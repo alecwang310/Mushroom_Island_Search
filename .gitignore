@@ -1,0 +1,13 @@
+xpple_full/
+xpple/
+__pycache__/
+*.o
+*.dll
+*.exe
+*.lib
+*.exp
+best_1m.json
+search_state.json
+best.json
+*.log
+.venv/
