@@ -11,3 +11,14 @@ search_state.json
 best.json
 *.log
 .venv/
+*.pdb
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.o
+big_islands.jsonl
+hunt_*.log
+best_1m.json
+best.json
+search_state.json

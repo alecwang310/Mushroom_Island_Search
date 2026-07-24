@@ -89,6 +89,12 @@ if __name__=='__main__':
             # Only flood fill top candidates (flood fill is the bottleneck)
             for seed,hx,hz in hits[:5]:
                 area=flood_fill(seed,hx,hz)
+                if area >= 2_000_000:
+                    entry = {'seed':seed,'area':area,'center_1_4':(hx,hz),
+                             'center_1_1':(hx*4,hz*4)}
+                    with open('big_islands.jsonl','a') as f:
+                        f.write(json.dumps(entry)+'\n')
+                    print(f'\n  *** BIG ({area:,}): seed {seed} at 1:4 ({hx},{hz}) 1:1 ({hx*4},{hz*4}) ***')
                 if best is None or area>best['area']:
                     best={'seed':seed,'area':area,'center':(hx,hz)}
                     print(f'\n  *** NEW BEST: seed {seed}, {area:,} blocks^2 at ({hx},{hz}) ***')
