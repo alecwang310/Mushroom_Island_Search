@@ -102,7 +102,12 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
     int ct_as=s_ranges[4], ct_ac=s_ranges[5], ct_bs=s_ranges[6], ct_bc=s_ranges[7];
     float sh_amp=s_dbl[0], ct_amp=s_dbl[1], sh4=sh_amp*4.0f;
 
-    int center = -(G / 2) * step_2x;
+    // Hex grid constants: D = spacing between adjacent centers
+    // x = tox + sx*D + (sz&1)*(D/2),  z = toz + sz*D*sqrt(3)/2
+    float D = (float)step_2x;
+    float D_sqrt3_2 = D * 0.8660254037844386f;
+    int center_x = (int)(-(G / 2) * D);
+    int center_z = (int)(-(G / 2) * D_sqrt3_2);
     int tiles_dim = (G + TILE - 1) / TILE;
 
     int seed_perm_off = seed * MAX_OCTAVES * PERM_SIZE;
@@ -123,8 +128,8 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
     for (int tz = 0; tz < tiles_dim; tz++) {
         for (int tx = 0; tx < tiles_dim; tx++) {
 
-            int tox = center + tx * TILE * step_2x;
-            int toz = center + tz * TILE * step_2x;
+            float tox = center_x + tx * TILE * D;
+            float toz = center_z + tz * TILE * D_sqrt3_2;
             int tile_w = (tx == tiles_dim-1) ? G - tx*TILE : TILE;
             int tile_h = (tz == tiles_dim-1) ? G - tz*TILE : TILE;
             int tile_cells = tile_w * tile_h;
@@ -133,8 +138,12 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
             for (int i = tid; i < tile_cells && my_ncells < MAXC; i += THREADS) {
                 my_cx[my_ncells] = i % tile_w;
                 my_cz[my_ncells] = i / tile_w;
-                my_x[my_ncells] = (float)(tox + my_cx[my_ncells] * step_2x);
-                my_z[my_ncells] = (float)(toz + my_cz[my_ncells] * step_2x);
+                // Hex grid: staggered x by half D on odd rows
+                float hx = tox + my_cx[my_ncells] * D;
+                float hz = toz + my_cz[my_ncells] * D_sqrt3_2;
+                if (my_cz[my_ncells] & 1) hx += D * 0.5f;
+                my_x[my_ncells] = hx;
+                my_z[my_ncells] = hz;
                 my_ncells++;
             }
             for (int c = 0; c < MAXC; c++) my_dx[c]=my_dz[c]=my_cont[c]=0;
@@ -191,21 +200,28 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
             // ---- Collect ALL adjacent pairs ----
             for (int i = tid; i < tile_cells; i += THREADS) {
                 int sx = i % tile_w, sz = i / tile_w;
-                if (s_grid[sz][sx] >= -1.05f) continue;
+                if (s_grid[sz][sx] >= -1.00f) continue;
 
                 // Count mushroom neighbors (4-directional)
                 // Report this mushroom cell if it has >=1 mushroom neighbor
+                // Hex grid: check 6 neighbors
                 int has_nb = 0;
-                if (sx > 0       && s_grid[sz][sx-1] < -1.05f) has_nb = 1;
-                if (!has_nb && sx+1 < tile_w && s_grid[sz][sx+1] < -1.05f) has_nb = 1;
-                if (!has_nb && sz > 0       && s_grid[sz-1][sx] < -1.05f) has_nb = 1;
-                if (!has_nb && sz+1 < tile_h && s_grid[sz+1][sx] < -1.05f) has_nb = 1;
+                // Hex offsets on square grid: right, left, up, down, up-right, down-left
+                int hx[6] = {1, -1, 0, 0, 1, -1};
+                int hz[6] = {0, 0, -1, 1, -1, 1};
+                for (int k = 0; k < 6 && !has_nb; k++) {
+                    int nx = sx + hx[k], nz = sz + hz[k];
+                    if (nx >= 0 && nx < tile_w && nz >= 0 && nz < tile_h)
+                        if (s_grid[nz][nx] < -1.00f) has_nb = 1;
+                }
                 if (!has_nb) continue;
 
                 int idx = atomicAdd(&s_hit_count, 1);
                 if (idx < MAX_HITS) {
-                    hit_gx[my_base + idx] = tox + sx * step_2x;
-                    hit_gz[my_base + idx] = toz + sz * step_2x;
+                    float hx = tox + sx * D + (sz & 1) * (D * 0.5f);
+                    float hz = toz + sz * D_sqrt3_2;
+                    hit_gx[my_base + idx] = (int)hx;
+                    hit_gz[my_base + idx] = (int)hz;
                 }
             }
             __syncthreads();

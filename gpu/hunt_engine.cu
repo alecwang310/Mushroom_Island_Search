@@ -405,6 +405,16 @@ extern "C" __declspec(dllexport) int hunt_batch_tiered(
         g.h_amp, g.h_lac, g.h_h2, g.h_d2, g.h_t2,
         g.h_ranges, g.h_dbl);
 
+    // Keep only O6 + O15: 2 of 24 octaves. Threshold -0.95.
+    for (int i = 0; i < n; i++) {
+        g.h_ranges[i * 8 + 1] = 0;  // sh_ac = 0
+        g.h_ranges[i * 8 + 3] = 0;  // sh_bc = 0
+        g.h_ranges[i * 8 + 4] = 6;  // ct_as = 6 (O6)
+        g.h_ranges[i * 8 + 5] = 1;  // ct_ac = 1 (just one octave)
+        g.h_ranges[i * 8 + 6] = 15; // ct_bs = 15 (O15)
+        g.h_ranges[i * 8 + 7] = 1;  // ct_bc = 1
+    }
+
     int perm_bytes = n * MAX_OCTAVES * PERM_SIZE;
     int vec_elems  = n * MAX_OCTAVES;
     cudaMemcpy(g.d_perm,  g.h_perms,  perm_bytes, cudaMemcpyHostToDevice);

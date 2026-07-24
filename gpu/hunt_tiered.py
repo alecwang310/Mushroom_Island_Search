@@ -34,47 +34,43 @@ def hunt_batch_tiered(start_seed, n, step_2x, G):
             for i in range(hc)]
 
 
-def verify_pair_cpu(seed, gx, gz, step_1x, step_2x):
-    """CPU: sample 13 new 1x points around an adjacent pair on the 2x grid.
-    Checks both vertical and horizontal pair directions. Returns True if
-    any 2x2 block at 1x has >= 3 of 4 cells < -1.05 (lenient threshold)."""
-    e = _eng.ContEngine(seed)
+def verify_pair_cpu(seed, gx, gz, step_1x, step_2x, engine_buf=None):
+    """Hex verification with O6+O15 only, threshold -0.95.
+    5 new hex points. If ANY one is < -0.95, trigger full flood fill."""
+    import ctypes, struct
+    buf = (ctypes.c_ubyte * 8192)()
+    _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
+    off_amp = 24*257 + 24*8*3
+    for j in range(24):
+        if j not in {6, 15}: struct.pack_into('d', buf, off_amp + j*8, 0.0)
+
+    def s(x, z):
+        return _eng._lib.cont_sample(buf, x, z)
+
     S1, S2 = float(step_1x), float(step_2x)
-    T = -1.05
+    T = -1.00
+    rt32 = 0.8660254037844386
 
-    def passes(v00, v10, v01, v11):
-        return sum(1 for v in (v00,v10,v01,v11) if v < T) >= 3
-
-    # New 1x points for vertical pair (anchor at top):
-    #   (-S1,-S1)(0,-S1)(S1,-S1)  (-S1,0)(S1,0)  (-S1,S1)(0,S1)(S1,S1)
-    #   (-S1,S2)(S1,S2)  (-S1,S2+S1)(0,S2+S1)(S1,S2+S1)
-    vx_v = [-S1, 0, S1, -S1, S1, -S1, 0, S1, -S1, S1, -S1, 0, S1]
-    vz_v = [-S1, -S1, -S1, 0, 0, S1, S1, S1, S2, S2, S2+S1, S2+S1, S2+S1]
-    vv = [e.sample(int(gx+x), int(gz+z)) for x, z in zip(vx_v, vz_v)]
-    # Known: K0 at (0,0) and K1 at (0,S2) are both < threshold (from GPU adjacency)
-    K0, K1 = -2.0, -2.0  # treated as passing
-    # Check 8 2x2 blocks in 3x5 grid
-    g = [vv[0], vv[1], vv[2],  vv[3], K0, vv[4],  vv[5], vv[6], vv[7],
-         vv[8], K1, vv[9],  vv[10], vv[11], vv[12]]
-    if passes(g[0],g[1],g[3],g[4]) or passes(g[1],g[2],g[4],g[5]) or \
-       passes(g[3],g[4],g[6],g[7]) or passes(g[4],g[5],g[7],g[8]) or \
-       passes(g[6],g[7],g[9],g[10]) or passes(g[7],g[8],g[10],g[11]) or \
-       passes(g[9],g[10],g[12],g[13]) or passes(g[10],g[11],g[13],g[14]):
+    # Vertical pair: A=(gx,gz), B=(gx,gz+S2). Center C=(gx, gz+S1)
+    pv = [
+        s(gx, int(gz+S1)),                                         # center
+        s(int(gx+S1*rt32), int(gz+0.5*S1)),                        # V1
+        s(int(gx+S1*rt32), int(gz+1.5*S1)),                        # V2
+        s(int(gx-S1*rt32), int(gz+1.5*S1)),                        # V4
+        s(int(gx-S1*rt32), int(gz+0.5*S1)),                        # V5
+    ]
+    if any(v < T for v in pv):
         return True
 
-    # New 1x points for horizontal pair (anchor at left):
-    #   (-S1,-S1)(0,-S1)(S1,-S1)(S2,-S1)(S2+S1,-S1)
-    #   (-S1,0)(S1,0)(S2+S1,0)
-    #   (-S1,S1)(0,S1)(S1,S1)(S2,S1)(S2+S1,S1)
-    vx_h = [-S1, 0, S1, S2, S2+S1,  -S1, S1, S2+S1,  -S1, 0, S1, S2, S2+S1]
-    vz_h = [-S1, -S1, -S1, -S1, -S1,  0, 0, 0,  S1, S1, S1, S1, S1]
-    vh = [e.sample(int(gx+x), int(gz+z)) for x, z in zip(vx_h, vz_h)]
-    g2 = [vh[0], vh[1], vh[2], vh[3], vh[4],  vh[5], K0, vh[6], K1, vh[7],
-          vh[8], vh[9], vh[10], vh[11], vh[12]]
-    if passes(g2[0],g2[1],g2[5],g2[6]) or passes(g2[1],g2[2],g2[6],g2[7]) or \
-       passes(g2[2],g2[3],g2[7],g2[8]) or passes(g2[3],g2[4],g2[8],g2[9]) or \
-       passes(g2[5],g2[6],g2[10],g2[11]) or passes(g2[6],g2[7],g2[11],g2[12]) or \
-       passes(g2[7],g2[8],g2[12],g2[13]) or passes(g2[8],g2[9],g2[13],g2[14]):
+    # Horizontal pair: A=(gx,gz), B=(gx+S2,gz). Center C=(gx+S1, gz)
+    ph = [
+        s(int(gx+S1), gz),                                         # center
+        s(int(gx+0.5*S1), int(gz-S1*rt32)),
+        s(int(gx+1.5*S1), int(gz-S1*rt32)),
+        s(int(gx+1.5*S1), int(gz+S1*rt32)),
+        s(int(gx+0.5*S1), int(gz+S1*rt32)),
+    ]
+    if any(v < T for v in ph):
         return True
 
     return False
@@ -92,12 +88,12 @@ def flood_fill(seed, cx, cz, max_cells=10_000_000):
 
 def verify_and_flood(seed, gx, gz, step_1x, step_2x):
     t0 = time.perf_counter()
-    ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)
+    ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)  # O6+O15 only, -0.95
     t_vfy = time.perf_counter() - t0
     if not ok:
         return (False, None, t_vfy, 0)
     t0 = time.perf_counter()
-    ff = flood_fill(seed, gx, gz)
+    ff = flood_fill(seed, gx, gz)  # full C engine
     t_ff = time.perf_counter() - t0
     return (True, ff, t_vfy, t_ff)
 
