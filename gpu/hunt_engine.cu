@@ -148,14 +148,18 @@ extern "C" __declspec(dllexport) int hunt_batch(
 }
 
 extern "C" __declspec(dllexport) void hunt_cleanup() {
-    if (g_gpu.d_perm) {
-        cudaFree(g_gpu.d_perm); cudaFree(g_gpu.d_oa); cudaFree(g_gpu.d_ob);
-        cudaFree(g_gpu.d_oc); cudaFree(g_gpu.d_amp); cudaFree(g_gpu.d_lac);
-        cudaFree(g_gpu.d_h2); cudaFree(g_gpu.d_d2); cudaFree(g_gpu.d_t2);
-        cudaFree(g_gpu.d_ranges); cudaFree(g_gpu.d_dbl);
-        cudaFree(g_gpu.d_offsets);
-        cudaFree(g_gpu.d_hit_flags); cudaFree(g_gpu.d_hit_x);
-        cudaFree(g_gpu.d_hit_z); cudaFree(g_gpu.d_hit_grid);
-        g_gpu.capacity = 0;
+    if (g.d_perm) {
+        cudaFree(g.d_perm); cudaFree(g.d_oa); cudaFree(g.d_ob);
+        cudaFree(g.d_oc); cudaFree(g.d_amp); cudaFree(g.d_lac);
+        cudaFree(g.d_h2); cudaFree(g.d_d2); cudaFree(g.d_t2);
+        cudaFree(g.d_ranges); cudaFree(g.d_dbl);
+        cudaFree(g.d_offsets);
+        cudaFree(g.d_hit_flags); cudaFree(g.d_hit_x);
+        cudaFree(g.d_hit_z); cudaFree(g.d_hit_grid);
+        g.cap = 0;
     }
+    if (g.h_perms) { free(g.h_perms); free(g.h_oa); free(g.h_ob); free(g.h_oc);
+        free(g.h_amp); free(g.h_lac); free(g.h_h2); free(g.h_d2); free(g.h_t2);
+        free(g.h_ranges); free(g.h_dbl); free(g.h_offsets);
+        free(g.h_hit_flags); free(g.h_hit_x); free(g.h_hit_z); }
 }

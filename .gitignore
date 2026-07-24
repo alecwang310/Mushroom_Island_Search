@@ -22,3 +22,6 @@ hunt_*.log
 best_1m.json
 best.json
 search_state.json
+*.dll
+*.exp
+*.lib
