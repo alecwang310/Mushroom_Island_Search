@@ -416,14 +416,18 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
                      float *d2, float *t2, int32_t *ranges, float *dbl_amps)
 {
     #define MAX_OCT 24
-    #define PSZ 257
+    #define PSZ 256   /* 32 lanes × 8 bytes = perfect fit, 8-byte aligned */
     ContEngine e;
     for (int s = 0; s < n; s++) {
         cont_engine_init(&e, seeds[s], large_biomes);
 
         int p_off = s * MAX_OCT * PSZ;
         int v_off = s * MAX_OCT;
-        memcpy(perms + p_off, e.perm, MAX_OCT * PSZ);
+        /* Copy 256 bytes per octave.  e.perm[i][256] == e.perm[i][0] by
+           perlin_init, so we drop byte 256; GPU perm_get wraps idx>=256→0. */
+        for (int i = 0; i < MAX_OCT; i++) {
+            memcpy(perms + p_off + i * PSZ, e.perm[i], 256);
+        }
         for (int i = 0; i < MAX_OCT; i++) {
             oa[v_off + i]  = (float)e.offset_a[i];
             ob[v_off + i]  = (float)e.offset_b[i];
