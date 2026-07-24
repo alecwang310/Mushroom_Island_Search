@@ -88,6 +88,16 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
                      float *amp, float *lac, uint8_t *h2,
                      float *d2, float *t2, int32_t *ranges, float *dbl_amps);
 
+/**
+ * Flood fill to measure mushroom island area.
+ * @param seed       World seed
+ * @param cx, cz     Start cell coordinates at 1:4 scale (int)
+ * @param max_cells  Maximum BFS cells to visit (safety cap)
+ * @return           Area in blocks^2 at 1:1 scale (cells * 16), or 0
+ *                   if the start cell is not mushroom.
+ */
+int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells);
+
 #ifdef __cplusplus
 }
 #endif

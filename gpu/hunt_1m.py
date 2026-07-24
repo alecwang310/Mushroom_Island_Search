@@ -1,106 +1,130 @@
-"""hunt_1m.py — GPU hunt for 1M+ mushroom islands."""
+"""hunt_1m.py — GPU hunt for large mushroom islands using C++ engine.
+
+GPU scans seeds as fast as possible, dumping hits to a queue.
+A thread pool flood-fills in parallel — GPU never waits on CPU.
+"""
 import sys, os, time, ctypes, json, math
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import threading
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import engine as _eng
 
-cuda = ctypes.CDLL(r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll')
-cuda.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]; cuda.cudaMalloc.restype = ctypes.c_int
-cuda.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]; cuda.cudaMemcpy.restype = ctypes.c_int
-cuda.cudaFree.argtypes = [ctypes.c_void_p]; cuda.cudaMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-cuda.cudaDeviceSynchronize.restype = ctypes.c_int
-H2D, D2H = 1, 2
+# ------- Load C++ hunt engine DLL -------
+_hunt = ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'hunt_engine.dll'))
+_hunt.hunt_batch.argtypes = [
+    ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+]
+_hunt.hunt_batch.restype = ctypes.c_int
+_hunt.hunt_cleanup.argtypes = []
+_hunt.hunt_cleanup.restype = None
 
-lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'sparse_kernel.dll'))
-lib.gpu_scan_seeds.argtypes = [ctypes.c_void_p]*21; lib.gpu_scan_seeds.restype = ctypes.c_int
 
-MAX_OCT, PERM, ENG_SZ = 24, 257, 8192
+def hunt_batch(start_seed: int, n: int, step: int, K: int, G: int):
+    results = (ctypes.c_int64 * (n * 3))()
+    hc = _hunt.hunt_batch(
+        ctypes.c_uint64(start_seed), ctypes.c_int(n),
+        ctypes.c_int(step), ctypes.c_int(K), ctypes.c_int(G), results)
+    return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
+            for i in range(hc)]
 
-def extract(buf):
-    off=0
-    perm=np.frombuffer(buf,dtype=np.uint8,count=MAX_OCT*PERM,offset=off);off+=MAX_OCT*PERM
-    oa=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    off+=MAX_OCT*8  # skip ob
-    oc=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    amp=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    lac=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    h2=np.frombuffer(buf,dtype=np.uint8,count=MAX_OCT,offset=off);off+=MAX_OCT
-    d2=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    t2=np.frombuffer(buf,dtype=np.float64,count=MAX_OCT,offset=off).astype(np.float32);off+=MAX_OCT*8
-    rng=np.frombuffer(buf,dtype=np.int32,count=8,offset=off);off+=32
-    dbl=np.frombuffer(buf,dtype=np.float64,count=2,offset=off).astype(np.float32)
-    return perm.reshape(MAX_OCT,PERM),oa,oc,amp,lac,h2,d2,t2,rng,dbl
 
-def m(arr): p=ctypes.c_void_p();cuda.cudaMalloc(ctypes.byref(p),arr.nbytes);cuda.cudaMemcpy(p,arr.ctypes.data,arr.nbytes,H2D);return p
-def mz(sz): p=ctypes.c_void_p();cuda.cudaMalloc(ctypes.byref(p),sz);cuda.cudaMemset(p,0,sz);return p
-def to_host(dp,arr): cuda.cudaMemcpy(arr.ctypes.data,dp,arr.nbytes,D2H)
+def flood_fill(seed: int, cx: int, cz: int,
+               max_cells: int = 10_000_000) -> dict | None:
+    """C-side flood fill at 1:4 scale. Returns dict with area + center, or None."""
+    area = _eng._lib.cont_flood_fill(
+        ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
+        ctypes.c_int(cx), ctypes.c_int(cz),
+        ctypes.c_int(max_cells))
+    if area <= 0:
+        return None
+    return {
+        'seed': seed,
+        'area': area,
+        'center_1_4': (cx, cz),
+        'center_1_1': (cx * 4, cz * 4),
+    }
 
-def gpu_scan(seeds,step,K):
-    n=len(seeds)
-    d = _eng.batch_init(seeds)
-    dp=m(d['perm'].ravel());doa=m(d['oa'].ravel());dob=m(d['ob'].ravel());doc=m(d['oc'].ravel())
-    da=m(d['amp'].ravel());dl=m(d['lac'].ravel());dh=m(d['h2'].ravel());dd=m(d['d2'].ravel());dt=m(d['t2'].ravel())
-    dr=m(d['rng'].ravel());ddb=m(d['dbl'].ravel())
-    # 128 random grids per seed, each GxG cells
-    offsets=np.array([(np.random.randint(-40000,40000)//step*step,
-                       np.random.randint(-40000,40000)//step*step) for _ in range(n*NG)], dtype=np.int32)
-    doff=m(offsets.ravel())
-    hf=np.zeros(n,dtype=np.int32);hx=np.zeros(n,dtype=np.int32);hz=np.zeros(n,dtype=np.int32);hg=np.zeros(n,dtype=np.int32)
-    df=mz(n*4);dx=mz(n*4);dz=mz(n*4);dg=mz(n*4)
-    lib.gpu_scan_seeds(dp,doa,dob,doc,da,dl,dh,dd,dt,dr,ddb,n,doff,NG,G,step,K,df,dx,dz,dg)
-    cuda.cudaDeviceSynchronize()
-    to_host(df,hf);to_host(dx,hx);to_host(dz,hz)
-    for p in[dp,doa,dob,doc,da,dl,dh,dd,dt,dr,ddb,doff,df,dx,dz,dg]:cuda.cudaFree(p)
-    return[(int(seeds[i]),int(hx[i]),int(hz[i]))for i in range(n)if hf[i]]
 
-def flood_fill(seed,cx,cz,max_cells=2_000_000):
-    """Flood fill at 1:4 scale. cx,cz are 1:4 coordinates."""
-    buf=(ctypes.c_ubyte*ENG_SZ)();_eng._lib.cont_engine_init(buf,seed&0xFFFFFFFFFFFFFFFF,0)
-    def s(x,z):return _eng._lib.cont_sample(buf,x,z)
-    sx,sz=int(cx),int(cz)  # already at 1:4 scale
-    if s(sx,sz)>=-1.05:return 0
-    q=deque([(sx,sz)]);seen={(sx,sz)};cache={(sx,sz):s(sx,sz)};cells=0
-    while q and cells<max_cells:
-        x,z=q.popleft();cells+=1
-        for dx,dz in[(1,0),(-1,0),(0,1),(0,-1)]:
-            nx,nz=x+dx,z+dz
-            if(nx,nz)in seen:continue
-            seen.add((nx,nz));cache[(nx,nz)]=s(nx,nz)
-            if cache[(nx,nz)]<-1.05:q.append((nx,nz))
-    return cells*16  # each 1:4 cell = 4x4 = 16 blocks at 1:1
+if __name__ == '__main__':
+    # ---- Config ----
+    TARGET = 2_000_000
+    S = 5_000_000
+    D = math.sqrt(S)
+    step = int(D / 4 / 3) // 4 * 4
+    step = max(step, 4)
+    K = 2
+    G = 256
+    batch = 2048
+    START_SEED = 77777
+    FF_WORKERS = 8                     # parallel flood fill threads
 
-if __name__=='__main__':
-    S=5_000_000;D=math.sqrt(S)       # D=2236 blocks at 1:1
-    D4=D/4                            # D=559 cells at 1:4
-    step=int(D4/3)//4*4               # step=184 at 1:4, K=2
-    K=2;G=4;NG=128                    # 128 grids of 4x4 = 2048 samples/seed
-    batch=4096
-    print(f'S={S:,} D4={D4:.0f} step={step} K={K} G={G} grids={NG} batch={batch}')
-    best,scanned,t0=None,0,time.perf_counter()
+    print(f'Target: >= {TARGET:,} blocks^2')
+    print(f'step={step}  K={K}  G={G}  batch={batch}  ff_workers={FF_WORKERS}')
+    print(f'Grid: {(G-1)*step}x{(G-1)*step} blocks at 1:1')
+    print(f'Seeds: sequential from {START_SEED}')
+    print()
+
+    pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
+    best = None
+    scanned = 0
+    hits_total = 0
+    big_count = 0
+    next_seed = START_SEED
+    lock = threading.Lock()
+    t0 = time.perf_counter()
+
+    def on_done(future):
+        """Callback: runs in worker thread. Log if big enough."""
+        global best, big_count
+        result = future.result()
+        if result is None or result['area'] < TARGET:
+            return
+        with lock:
+            big_count += 1
+            with open('big_islands.jsonl', 'a') as f:
+                f.write(json.dumps(result) + '\n')
+            print(f'\n  BIG ({result["area"]:,}): seed {result["seed"]} '
+                  f'at 1:4 ({result["center_1_4"][0]},{result["center_1_4"][1]})')
+            if best is None or result['area'] > best['area']:
+                best = result
+                print(f'  *** NEW BEST: seed {result["seed"]}, '
+                      f'{result["area"]:,} blocks^2 ***')
+                with open('best.json', 'w') as f:
+                    json.dump(best, f)
+
     try:
         while True:
-            seeds=np.random.randint(0,2**63,size=batch,dtype=np.uint64)
-            hits=gpu_scan(seeds,step,K)
-            scanned+=batch
-            # Only flood fill top candidates (flood fill is the bottleneck)
-            for seed,hx,hz in hits[:5]:
-                area=flood_fill(seed,hx,hz)
-                if area >= 2_000_000:
-                    entry = {'seed':seed,'area':area,'center_1_4':(hx,hz),
-                             'center_1_1':(hx*4,hz*4)}
-                    with open('big_islands.jsonl','a') as f:
-                        f.write(json.dumps(entry)+'\n')
-                    print(f'\n  *** BIG ({area:,}): seed {seed} at 1:4 ({hx},{hz}) 1:1 ({hx*4},{hz*4}) ***')
-                if best is None or area>best['area']:
-                    best={'seed':seed,'area':area,'center':(hx,hz)}
-                    print(f'\n  *** NEW BEST: seed {seed}, {area:,} blocks^2 at ({hx},{hz}) ***')
-                    with open('best_1m.json','w')as f:json.dump(best,f)
-            elapsed=time.perf_counter()-t0;rate=scanned/elapsed
-            if scanned % 50000 == 0:
-                ba=best['area']if best else 0
-                print(f'\r  {scanned:,} seeds ({rate:.0f}/s) | {len(hits)} hits | best {ba:,}  ',end='')
-    except KeyboardInterrupt:pass
-    print(f'\n\nScanned {scanned:,} seeds in {time.perf_counter()-t0:.0f}s')
+            hits = hunt_batch(next_seed, batch, step, K, G)
+            scanned += batch
+            hits_total += len(hits)
+            next_seed += batch
+
+            # Submit all hits to the thread pool — non-blocking
+            for seed, hx, hz in hits:
+                f = pool.submit(flood_fill, seed, hx, hz)
+                f.add_done_callback(on_done)
+
+            elapsed = time.perf_counter() - t0
+            rate = scanned / elapsed
+            if scanned % (batch * 10) == 0:
+                ba = best['area'] if best else 0
+                print(f'\r  {scanned:,} seeds ({rate:,.0f}/s) | '
+                      f'{hits_total} hits | {big_count} big | best {ba:,}  ',
+                      end='')
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print('\nShutting down thread pool...')
+        pool.shutdown(wait=True)
+        _hunt.hunt_cleanup()
+
+    elapsed = time.perf_counter() - t0
+    print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
+    print(f'{hits_total} GPU hits, {big_count} islands >= {TARGET:,}')
     if best:
-        print(f"BEST: seed {best['seed']}, {best['area']:,} blocks^2 at {best['center']}")
+        print(f'BEST: seed {best["seed"]}, {best["area"]:,} blocks^2 '
+              f'at {best["center_1_4"]}')

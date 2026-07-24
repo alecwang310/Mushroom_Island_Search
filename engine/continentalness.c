@@ -439,3 +439,185 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
         dbl_amps[s * 2 + 1] = (float)e.cont_dbl_amp;
     }
 }
+
+/* ==========================================================================
+ * Flood fill — BFS to measure island area. No Python in the loop.
+ * ========================================================================== */
+
+/* Hash set for visited cells: open addressing with linear probe. */
+typedef struct {
+    int x, z;
+    int occupied;  /* 1 = used, 0 = empty, -1 = tombstone */
+} VisEntry;
+
+typedef struct {
+    VisEntry *entries;
+    size_t cap;
+    size_t count;
+} VisSet;
+
+static inline uint64_t vis_hash(int x, int z) {
+    /* FNV-1a style mix of two 32-bit ints */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h ^= (uint32_t)x; h *= 0x100000001b3ULL;
+    h ^= (uint32_t)z; h *= 0x100000001b3ULL;
+    return h;
+}
+
+static int vis_init(VisSet *vs, size_t cap) {
+    vs->entries = (VisEntry*)calloc(cap, sizeof(VisEntry));
+    if (!vs->entries) return 0;
+    vs->cap = cap;
+    vs->count = 0;
+    return 1;
+}
+
+static int vis_grow(VisSet *vs) {
+    size_t old_cap = vs->cap;
+    VisEntry *old = vs->entries;
+    size_t new_cap = old_cap * 2;
+    VisEntry *new_entries = (VisEntry*)calloc(new_cap, sizeof(VisEntry));
+    if (!new_entries) return 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (old[i].occupied != 1) continue;
+        uint64_t h = vis_hash(old[i].x, old[i].z);
+        size_t idx = h % new_cap;
+        while (new_entries[idx].occupied)
+            idx = (idx + 1) % new_cap;
+        new_entries[idx].x = old[i].x;
+        new_entries[idx].z = old[i].z;
+        new_entries[idx].occupied = 1;
+    }
+    free(old);
+    vs->entries = new_entries;
+    vs->cap = new_cap;
+    return 1;
+}
+
+static int vis_contains(VisSet *vs, int x, int z) {
+    uint64_t h = vis_hash(x, z);
+    size_t idx = h % vs->cap;
+    while (vs->entries[idx].occupied != 0) {
+        if (vs->entries[idx].occupied == 1 &&
+            vs->entries[idx].x == x && vs->entries[idx].z == z)
+            return 1;
+        idx = (idx + 1) % vs->cap;
+    }
+    return 0;
+}
+
+static int vis_insert(VisSet *vs, int x, int z) {
+    if (vs->count * 2 >= vs->cap) {  /* load factor > 0.5 */
+        if (!vis_grow(vs)) return 0;
+    }
+    uint64_t h = vis_hash(x, z);
+    size_t idx = h % vs->cap;
+    while (vs->entries[idx].occupied == 1) {
+        /* already present? */
+        if (vs->entries[idx].x == x && vs->entries[idx].z == z)
+            return 1;  /* already in set, not an error */
+        idx = (idx + 1) % vs->cap;
+    }
+    vs->entries[idx].x = x;
+    vs->entries[idx].z = z;
+    vs->entries[idx].occupied = 1;
+    vs->count++;
+    return 1;
+}
+
+/* Dynamic queue for BFS */
+typedef struct {
+    int *qx, *qz;
+    size_t cap, head, tail;
+} Queue;
+
+static int q_init(Queue *q, size_t cap) {
+    q->qx = (int*)malloc(cap * sizeof(int));
+    q->qz = (int*)malloc(cap * sizeof(int));
+    if (!q->qx || !q->qz) { free(q->qx); free(q->qz); return 0; }
+    q->cap = cap; q->head = 0; q->tail = 0;
+    return 1;
+}
+
+static int q_grow(Queue *q) {
+    size_t new_cap = q->cap * 2;
+    int *nx = (int*)malloc(new_cap * sizeof(int));
+    int *nz = (int*)malloc(new_cap * sizeof(int));
+    if (!nx || !nz) { free(nx); free(nz); return 0; }
+    for (size_t i = 0; i < q->cap; i++) {
+        size_t src = (q->head + i) % q->cap;
+        nx[i] = q->qx[src];
+        nz[i] = q->qz[src];
+    }
+    free(q->qx); free(q->qz);
+    q->qx = nx; q->qz = nz;
+    q->head = 0; q->tail = q->cap;
+    q->cap = new_cap;
+    return 1;
+}
+
+static inline int q_empty(Queue *q) { return q->head == q->tail; }
+
+static inline void q_push(Queue *q, int x, int z) {
+    q->qx[q->tail] = x; q->qz[q->tail] = z;
+    q->tail = (q->tail + 1) % q->cap;
+}
+
+static inline void q_pop(Queue *q, int *x, int *z) {
+    *x = q->qx[q->head]; *z = q->qz[q->head];
+    q->head = (q->head + 1) % q->cap;
+}
+
+static void q_free(Queue *q) { free(q->qx); free(q->qz); }
+
+int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells) {
+    ContEngine e;
+    cont_engine_init(&e, seed, 0);
+
+    /* Check start cell */
+    if (cont_sample(&e, cx, cz) >= -1.05)
+        return 0;
+
+    /* Estimate initial sizes. Most islands are small.
+     * Start with 4K entries (handles up to ~2K cells) and grow as needed. */
+    size_t init_q = 4096;
+    size_t init_vis = 8192;
+    Queue q;
+    VisSet vs;
+    if (!q_init(&q, init_q)) return -1;
+    if (!vis_init(&vs, init_vis)) { q_free(&q); return -1; }
+
+    q_push(&q, cx, cz);
+    vis_insert(&vs, cx, cz);
+    int64_t cells = 0;
+
+    while (!q_empty(&q) && cells < max_cells) {
+        /* Grow queue if needed */
+        if ((q.tail + 1) % q.cap == q.head) {
+            if (!q_grow(&q)) break;
+        }
+
+        int x, z;
+        q_pop(&q, &x, &z);
+        cells++;
+
+        /* 4-direction neighbors at 1:4 scale */
+        struct { int dx, dz; } dirs[4] = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dirs[d].dx;
+            int nz = z + dirs[d].dz;
+            if (vis_contains(&vs, nx, nz)) continue;
+            if (cont_sample(&e, nx, nz) < -1.05) {
+                vis_insert(&vs, nx, nz);
+                q_push(&q, nx, nz);
+            } else {
+                /* Mark visited even if not mushroom (boundary) */
+                vis_insert(&vs, nx, nz);
+            }
+        }
+    }
+
+    q_free(&q);
+    free(vs.entries);
+    return cells * 16;  /* Each 1:4 cell = 4x4 = 16 blocks at 1:1 */
+}

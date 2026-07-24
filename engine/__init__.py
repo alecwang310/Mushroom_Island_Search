@@ -10,7 +10,7 @@ Usage:
 
 import ctypes
 import os
-from ctypes import c_double, c_float, c_int, c_uint64, c_void_p, POINTER
+from ctypes import c_double, c_float, c_int, c_int64, c_uint64, c_void_p, POINTER
 
 # Load the shared library
 _lib_path = os.path.join(os.path.dirname(__file__), 'continentalness.dll')
@@ -37,6 +37,9 @@ _lib.cont_batch_init.argtypes = [
     c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p,
 ]
 _lib.cont_batch_init.restype = None
+
+_lib.cont_flood_fill.argtypes = [c_uint64, c_int, c_int, c_int]
+_lib.cont_flood_fill.restype = c_int64
 
 MAX_OCTAVES = 24
 PERM_SIZE = 257
