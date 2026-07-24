@@ -36,17 +36,19 @@ def m(arr): p=ctypes.c_void_p();cuda.cudaMalloc(ctypes.byref(p),arr.nbytes);cuda
 def mz(sz): p=ctypes.c_void_p();cuda.cudaMalloc(ctypes.byref(p),sz);cuda.cudaMemset(p,0,sz);return p
 def to_host(dp,arr): cuda.cudaMemcpy(arr.ctypes.data,dp,arr.nbytes,D2H)
 
-def gpu_scan(seeds,step,K,G,offsets):
-    n=len(seeds);ng=len(offsets)//2
+def gpu_scan(seeds,step,K):
+    n=len(seeds)
     d = _eng.batch_init(seeds)
-    perms=d['perm'];oas=d['oa'];obs=d['ob'];ocs=d['oc'];amps=d['amp'];lacs=d['lac']
-    h2s=d['h2'];d2s=d['d2'];t2s=d['t2'];rngs=d['rng'];dbls=d['dbl']
-    dp=m(perms.ravel());doa=m(oas.ravel());dob=m(obs.ravel());doc=m(ocs.ravel())
-    da=m(amps.ravel());dl=m(lacs.ravel());dh=m(h2s.ravel());dd=m(d2s.ravel());dt=m(t2s.ravel())
-    dr=m(rngs.ravel());ddb=m(dbls.ravel());doff=m(offsets)
+    dp=m(d['perm'].ravel());doa=m(d['oa'].ravel());dob=m(d['ob'].ravel());doc=m(d['oc'].ravel())
+    da=m(d['amp'].ravel());dl=m(d['lac'].ravel());dh=m(d['h2'].ravel());dd=m(d['d2'].ravel());dt=m(d['t2'].ravel())
+    dr=m(d['rng'].ravel());ddb=m(d['dbl'].ravel())
+    # 128 random grids per seed, each GxG cells
+    offsets=np.array([(np.random.randint(-40000,40000)//step*step,
+                       np.random.randint(-40000,40000)//step*step) for _ in range(n*NG)], dtype=np.int32)
+    doff=m(offsets.ravel())
     hf=np.zeros(n,dtype=np.int32);hx=np.zeros(n,dtype=np.int32);hz=np.zeros(n,dtype=np.int32);hg=np.zeros(n,dtype=np.int32)
     df=mz(n*4);dx=mz(n*4);dz=mz(n*4);dg=mz(n*4)
-    lib.gpu_scan_seeds(dp,doa,dob,doc,da,dl,dh,dd,dt,dr,ddb,n,doff,ng,G,step,K,df,dx,dz,dg)
+    lib.gpu_scan_seeds(dp,doa,dob,doc,da,dl,dh,dd,dt,dr,ddb,n,doff,NG,G,step,K,df,dx,dz,dg)
     cuda.cudaDeviceSynchronize()
     to_host(df,hf);to_host(dx,hx);to_host(dz,hz)
     for p in[dp,doa,dob,doc,da,dl,dh,dd,dt,dr,ddb,doff,df,dx,dz,dg]:cuda.cudaFree(p)
@@ -71,20 +73,15 @@ def flood_fill(seed,cx,cz,max_cells=2_000_000):
 if __name__=='__main__':
     S=5_000_000;D=math.sqrt(S)       # D=2236 blocks at 1:1
     D4=D/4                            # D=559 cells at 1:4
-    step=int(D4/2.5)//4*4             # step=220, K=2, spans 2.5 cells
-    K=2;G=4;ng=2048//(G*G)            # G=4 → 128 grids
-    radius=int(8000)                  # 8000 cells at 1:4 = 32K blocks
-    batch=1024
-    print(f'S={S:,} D4={D4:.0f} step={step} K={K} G={G} grids={ng} radius={radius:,}')
+    step=int(D4/3)//4*4               # step=184 at 1:4, K=2
+    K=2;G=4;NG=128                    # 128 grids of 4x4 = 2048 samples/seed
+    batch=4096
+    print(f'S={S:,} D4={D4:.0f} step={step} K={K} G={G} grids={NG} batch={batch}')
     best,scanned,t0=None,0,time.perf_counter()
     try:
         while True:
-            off=np.array([v for _ in range(ng) for v in
-                (np.random.randint(-radius,radius)//step*step,
-                 np.random.randint(-radius,radius)//step*step)],dtype=np.int32)
             seeds=np.random.randint(0,2**63,size=batch,dtype=np.uint64)
-            t1=time.perf_counter()
-            hits=gpu_scan(seeds,step,K,G,off)
+            hits=gpu_scan(seeds,step,K)
             scanned+=batch
             # Only flood fill top candidates (flood fill is the bottleneck)
             for seed,hx,hz in hits[:5]:
@@ -100,8 +97,9 @@ if __name__=='__main__':
                     print(f'\n  *** NEW BEST: seed {seed}, {area:,} blocks^2 at ({hx},{hz}) ***')
                     with open('best_1m.json','w')as f:json.dump(best,f)
             elapsed=time.perf_counter()-t0;rate=scanned/elapsed
-            ba=best['area']if best else 0
-            print(f'\r  {scanned:,} seeds ({rate:.0f}/s) | {len(hits)} hits | best {ba:,}  ',end='')
+            if scanned % 50000 == 0:
+                ba=best['area']if best else 0
+                print(f'\r  {scanned:,} seeds ({rate:.0f}/s) | {len(hits)} hits | best {ba:,}  ',end='')
     except KeyboardInterrupt:pass
     print(f'\n\nScanned {scanned:,} seeds in {time.perf_counter()-t0:.0f}s')
     if best:

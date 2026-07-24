@@ -1,13 +1,11 @@
 /*
- * sparse_kernel.cu — GPU sparse-grid mushroom scanner with coalesced loads.
+ * sparse_kernel.cu — GPU sparse-grid mushroom scanner.
  *
- * Optimizations over old version:
- *   1. Coalesced global loads: consecutive threads read consecutive bytes
- *   2. Tiled: 16x16 tiles in shared memory for KxK detection
- *   3. __launch_bounds__(256,4) for better occupancy
+ * Exports: gpu_scan_seeds(...) → DLL callable from Python ctypes.
  *
- * One block per seed, 256 threads. Processes num_grids sparse grids.
- * Detection: KxK block ALL < -1.05 -> candidate.
+ * One block per seed, 256 threads per block.
+ * Processes one G×G sparse grid per wavefront (8 grids × 256 threads = 2048 samples).
+ * Detection: K×K block of grid cells ALL < -1.05 → candidate.
  */
 
 #include <cuda_runtime.h>
@@ -16,7 +14,7 @@
 #define MAX_OCTAVES 24
 #define PERM_SIZE 257
 #define THREADS 256
-#define TILE 16  // cells per grid side
+#define MAX_GRIDS 32  // must be >= G
 
 __constant__ float c_grad[16][3] = {
     { 1, 1, 0}, {-1, 1, 0}, { 1,-1, 0}, {-1,-1, 0},
@@ -32,13 +30,18 @@ __device__ __noinline__ float perlin(
 {
     float d1 = x + oa, d2 = y + ob, d3 = z + oc;
     uint8_t h2; float t2;
-    if (y == 0.0f) { h2 = cached_h2; d2 = cached_d2; t2 = cached_t2; }
-    else { float i2 = floorf(d2); d2 -= i2; h2 = (uint8_t)((int)i2 & 0xFF);
-           t2 = d2*d2*d2 * (d2*(d2*6.0f-15.0f)+10.0f); }
-    float i1 = floorf(d1), i3 = floorf(d3); d1 -= i1; d3 -= i3;
+    if (y == 0.0f) {
+        h2 = cached_h2; d2 = cached_d2; t2 = cached_t2;
+    } else {
+        float i2 = floorf(d2); d2 -= i2;
+        h2 = (uint8_t)((int)i2 & 0xFF);
+        t2 = d2*d2*d2 * (d2*(d2*6.0f-15.0f)+10.0f);
+    }
+    float i1 = floorf(d1), i3 = floorf(d3);
+    d1 -= i1; d3 -= i3;
     int h1 = ((int)i1) & 0xFF, h3 = ((int)i3) & 0xFF;
-    float t1 = d1*d1*d1*(d1*(d1*6.0f-15.0f)+10.0f);
-    float t3 = d3*d3*d3*(d3*(d3*6.0f-15.0f)+10.0f);
+    float t1 = d1*d1*d1 * (d1*(d1*6.0f-15.0f)+10.0f);
+    float t3 = d3*d3*d3 * (d3*(d3*6.0f-15.0f)+10.0f);
 
     int va = perm[h1]+h2, vb = perm[h1+1]+h2;
     int v2a=perm[va&0xFF]+h3, v2b=perm[(va&0xFF)+1]+h3;
@@ -54,12 +57,13 @@ __device__ __noinline__ float perlin(
     float l3=L(v5a,d1,d2-1,d3); float l7=L(v5b,d1,d2-1,d3-1);
     float l4=L(v7a,d1-1,d2-1,d3); float l8=L(v7b,d1-1,d2-1,d3-1);
     #undef L
+
     l1+=t1*(l2-l1); l3+=t1*(l4-l3); l5+=t1*(l6-l5); l7+=t1*(l8-l7);
     l1+=t2*(l3-l1); l5+=t2*(l7-l5);
     return l1+t3*(l5-l1);
 }
 
-extern "C" __launch_bounds__(THREADS, 4) __global__ void sparse_scan(
+extern "C" __launch_bounds__(256, 4) __global__ void sparse_scan(
     const uint8_t *perm, const float *oa, const float *ob, const float *oc,
     const float *amp, const float *lac, const uint8_t *h2,
     const float *d2, const float *t2,
@@ -69,93 +73,109 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void sparse_scan(
 {
     int seed = blockIdx.x, tid = threadIdx.x;
     float fr = 337.0f/331.0f;
-    (void)hit_grid;
 
-    // ---- COALESCED: consecutive threads read consecutive bytes ----
     __shared__ uint8_t s_perm[MAX_OCTAVES][PERM_SIZE];
-    int total_bytes = MAX_OCTAVES * PERM_SIZE;
-    for (int i = tid; i < total_bytes; i += THREADS)
-        ((uint8_t*)s_perm)[i] = perm[seed * total_bytes + i];
-
-    __shared__ float s_oa[MAX_OCTAVES], s_ob[MAX_OCTAVES], s_oc[MAX_OCTAVES];
-    __shared__ float s_amp[MAX_OCTAVES], s_lac[MAX_OCTAVES];
+    __shared__ float   s_oa[MAX_OCTAVES], s_ob[MAX_OCTAVES], s_oc[MAX_OCTAVES];
+    __shared__ float   s_amp[MAX_OCTAVES], s_lac[MAX_OCTAVES];
     __shared__ uint8_t s_h2[MAX_OCTAVES];
-    __shared__ float s_d2[MAX_OCTAVES], s_t2[MAX_OCTAVES];
-    if (tid < MAX_OCTAVES) {
-        int src = seed * MAX_OCTAVES + tid;
+    __shared__ float   s_d2[MAX_OCTAVES], s_t2[MAX_OCTAVES];
+    __shared__ int   s_ranges[8];
+    __shared__ float s_dbl[2];
+
+    // Load perlin data into shared memory
+    int oct=0, b=tid;
+    while (oct<MAX_OCTAVES && b<PERM_SIZE) {
+        int src=(seed*MAX_OCTAVES+oct)*PERM_SIZE+b;
+        s_perm[oct][b]=perm[src];
+        oct+=(b+THREADS)/PERM_SIZE; b=(b+THREADS)%PERM_SIZE;
+    }
+    if (tid<MAX_OCTAVES) {
+        int src=seed*MAX_OCTAVES+tid;
         s_oa[tid]=oa[src]; s_ob[tid]=ob[src]; s_oc[tid]=oc[src];
         s_amp[tid]=amp[src]; s_lac[tid]=lac[src];
         s_h2[tid]=h2[src]; s_d2[tid]=d2[src]; s_t2[tid]=t2[src];
     }
-    __shared__ int s_ranges[8]; __shared__ float s_dbl[2];
-    if (tid < 8) s_ranges[tid] = ranges[seed * 8 + tid];
-    if (tid < 2) s_dbl[tid] = dbl_amps[seed * 2 + tid];
+    if (tid<8) s_ranges[tid]=ranges[seed*8+tid];
+    if (tid<2) s_dbl[tid]=dbl_amps[seed*2+tid];
     __syncthreads();
 
     int sh_as=s_ranges[0],sh_ac=s_ranges[1],sh_bs=s_ranges[2],sh_bc=s_ranges[3];
     int ct_as=s_ranges[4],ct_ac=s_ranges[5],ct_bs=s_ranges[6],ct_bc=s_ranges[7];
     float sh_amp=s_dbl[0], ct_amp=s_dbl[1];
-
-    __shared__ float s_grid[TILE][TILE];
+    __shared__ float s_grid[MAX_GRIDS * MAX_GRIDS];
     __shared__ int s_found;
 
+    // Process grids one at a time
     for (int gid = 0; gid < num_grids; gid++) {
         if (tid == 0) s_found = 0;
         __syncthreads();
-        if (s_found) break;
 
         int ox = grid_offsets[gid*2], oz = grid_offsets[gid*2+1];
         int total = G * G;
 
-        // Fill tile
-        for (int i = tid; i < total; i += THREADS) {
-            int cx = i % G, cz = i / G;
-            float x = (float)(ox + cx * step), z = (float)(oz + cz * step);
+        // 1. Sample grid into shared memory
+        for (int idx = tid; idx < total; idx += THREADS) {
+            int cx = idx % G, cz = idx / G;
+            float x = (float)(ox + cx * step);
+            float z = (float)(oz + cz * step);
 
             float dx = 0, dz = 0;
-            for (int j = sh_as; j < sh_as+sh_ac; j++) {
-                float lf = s_lac[j];
-                dx += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],x*lf,0.0f,z*lf);
-                dz += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],z*lf,x*lf,0.0f);
+            // shift A: dx=shift(x,0,z) dz=shift(z,x,0)  → y=x for dz!
+            for (int i=sh_as; i<sh_as+sh_ac; i++) {
+                float lf=s_lac[i];
+                dx += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],x*lf,0.0f,z*lf);
+                dz += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],z*lf,x*lf,0.0f);
             }
-            for (int j = sh_bs; j < sh_bs+sh_bc; j++) {
-                float lf = s_lac[j];
-                dx += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],x*lf*fr,0.0f,z*lf*fr);
-                dz += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],z*lf*fr,x*lf*fr,0.0f);
+            // shift B
+            for (int i=sh_bs; i<sh_bs+sh_bc; i++) {
+                float lf=s_lac[i];
+                dx += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],x*lf*fr,0.0f,z*lf*fr);
+                dz += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],z*lf*fr,x*lf*fr,0.0f);
             }
             dx *= sh_amp; dz *= sh_amp;
             float px = x + dx*4.0f, pz = z + dz*4.0f;
 
+            // continentalness at y=0
             float cont = 0;
-            for (int j = ct_as; j < ct_as+ct_ac; j++) {
-                float lf = s_lac[j];
-                cont += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],px*lf,0.0f,pz*lf);
+            for (int i=ct_as; i<ct_as+ct_ac; i++) {
+                float lf=s_lac[i];
+                cont += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],px*lf,0.0f,pz*lf);
             }
-            for (int j = ct_bs; j < ct_bs+ct_bc; j++) {
-                float lf = s_lac[j];
-                cont += s_amp[j]*perlin(s_perm[j],s_oa[j],s_ob[j],s_oc[j],s_h2[j],s_d2[j],s_t2[j],px*lf*fr,0.0f,pz*lf*fr);
+            for (int i=ct_bs; i<ct_bs+ct_bc; i++) {
+                float lf=s_lac[i];
+                cont += s_amp[i]*perlin(s_perm[i],s_oa[i],s_ob[i],s_oc[i],s_h2[i],s_d2[i],s_t2[i],px*lf*fr,0.0f,pz*lf*fr);
             }
-            s_grid[cz][cx] = cont * ct_amp;
+            s_grid[idx] = cont * ct_amp;
         }
         __syncthreads();
 
-        // KxK detection
-        int bpa = G - K + 1, tblks = bpa * bpa;
-        for (int i = tid; i < tblks; i += THREADS) {
-            int bx = i % bpa, bz = i / bpa;
-            int hit = 1;
-            for (int dz2 = 0; dz2 < K && hit; dz2++)
-                for (int dx2 = 0; dx2 < K; dx2++)
-                    if (s_grid[bz+dz2][bx+dx2] >= -1.05f) { hit = 0; break; }
-            if (hit) {
+        // 2. Check for K×K blocks where ALL cells < -1.05
+        // Only need ceil((G-K+1)^2 / THREADS) threads for this
+        int blocks_per_axis = G - K + 1;
+        int total_blocks = blocks_per_axis * blocks_per_axis;
+        for (int idx = tid; idx < total_blocks; idx += THREADS) {
+            int bx = idx % blocks_per_axis;
+            int bz = idx / blocks_per_axis;
+            int all_mushroom = 1;
+            for (int dz2 = 0; dz2 < K && all_mushroom; dz2++) {
+                for (int dx2 = 0; dx2 < K; dx2++) {
+                    if (s_grid[(bz+dz2)*G + (bx+dx2)] >= -1.05f) {
+                        all_mushroom = 0;
+                        break;
+                    }
+                }
+            }
+            if (all_mushroom) {
+                // Found! Write hit coordinates (center of the K×K block)
                 hit_flags[seed] = 1;
                 hit_gx[seed] = ox + (bx + K/2) * step;
                 hit_gz[seed] = oz + (bz + K/2) * step;
                 hit_grid[seed] = gid;
-                s_found = 1;
+                s_found = 1;  // signal all threads to break cooperatively
             }
         }
         __syncthreads();
+        // All threads break together — no divergence at next __syncthreads
         if (s_found) break;
     }
 }
