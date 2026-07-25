@@ -2,14 +2,14 @@
 
 GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
      threshold -1.0, 6-neighbor adjacent pair detection. ~20K seeds/s.
-     Optional pre-filter: GPU LUT-variance filter on raw seeds in RAM,
-     writes only survivors to disk, hunt scans only survivors.
+     Optional pre-filter: GPU LUT-variance filter generates a consecutive
+     seed range on-device and returns only compacted survivors.
 
 CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
      Logs >=3M block^2 islands to islands_3m.jsonl.
 """
-import sys, os, time, ctypes, json, random, array, struct
+import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -20,35 +20,28 @@ GPU_DIR = os.path.dirname(__file__)
 _hunt = ctypes.CDLL(os.path.join(GPU_DIR, 'hunt_engine.dll'))
 
 _hunt.hunt_batch_tiered.argtypes = [
-    ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_uint64, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int64),
 ]
 _hunt.hunt_batch_tiered.restype = ctypes.c_int
 
-_hunt.prefilter_gpu.argtypes = [
+_hunt.prefilter_range.argtypes = [
+    ctypes.c_uint64, ctypes.c_int, ctypes.c_float, ctypes.c_float,
     ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
-    ctypes.c_float, ctypes.c_float, ctypes.c_char_p,
 ]
-_hunt.prefilter_gpu.restype = ctypes.c_int
+_hunt.prefilter_range.restype = ctypes.c_int
 
 _hunt.tiered_scan_mem.argtypes = [
     ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
     ctypes.POINTER(ctypes.c_int64),
 ]
 _hunt.tiered_scan_mem.restype = ctypes.c_int
 
-_hunt.hunt_batch_from_file.argtypes = [
-    ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
-]
-_hunt.hunt_batch_from_file.restype = ctypes.c_int
-
 _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
-MAX_HITS = 512
+INITIAL_HIT_CAP = 65_536
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -56,52 +49,58 @@ MAX_HITS = 512
 # Lower rejects noise, upper rejects score-ceiling randoms
 PREFT_LO = 0.0429   # captures 65% of 4M+ in [0.0429, 0.0433]
 PREFT_HI = 0.0433   # 23× enrichment, ~0.95% random pass
-PREFT_ENABLED = True  # prefilter 100M seeds → survivors to disk → tiered scan
-PREF_BATCH = 100_000_000  # 100M seeds/batch = 800MB RAM
+PREFT_ENABLED = True
+PREF_BATCH = 100_000_000
+PREF_SURVIVOR_CAP = 2_000_000
 
 
 def hunt_batch_tiered(start_seed, n, step_2x, G):
-    counts = (ctypes.c_int * n)()
-    results = (ctypes.c_int64 * (n * MAX_HITS * 3))()
-    hc = _hunt.hunt_batch_tiered(
-        ctypes.c_uint64(start_seed), ctypes.c_int(n),
-        ctypes.c_int(step_2x), ctypes.c_int(1), ctypes.c_int(G),
-        counts, results)
+    hit_capacity = INITIAL_HIT_CAP
+    while True:
+        results = (ctypes.c_int64 * (hit_capacity * 3))()
+        hc = _hunt.hunt_batch_tiered(
+            ctypes.c_uint64(start_seed), ctypes.c_int(n),
+            ctypes.c_int(step_2x), ctypes.c_int(G), ctypes.c_int(hit_capacity),
+            results)
+        if hc >= 0:
+            break
+        hit_capacity = -hc
     return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
             for i in range(hc)]
 
 
-def prefilter_gpu(seeds, lo, hi, out_file):
-    """Run prefilter kernel (band pass: lo ≤ score < hi), write survivors."""
-    n = len(seeds)
-    ptr = ctypes.cast(seeds.buffer_info()[0], ctypes.POINTER(ctypes.c_uint64))
-    return _hunt.prefilter_gpu(ptr, ctypes.c_int(n),
-                                ctypes.c_float(lo), ctypes.c_float(hi),
-                                ctypes.c_char_p(out_file.encode('utf-8')))
+def prefilter_range(start_seed, n, lo, hi, survivors):
+    """Run the band-pass prefilter on a consecutive seed range."""
+    return _hunt.prefilter_range(
+        ctypes.c_uint64(start_seed), ctypes.c_int(n),
+        ctypes.c_float(lo), ctypes.c_float(hi), survivors,
+        ctypes.c_int(len(survivors)))
 
 
 CHUNK = 8192
 
-def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
-    """Read survivors from disk, scan in 8192-seed chunks, submit hits
-    incrementally to the thread pool. Islands start appearing immediately."""
-    with open(seed_file, 'rb') as f:
-        data = f.read()
-    n = len(data) // 8
+def scan_survivors_stream(seeds, n, step_2x, G, pool, on_done, s1x, s2x):
+    """Scan compacted survivors in chunks and submit hits immediately."""
     if n == 0:
         return 0
-    all_seeds = array.array('Q')
-    all_seeds.frombytes(data)
-    del data
 
     total_hits = 0
+    hit_capacity = INITIAL_HIT_CAP
+    results = (ctypes.c_int64 * (hit_capacity * 3))()
     for off in range(0, n, CHUNK):
         sz = min(CHUNK, n - off)
-        chunk = all_seeds[off:off+sz]
-        ptr = ctypes.cast(chunk.buffer_info()[0], ctypes.POINTER(ctypes.c_uint64))
-        counts = (ctypes.c_int * sz)()
-        results = (ctypes.c_int64 * (sz * MAX_HITS * 3))()
-        hc = _hunt.tiered_scan_mem(ptr, sz, step_2x, G, counts, results)
+        ptr = ctypes.cast(
+            ctypes.byref(seeds, off * ctypes.sizeof(ctypes.c_uint64)),
+            ctypes.POINTER(ctypes.c_uint64))
+        hc = _hunt.tiered_scan_mem(
+            ptr, sz, step_2x, G, hit_capacity, results)
+        if hc < 0:
+            hit_capacity = -hc
+            results = (ctypes.c_int64 * (hit_capacity * 3))()
+            hc = _hunt.tiered_scan_mem(
+                ptr, sz, step_2x, G, hit_capacity, results)
+        if hc < 0:
+            raise RuntimeError(f'tiered scan overflow retry failed: {-hc} hits')
         for i in range(hc):
             seed, gx, gz = int(results[i*3]), int(results[i*3+1]), int(results[i*3+2])
             pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x).add_done_callback(on_done)
@@ -212,33 +211,35 @@ if __name__ == '__main__':
                     json.dump(entry, f)
 
     def gpu_thread():
-        global scanned, hits_gpu, t_gpu
-        sur_file = 'seeds_pass.bin'
+        global scanned, tiered_scanned, hits_gpu, t_gpu
         use_prefilter = PREFT_ENABLED
         batch_num = 0
+        survivor_capacity = PREF_SURVIVOR_CAP
+        survivors = (ctypes.c_uint64 * survivor_capacity)()
         while running:
             start = random.getrandbits(64)
             t1 = time.perf_counter()
 
             if use_prefilter:
                 batch_num += 1
-                # Phase 1: generate seeds
-                t_gen0 = time.perf_counter()
-                arr = array.array('Q', range(start, start + PREF_BATCH))
-                t_gen1 = time.perf_counter()
-
-                # Phase 2: prefilter on GPU
-                n_pass = prefilter_gpu(arr, PREFT_LO, PREFT_HI, sur_file)
+                n_pass = prefilter_range(start, PREF_BATCH, PREFT_LO, PREFT_HI, survivors)
+                if n_pass < 0:
+                    survivor_capacity = -n_pass
+                    survivors = (ctypes.c_uint64 * survivor_capacity)()
+                    n_pass = prefilter_range(
+                        start, PREF_BATCH, PREFT_LO, PREFT_HI, survivors)
+                if n_pass < 0:
+                    raise RuntimeError(f'prefilter overflow retry failed: {-n_pass} survivors')
                 t_pref = time.perf_counter()
                 with lock: scanned += PREF_BATCH
 
                 if n_pass <= 0:
                     print(f'\n  batch {batch_num}: {PREF_BATCH//1_000_000}M seeds -> 0 survivors '
-                          f'(gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
+                          f'(pref {t_pref-t1:.2f}s)')
                     continue
 
-                # Phase 3: tiered scan (streaming — hits submitted as chunks complete)
-                hc = scan_survivors_stream(sur_file, step_2x, G, pool, on_done, step_1x, step_2x)
+                hc = scan_survivors_stream(
+                    survivors, n_pass, step_2x, G, pool, on_done, step_1x, step_2x)
                 t_end = time.perf_counter()
                 with lock:
                     hits_gpu += hc
@@ -247,7 +248,7 @@ if __name__ == '__main__':
                 t_total = t_end - t1
                 t_scan_time = t_end - t_pref
                 print(f'\n  batch {batch_num}: prefilter {PREF_BATCH//1_000_000}M -> {n_pass:,} survivors '
-                      f'({t_total:.1f}s: gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
+                      f'({t_total:.1f}s: pref {t_pref-t1:.2f}s)')
                 print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
             else:
                 hits = hunt_batch_tiered(start, batch, step_2x, G)

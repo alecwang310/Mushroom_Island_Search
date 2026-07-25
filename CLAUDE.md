@@ -2,47 +2,44 @@
 
 ## Objective
 
-Find Minecraft seeds with mushroom islands ≥ 3 million blocks², **speed over accuracy**. We prioritize scanning more seeds faster over catching every island.
+Find Minecraft seeds with mushroom islands ≥ 4 million blocks², **speed over accuracy**. We prioritize scanning more seeds faster over catching every island.
 
 ## Pipeline (current: hex grid O6+O15)
 
 ```
-Seed → [optional: prefilter_kernel GPU — LUT variance filter]
-     → cont_batch_init (CPU, 6.9µs/seed) → upload (PCIe)
+Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
+     → compact survivor seeds in RAM (no 800MB host seed array or disk round trip)
+     → cont_batch_init_tiered (CPU, O6+O15 only) → one compact upload
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
-     → download pairs (~500 per batch)
+     → download only compacted hit pairs
      → CPU verify (≥2 hex points, all cont octaves, 22µs/hit)
      → CPU 6-octave flood (C, 37ms) → if area≥3M, 24-octave flood (134ms)
-     → log to islands_3m.jsonl
+     → log results ≥4M to islands_4m.jsonl
 ```
 
-**Throughput: ~20,000 seeds/s at G=512, step_2x=280 (no pre-filter).**
-**With pre-filter at p99.5: ~140K seeds/s init-limited, GPU does 200× less work.**
-**CPU keeps up with 16 workers.**
+The previous baseline was ~20,000 tiered seeds/s at G=512 and step_2x=280.
+The compact initialization/transfer path must be benchmarked on the CUDA host after rebuilding.
 
 ## File Structure
 
 ```
 engine/                        # CPU continentalness engine (C + Python bindings)
   continentalness.h            #   24-octave Perlin noise, MC 1.18+ exact
-  continentalness.c            #   cont_sample, cont_flood_fill, cont_flood_fill_6oct
+  continentalness.c            #   sampling, compact tier init, flood fills
   __init__.py                  #   Python ctypes bindings (ContEngine class)
 
 gpu/
   tiered_kernel.cu             # ★ Current main kernel: hex grid, 2 octaves only
-  prefilter_kernel.cu          # ★ NEW: GPU-side seed init + variance LUT pre-filter
+  prefilter_kernel.cu          #    GPU seed-range variance LUT pre-filter
   variance_lut.h               #    Precomputed analytic LUT + MD5/amplitude constants
-  hunt_engine.cu               #    DLL host: upload, launch, download, timing
+  hunt_engine.cu               #    DLL host: compact init/upload/launch/download
   hunt_tiered.py               # ★ Current hunt script: GPU thread + CPU verify + flood
-  sparse_kernel.cu             #    Baseline kernel (all 24 octaves, K=2, square grid)
-  warp_shuffle.cu              #    Experimental register-based perm table (broken)
-  bench_ws.py                  #    Compare shared-mem vs warp-shuffle variants
   gpu_monitor.py               #    nvidia-smi polling script
 
 continentalness_pipeline.py    # Pure-Python reference implementation (verified vs cubiomes)
 build_variance_lut.py          # Builds analytic variance LUT + pre-filter threshold calibration
 variance_lut.npz               # Saved LUT (256 floats)
-islands_3m.jsonl               # Output: seed, area, center_1:4 coords
+islands_4m.jsonl               # Output: seed, area, center coordinates
 ```
 
 ## Pre-Filter (prefilter_kernel.cu)
@@ -54,8 +51,8 @@ islands_3m.jsonl               # Output: seed, area, center_1:4 coords
   Gradient table has `Syy=0.75 > Sxx,Szz=0.625`, so dy controls y-energy
   coupling into the 2D slice. Island seeds have dy tightly clustered near 0.5.
 - **LUT**: `gpu/variance_lut.h` — 256 floats, analytic integral over (dx,dz)∈[0,1]²
-- **Speed**: ~520 RNG calls/seed, one thread/seed, ~microseconds per batch
-- **Output**: scores[i], plus compacted pass_idx[] for seeds ≥ threshold
+- **Work**: 10 Xoroshiro draws/seed, one thread/seed
+- **Input/output**: seed is generated as `start_seed + tid`; only survivor seeds are copied back
 - **Thresholds** (from `build_variance_lut.py`):
   | pct | threshold | islands kept | randoms rejected |
   |-----|-----------|-------------|-----------------|
@@ -74,15 +71,15 @@ islands_3m.jsonl               # Output: seed, area, center_1:4 coords
 - **Threads**: 256 per block, 4 blocks/SM, 64 registers/thread
 - **Tiling**: 32×32 cells per tile, MAXC=4 cells/thread
 - **Perm storage**: uint32_t[257] per octave (zero bank conflict attempt, marginal gain)
-- **Perm load**: Both perms loaded together, single __syncthreads() per tile
-- **Detection**: 6-neighbor adjacency on s_grid. All pairs written via atomicAdd.
-- **Timing**: clock64() measures perlin (97%) vs detection (3%)
+- **Perm load**: Both invariant tables are loaded once per seed block
+- **Detection**: 6-neighbor adjacency on s_grid. Hits are compacted into one global buffer.
+- **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
 
 ## CPU Pipeline (hunt_tiered.py)
 
 - **16 workers** (ThreadPoolExecutor)
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
-- **Verify** (`verify_pair_cpu`): O6+O15 only, 5 hex points, ≥2 must be < -1.0
+- **Verify** (`verify_pair_cpu`): all continentalness octaves without shift, up to 10 hex points
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
 - **Dedup**: by (seed, area) to avoid logging same island from adjacent pairs
@@ -102,7 +99,7 @@ islands_3m.jsonl               # Output: seed, area, center_1:4 coords
 ```powershell
 # GPU DLL
 cd gpu
-nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu sparse_kernel.cu warp_shuffle.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
+nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
 
 # Engine DLL (if continentalness.c changes)
 cd engine
@@ -116,10 +113,7 @@ cd D:\Code\Seeds
 python gpu\hunt_tiered.py
 ```
 
-Logs islands ≥ 3M to `islands_3m.jsonl`. Ctrl+C to stop.
+Logs islands ≥ 4M to `islands_4m.jsonl`. Ctrl+C to stop.
 
-**Pre-filter mode**: Edit `PREFT_PCT` in `gpu/hunt_tiered.py`:
-- `None` — disabled (full GPU scan on all seeds)
-- `90` — reject 90% randoms, keep 91% islands
-- `99` — reject 99% randoms, keep 23% islands
-- `995` — reject 99.5% randoms, keep 12% islands
+Pre-filter mode is controlled by `PREFT_ENABLED`, `PREFT_LO`, and `PREFT_HI`
+in `gpu/hunt_tiered.py`.

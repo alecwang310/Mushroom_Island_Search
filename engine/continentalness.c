@@ -444,6 +444,57 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
     }
 }
 
+void cont_batch_init_tiered(const uint64_t *seeds, int n, int large_biomes,
+                            ContTieredParams *out)
+{
+    static const double amplitudes[] = {1, 1, 2, 2, 2, 1, 1, 1, 1};
+    const int omin = large_biomes ? -11 : -9;
+    const int md5_idx = 12 + omin;
+    const double lacunarity = lacuna_ini[-omin];
+    const double persistence = persist_ini[9];
+    const uint64_t cont_md5_lo = large_biomes
+        ? 0x9a3f51a113fce8dcULL : 0x83886c9d0ae3a662ULL;
+    const uint64_t cont_md5_hi = large_biomes
+        ? 0xee2dbd157e5dcdadULL : 0xafa638a61b42e8adULL;
+
+    for (int s = 0; s < n; s++) {
+        Xoroshiro root;
+        xSetSeed(&root, seeds[s]);
+        uint64_t xlo = xNextLong(&root);
+        uint64_t xhi = xNextLong(&root);
+
+        Xoroshiro cont = {xlo ^ cont_md5_lo, xhi ^ cont_md5_hi};
+        uint64_t octave_lo[CONT_TIERED_OCTAVES];
+        uint64_t octave_hi[CONT_TIERED_OCTAVES];
+        octave_lo[0] = xNextLong(&cont);
+        octave_hi[0] = xNextLong(&cont);
+        octave_lo[1] = xNextLong(&cont);
+        octave_hi[1] = xNextLong(&cont);
+
+        ContTieredParams *params = out + s;
+        for (int octave = 0; octave < CONT_TIERED_OCTAVES; octave++) {
+            double oa, ob, oc, d2, t2;
+            uint8_t h2;
+            uint8_t perm[CONT_PERM_SIZE];
+            perlin_init(perm, &oa, &ob, &oc, &h2, &d2, &t2,
+                        octave_lo[octave] ^ md5_octave[md5_idx][0],
+                        octave_hi[octave] ^ md5_octave[md5_idx][1]);
+            memcpy(params->perm[octave], perm, CONT_TIERED_PERM_SIZE);
+            params->offset_a[octave] = (float)oa;
+            params->offset_b[octave] = (float)ob;
+            params->offset_c[octave] = (float)oc;
+            params->amplitude[octave] = (float)(amplitudes[0] * persistence);
+            params->lacunarity[octave] = (float)lacunarity;
+            params->cached_h2[octave] = h2;
+            params->cached_d2[octave] = (float)d2;
+            params->cached_t2[octave] = (float)t2;
+        }
+        params->padding[0] = 0;
+        params->padding[1] = 0;
+        params->cont_dbl_amp = (float)amp_ini[9];
+    }
+}
+
 /* ==========================================================================
  * Flood fill — BFS to measure island area. No Python in the loop.
  * ========================================================================== */

@@ -19,6 +19,8 @@ extern "C" {
 /* Maximum octaves: 3 (shift octA) + 3 (shift octB) + 9 (cont octA) + 9 (cont octB) */
 #define CONT_MAX_OCTAVES 24
 #define CONT_PERM_SIZE 257
+#define CONT_TIERED_OCTAVES 2
+#define CONT_TIERED_PERM_SIZE 256
 
 typedef struct {
     /* Perlin noise parameters — one flat array per field (SoA layout for SIMD) */
@@ -45,6 +47,21 @@ typedef struct {
     /* Frequency ratio for DoublePerlin octB (337/331) */
     double freq_ratio;
 } ContEngine;
+
+/* Compact state for the O6+O15 tiered GPU scan. */
+typedef struct {
+    uint8_t perm[CONT_TIERED_OCTAVES][CONT_TIERED_PERM_SIZE];
+    float offset_a[CONT_TIERED_OCTAVES];
+    float offset_b[CONT_TIERED_OCTAVES];
+    float offset_c[CONT_TIERED_OCTAVES];
+    float amplitude[CONT_TIERED_OCTAVES];
+    float lacunarity[CONT_TIERED_OCTAVES];
+    uint8_t cached_h2[CONT_TIERED_OCTAVES];
+    uint8_t padding[2];
+    float cached_d2[CONT_TIERED_OCTAVES];
+    float cached_t2[CONT_TIERED_OCTAVES];
+    float cont_dbl_amp;
+} ContTieredParams;
 
 /**
  * Initialize the engine for a world seed.
@@ -87,6 +104,13 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
                      uint8_t *perms, float *oa, float *ob, float *oc,
                      float *amp, float *lac, uint8_t *h2,
                      float *d2, float *t2, int32_t *ranges, float *dbl_amps);
+
+/**
+ * Initialize only the two continentalness octaves used by tiered_scan:
+ * the first octave of continentalness A and B (O6 and O15 for normal worlds).
+ */
+void cont_batch_init_tiered(const uint64_t *seeds, int n, int large_biomes,
+                            ContTieredParams *out);
 
 /**
  * Flood fill to measure mushroom island area.

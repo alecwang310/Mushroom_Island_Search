@@ -4,16 +4,14 @@
  * Simulates Xoroshiro128++ RNG per seed to extract ob6 and ob15,
  * then scores: score = amp6²·LUT[frac(ob6)] + amp15²·LUT[frac(ob15)]
  *
- * One thread per seed. ~520 RNG calls/seed. Rejection sampling skipped
- * for perm generation (bias < 1e-7, negligible for statistical filter).
+ * One thread per seed. Only the 10 Xoroshiro draws needed to reach the two
+ * y-offsets are evaluated; no permutation table is generated in this stage.
  *
- * Output: scores[i], and pass_idx[] (compacted indices of seeds above threshold).
+ * Output: compacted survivor seeds for a consecutive uint64 seed range.
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include "variance_lut.h"
-
-#define THREADS_PER_BLOCK 256
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Xoroshiro128++ — exact match with Minecraft/continentalness_pipeline.py
@@ -37,14 +35,6 @@ __device__ __forceinline__ double xNextDouble(uint64_t &lo, uint64_t &hi) {
     uint64_t n;
     xNextLong(lo, hi, n);
     return (double)(n >> 11) * (1.0 / (double)(1ULL << 53));
-}
-
-// Simplified xNextInt: skip rejection sampling. Bias < 1/2^32 per call.
-// For n=256, 2^32/256 = 16,777,216 exactly → zero bias.
-__device__ __forceinline__ int xNextIntFast(uint64_t &lo, uint64_t &hi, int n) {
-    uint64_t rng;
-    xNextLong(lo, hi, rng);
-    return (int)(((rng & 0xFFFFFFFFULL) * (uint64_t)n) >> 32);
 }
 
 __device__ void xSetSeed(uint64_t seed, uint64_t &lo, uint64_t &hi) {
@@ -94,14 +84,14 @@ __device__ __forceinline__ float lut_lookup(float dy) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 extern "C" __global__ void prefilter_seeds(
-    const uint64_t *seeds, int n,
-    float *scores, int *pass_idx, int *pass_count,
+    uint64_t start_seed, int n,
+    uint64_t *survivors, int survivor_capacity, int *pass_count,
     float lo_thresh, float hi_thresh, int large_biomes)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    uint64_t seed = seeds[tid];
+    uint64_t seed = start_seed + (uint64_t)tid;
 
     // ── Step 1: xSetSeed ─────────────────────────────────────────────
     uint64_t lo, hi;
@@ -136,11 +126,10 @@ extern "C" __global__ void prefilter_seeds(
     float score = CONT_AMP_SQ * lut_lookup(dy6)
                 + CONT_AMP_SQ * lut_lookup(dy15);
 
-    scores[tid] = score;
-
     // ── Step 8: stream compaction (band pass: lo ≤ score < hi) ─────
     if (score >= lo_thresh && score < hi_thresh) {
         int idx = atomicAdd(pass_count, 1);
-        pass_idx[idx] = tid;
+        if (idx < survivor_capacity)
+            survivors[idx] = seed;
     }
 }
