@@ -1,204 +1,418 @@
 /*
- * tiered_kernel.cu — Hex grid O6+O15 mushroom prefilter.
+ * tiered_kernel.cu — Hex-grid O6+O15 mushroom prefilter.
  *
- * Grid: hex lattice (staggered rows, D=step_2x, 6 neighbors).
- * Only 2 octaves: O6 (cont A first) + O15 (cont B first).
- * No shift distortion — my_dx=my_dz=0, continentalness sampled at raw (x,z).
- * Threshold: -1.00 combined.
+ * Default path:
+ *   - Each warp keeps both 256-byte permutation tables in packed registers.
+ *   - One lane owns eight consecutive bytes (two uint32 registers) per table.
+ *   - Adjacent permutation lookups use three PTX shuffles per pair instead of
+ *     fourteen conflict-prone shared-memory loads per Perlin evaluation.
+ *   - One cell is evaluated per thread wave to keep register pressure bounded.
+ *   - Detection uses one 32-bit mask per row instead of a float shared grid.
  *
- * Phase 1: continentalness at hex grid points → s_grid[32][32].
- * Phase 2: 6-neighbor adjacent pair detection → compact global hit buffer.
+ * Build with -DTIERED_USE_WARP_PERM=0 for the shared-memory reference path.
+ * If ptxas reports spills, benchmark TIERED_MIN_BLOCKS_PER_SM=3 before raising
+ * register limits manually; the four permutation words are used every wave and
+ * should remain resident rather than being spilled to local/L2 memory.
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include "../engine/continentalness.h"
 
-#define THREADS     256
-#define TILE        32
-#define MAXC        4
-#define MAX_HITS    512
+#define THREADS  256
+#define TILE     32
+#define WAVES    4
+#define MAX_HITS 512
+#define FULL_MASK 0xFFFFFFFFu
 
-__constant__ float c_grad_tier[16][3] = {
-    { 1, 1, 0}, {-1, 1, 0}, { 1,-1, 0}, {-1,-1, 0},
-    { 1, 0, 1}, {-1, 0, 1}, { 1, 0,-1}, {-1, 0,-1},
-    { 0, 1, 1}, { 0,-1, 1}, { 0, 1,-1}, { 0,-1,-1},
-    { 1, 1, 0}, { 0,-1, 1}, {-1, 1, 0}, { 0,-1,-1},
-};
+#ifndef TIERED_USE_WARP_PERM
+#define TIERED_USE_WARP_PERM 1
+#endif
 
-__device__ __forceinline__ float perlin32(
-    const uint32_t *perm, float oa, float ob, float oc,
-    uint8_t cached_h2, float cached_d2, float cached_t2,
-    float x, float y, float z)
-{
-    float d1 = x + oa, d2 = y + ob, d3 = z + oc;
-    uint8_t h2; float t2;
-    if (y == 0.0f) {
-        h2 = cached_h2; d2 = cached_d2; t2 = cached_t2;
-    } else {
-        float i2 = floorf(d2); d2 -= i2;
-        h2 = (uint8_t)((int)i2 & 0xFF);
-        t2 = d2*d2*d2 * (d2*(d2*6.0f - 15.0f) + 10.0f);
-    }
-    float i1 = floorf(d1), i3 = floorf(d3); d1 -= i1; d3 -= i3;
-    int h1 = ((int)i1) & 0xFF, h3 = ((int)i3) & 0xFF;
-    float t1 = d1*d1*d1 * (d1*(d1*6.0f - 15.0f) + 10.0f);
-    float t3 = d3*d3*d3 * (d3*(d3*6.0f - 15.0f) + 10.0f);
+#ifndef TIERED_MIN_BLOCKS_PER_SM
+#define TIERED_MIN_BLOCKS_PER_SM 4
+#endif
 
-    // All lookups via perm[idx] & 0xFF — uint32_t array, no bank conflicts
-    int va  = (perm[h1] & 0xFF)   + h2, vb  = (perm[h1+1] & 0xFF) + h2;
-    int v2a = (perm[va & 0xFF] & 0xFF) + h3, v2b = (perm[(va & 0xFF)+1] & 0xFF) + h3;
-    int v3a = (perm[vb & 0xFF] & 0xFF) + h3, v3b = (perm[(vb & 0xFF)+1] & 0xFF) + h3;
-    int v4a = (perm[v2a & 0xFF] & 0xFF),     v4b = (perm[(v2a & 0xFF)+1] & 0xFF);
-    int v5a = (perm[v2b & 0xFF] & 0xFF),     v5b = (perm[(v2b & 0xFF)+1] & 0xFF);
-    int v6a = (perm[v3a & 0xFF] & 0xFF),     v6b = (perm[(v3a & 0xFF)+1] & 0xFF);
-    int v7a = (perm[v3b & 0xFF] & 0xFF),     v7b = (perm[(v3b & 0xFF)+1] & 0xFF);
+static_assert(THREADS % 32 == 0, "tiered_scan requires whole warps");
+static_assert(THREADS * WAVES == TILE * TILE,
+              "thread waves must cover one complete tile");
 
-    #define L(i,a,b,c) (c_grad_tier[(i)&0xF][0]*(a) + \
-                         c_grad_tier[(i)&0xF][1]*(b) + \
-                         c_grad_tier[(i)&0xF][2]*(c))
-    float l1 = L(v4a, d1, d2, d3),   l5 = L(v4b, d1, d2, d3-1);
-    float l2 = L(v6a, d1-1, d2, d3), l6 = L(v6b, d1-1, d2, d3-1);
-    float l3 = L(v5a, d1, d2-1, d3), l7 = L(v5b, d1, d2-1, d3-1);
-    float l4 = L(v7a, d1-1, d2-1, d3), l8 = L(v7b, d1-1, d2-1, d3-1);
-    #undef L
-
-    l1 += t1*(l2 - l1); l3 += t1*(l4 - l3);
-    l5 += t1*(l6 - l5); l7 += t1*(l8 - l7);
-    l1 += t2*(l3 - l1); l5 += t2*(l7 - l5);
-    return l1 + t3*(l5 - l1);
+__device__ __forceinline__ float fade(float value) {
+    return value * value * value
+        * (value * (value * 6.0f - 15.0f) + 10.0f);
 }
 
+__device__ __forceinline__ float grad_dot(
+    uint32_t hash, float x, float y, float z)
+{
+    uint32_t h = hash & 15u;
+    float u = h < 8u ? x : y;
+    float v = h < 4u ? y : ((h == 12u || h == 14u) ? x : z);
+    uint32_t u_bits = __float_as_uint(u) ^ ((h & 1u) * 0x80000000u);
+    uint32_t v_bits = __float_as_uint(v) ^ (((h >> 1) & 1u) * 0x80000000u);
+    return __uint_as_float(u_bits) + __uint_as_float(v_bits);
+}
 
-extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
+#if TIERED_USE_WARP_PERM
+
+__device__ __forceinline__ void keep_perm_words(
+    uint32_t &perm6_lo, uint32_t &perm6_hi,
+    uint32_t &perm15_lo, uint32_t &perm15_hi)
+{
+    asm volatile(""
+        : "+r"(perm6_lo), "+r"(perm6_hi),
+          "+r"(perm15_lo), "+r"(perm15_hi));
+}
+
+__device__ __forceinline__ uint32_t perm_pair_warp(
+    uint32_t local_lo, uint32_t local_hi, uint32_t index)
+{
+    uint32_t wrapped = index & 0xFFu;
+    uint32_t source_lane = wrapped >> 3;
+    uint32_t next_lane = (source_lane + 1u) & 31u;
+    uint32_t byte_offset = wrapped & 7u;
+
+    uint32_t source_lo, source_hi, next_lo;
+    asm volatile(
+        "shfl.sync.idx.b32 %0, %3, %5, 31, 0xFFFFFFFF;\n\t"
+        "shfl.sync.idx.b32 %1, %4, %5, 31, 0xFFFFFFFF;\n\t"
+        "shfl.sync.idx.b32 %2, %3, %6, 31, 0xFFFFFFFF;"
+        : "=&r"(source_lo), "=&r"(source_hi), "=&r"(next_lo)
+        : "r"(local_lo), "r"(local_hi),
+          "r"(source_lane), "r"(next_lane));
+
+    uint32_t selector = byte_offset | ((byte_offset + 1u) << 4);
+    uint32_t adjacent;
+    asm volatile("prmt.b32 %0, %1, %2, %3;"
+        : "=r"(adjacent)
+        : "r"(source_lo), "r"(source_hi), "r"(selector));
+
+    uint32_t crossing = (source_hi >> 24) | ((next_lo & 0xFFu) << 8);
+    return (byte_offset == 7u ? crossing : adjacent) & 0xFFFFu;
+}
+
+__device__ __forceinline__ float perlin_warp(
+    uint32_t perm_lo, uint32_t perm_hi,
+    float offset_x, float offset_z,
+    uint32_t cached_h2, float cached_d2, float cached_t2,
+    float x, float z)
+{
+    float dx = x + offset_x;
+    float dz = z + offset_z;
+    int cell_x = __float2int_rd(dx);
+    int cell_z = __float2int_rd(dz);
+    dx -= (float)cell_x;
+    dz -= (float)cell_z;
+    uint32_t h1 = (uint32_t)cell_x & 0xFFu;
+    uint32_t h3 = (uint32_t)cell_z & 0xFFu;
+    float tx = fade(dx);
+    float tz = fade(dz);
+
+    uint32_t pair = perm_pair_warp(perm_lo, perm_hi, h1);
+    uint32_t va = (pair & 0xFFu) + cached_h2;
+    uint32_t vb = (pair >> 8) + cached_h2;
+
+    pair = perm_pair_warp(perm_lo, perm_hi, va);
+    uint32_t v2a = (pair & 0xFFu) + h3;
+    uint32_t v2b = (pair >> 8) + h3;
+    pair = perm_pair_warp(perm_lo, perm_hi, vb);
+    uint32_t v3a = (pair & 0xFFu) + h3;
+    uint32_t v3b = (pair >> 8) + h3;
+
+    pair = perm_pair_warp(perm_lo, perm_hi, v2a);
+    uint32_t v4a = pair & 0xFFu;
+    uint32_t v4b = pair >> 8;
+    pair = perm_pair_warp(perm_lo, perm_hi, v2b);
+    uint32_t v5a = pair & 0xFFu;
+    uint32_t v5b = pair >> 8;
+    pair = perm_pair_warp(perm_lo, perm_hi, v3a);
+    uint32_t v6a = pair & 0xFFu;
+    uint32_t v6b = pair >> 8;
+    pair = perm_pair_warp(perm_lo, perm_hi, v3b);
+    uint32_t v7a = pair & 0xFFu;
+    uint32_t v7b = pair >> 8;
+
+    float l1 = grad_dot(v4a, dx, cached_d2, dz);
+    float l5 = grad_dot(v4b, dx, cached_d2, dz - 1.0f);
+    float l2 = grad_dot(v6a, dx - 1.0f, cached_d2, dz);
+    float l6 = grad_dot(v6b, dx - 1.0f, cached_d2, dz - 1.0f);
+    float l3 = grad_dot(v5a, dx, cached_d2 - 1.0f, dz);
+    float l7 = grad_dot(v5b, dx, cached_d2 - 1.0f, dz - 1.0f);
+    float l4 = grad_dot(v7a, dx - 1.0f, cached_d2 - 1.0f, dz);
+    float l8 = grad_dot(v7b, dx - 1.0f, cached_d2 - 1.0f, dz - 1.0f);
+
+    l1 = fmaf(tx, l2 - l1, l1);
+    l3 = fmaf(tx, l4 - l3, l3);
+    l5 = fmaf(tx, l6 - l5, l5);
+    l7 = fmaf(tx, l8 - l7, l7);
+    l1 = fmaf(cached_t2, l3 - l1, l1);
+    l5 = fmaf(cached_t2, l7 - l5, l5);
+    return fmaf(tz, l5 - l1, l1);
+}
+
+#else
+
+__device__ __forceinline__ uint32_t perm_pair_shared(
+    const uint32_t *perm, uint32_t index)
+{
+    uint32_t wrapped = index & 0xFFu;
+    return (perm[wrapped] & 0xFFu)
+        | ((perm[(wrapped + 1u) & 0xFFu] & 0xFFu) << 8);
+}
+
+__device__ __forceinline__ float perlin_shared(
+    const uint32_t *perm,
+    float offset_x, float offset_z,
+    uint32_t cached_h2, float cached_d2, float cached_t2,
+    float x, float z)
+{
+    float dx = x + offset_x;
+    float dz = z + offset_z;
+    int cell_x = __float2int_rd(dx);
+    int cell_z = __float2int_rd(dz);
+    dx -= (float)cell_x;
+    dz -= (float)cell_z;
+    uint32_t h1 = (uint32_t)cell_x & 0xFFu;
+    uint32_t h3 = (uint32_t)cell_z & 0xFFu;
+    float tx = fade(dx);
+    float tz = fade(dz);
+
+    uint32_t pair = perm_pair_shared(perm, h1);
+    uint32_t va = (pair & 0xFFu) + cached_h2;
+    uint32_t vb = (pair >> 8) + cached_h2;
+    pair = perm_pair_shared(perm, va);
+    uint32_t v2a = (pair & 0xFFu) + h3;
+    uint32_t v2b = (pair >> 8) + h3;
+    pair = perm_pair_shared(perm, vb);
+    uint32_t v3a = (pair & 0xFFu) + h3;
+    uint32_t v3b = (pair >> 8) + h3;
+    pair = perm_pair_shared(perm, v2a);
+    uint32_t v4a = pair & 0xFFu;
+    uint32_t v4b = pair >> 8;
+    pair = perm_pair_shared(perm, v2b);
+    uint32_t v5a = pair & 0xFFu;
+    uint32_t v5b = pair >> 8;
+    pair = perm_pair_shared(perm, v3a);
+    uint32_t v6a = pair & 0xFFu;
+    uint32_t v6b = pair >> 8;
+    pair = perm_pair_shared(perm, v3b);
+    uint32_t v7a = pair & 0xFFu;
+    uint32_t v7b = pair >> 8;
+
+    float l1 = grad_dot(v4a, dx, cached_d2, dz);
+    float l5 = grad_dot(v4b, dx, cached_d2, dz - 1.0f);
+    float l2 = grad_dot(v6a, dx - 1.0f, cached_d2, dz);
+    float l6 = grad_dot(v6b, dx - 1.0f, cached_d2, dz - 1.0f);
+    float l3 = grad_dot(v5a, dx, cached_d2 - 1.0f, dz);
+    float l7 = grad_dot(v5b, dx, cached_d2 - 1.0f, dz - 1.0f);
+    float l4 = grad_dot(v7a, dx - 1.0f, cached_d2 - 1.0f, dz);
+    float l8 = grad_dot(v7b, dx - 1.0f, cached_d2 - 1.0f, dz - 1.0f);
+
+    l1 = fmaf(tx, l2 - l1, l1);
+    l3 = fmaf(tx, l4 - l3, l3);
+    l5 = fmaf(tx, l6 - l5, l5);
+    l7 = fmaf(tx, l8 - l7, l7);
+    l1 = fmaf(cached_t2, l3 - l1, l1);
+    l5 = fmaf(cached_t2, l7 - l5, l5);
+    return fmaf(tz, l5 - l1, l1);
+}
+
+#endif
+
+__device__ __forceinline__ void emit_warp_hits(
+    uint32_t candidate_mask, int lane, int hit_x, int hit_z,
+    int *seed_hit_count, int hit_capacity, int *hit_count,
+    int seed, int3 *hits)
+{
+    if (candidate_mask == 0u) return;
+
+    int warp_count = __popc(candidate_mask);
+    int seed_base = 0;
+    if (lane == 0)
+        seed_base = atomicAdd(seed_hit_count, warp_count);
+    seed_base = __shfl_sync(FULL_MASK, seed_base, 0);
+
+    int accepted = MAX_HITS - seed_base;
+    if (accepted < 0) accepted = 0;
+    if (accepted > warp_count) accepted = warp_count;
+
+    int output_base = 0;
+    if (lane == 0 && accepted > 0)
+        output_base = atomicAdd(hit_count, accepted);
+    output_base = __shfl_sync(FULL_MASK, output_base, 0);
+
+    uint32_t lane_bit = 1u << lane;
+    int rank = __popc(candidate_mask & (lane_bit - 1u));
+    if ((candidate_mask & lane_bit) && rank < accepted) {
+        int output_index = output_base + rank;
+        if (output_index < hit_capacity)
+            hits[output_index] = make_int3(seed, hit_x, hit_z);
+    }
+}
+
+extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
+__global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_2x,
     int hit_capacity, int *hit_count,
     int3 *hits)
 {
-    int seed = blockIdx.x, tid = threadIdx.x;
+    int seed = blockIdx.x;
+    int tid = threadIdx.x;
     if (seed >= num_seeds) return;
 
-    // ---- Perm tables as uint32 to eliminate bank conflicts ----
-    // Each byte stored in its own 32-bit word. 43% conflicts → 0%.
-    // s_perm[257] because perm[256] == perm[0] (hash chain wrap).
-    __shared__ uint32_t s_perm6[257], s_perm15[257];
-    __shared__ float s_grid[TILE][TILE];
-
+    int lane = tid & 31;
+    int warp = tid >> 5;
     const ContTieredParams *seed_params = params + seed;
+
     float oa6 = seed_params->offset_a[0];
-    float ob6 = seed_params->offset_b[0];
     float oc6 = seed_params->offset_c[0];
     float amp6 = seed_params->amplitude[0];
     float lac6 = seed_params->lacunarity[0];
-    uint8_t h26 = seed_params->cached_h2[0];
+    uint32_t h26 = seed_params->cached_h2[0];
     float d26 = seed_params->cached_d2[0];
     float t26 = seed_params->cached_t2[0];
     float oa15 = seed_params->offset_a[1];
-    float ob15 = seed_params->offset_b[1];
     float oc15 = seed_params->offset_c[1];
     float amp15 = seed_params->amplitude[1];
     float lac15 = seed_params->lacunarity[1];
-    uint8_t h215 = seed_params->cached_h2[1];
+    uint32_t h215 = seed_params->cached_h2[1];
     float d215 = seed_params->cached_d2[1];
     float t215 = seed_params->cached_t2[1];
     float ct_amp = seed_params->cont_dbl_amp;
-    float fr = 337.0f / 331.0f;  // only used for O15 (cont B)
+    float frequency_ratio = 337.0f / 331.0f;
 
-    const uint8_t *pb6 = seed_params->perm[0];
-    const uint8_t *pb15 = seed_params->perm[1];
+#if TIERED_USE_WARP_PERM
+    const uint2 *perm6_words = reinterpret_cast<const uint2*>(seed_params->perm[0]);
+    const uint2 *perm15_words = reinterpret_cast<const uint2*>(seed_params->perm[1]);
+    uint2 perm6 = perm6_words[lane];
+    uint2 perm15 = perm15_words[lane];
+#else
+    __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE];
+    __shared__ uint32_t shared_perm15[CONT_TIERED_PERM_SIZE];
     if (tid < CONT_TIERED_PERM_SIZE) {
-        s_perm6[tid] = (uint32_t)pb6[tid];
-        s_perm15[tid] = (uint32_t)pb15[tid];
+        shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid];
+        shared_perm15[tid] = (uint32_t)seed_params->perm[1][tid];
     }
-    if (tid == 0) {
-        s_perm6[CONT_TIERED_PERM_SIZE] = s_perm6[0];
-        s_perm15[CONT_TIERED_PERM_SIZE] = s_perm15[0];
-    }
+#endif
 
-    // ---- Hex grid constants ----
-    float D = (float)step_2x;
-    float D_sqrt3_2 = D * 0.8660254037844386f;
-    int center_x = (int)(-(G / 2) * D);
-    int center_z = (int)(-(G / 2) * D_sqrt3_2);
-    int tiles_dim = (G + TILE - 1) / TILE;
-
-    __shared__ int s_hit_count;
-    if (tid == 0) s_hit_count = 0;
+    __shared__ uint32_t row_masks[TILE];
+    __shared__ int seed_hit_count;
+    if (tid == 0) seed_hit_count = 0;
     __syncthreads();
 
-    float my_cont[MAXC], my_x[MAXC], my_z[MAXC];
-    int my_cx[MAXC], my_cz[MAXC], my_ncells;
+    float spacing_x = (float)step_2x;
+    float spacing_z = spacing_x * 0.8660254037844386f;
+    float half_spacing_x = spacing_x * 0.5f;
+    int center_x = (int)(-(G / 2) * spacing_x);
+    int center_z = (int)(-(G / 2) * spacing_z);
+    int tiles_dim = (G + TILE - 1) / TILE;
 
-    for (int tz = 0; tz < tiles_dim; tz++) {
-        for (int tx = 0; tx < tiles_dim; tx++) {
+    for (int tile_z = 0; tile_z < tiles_dim; tile_z++) {
+        for (int tile_x = 0; tile_x < tiles_dim; tile_x++) {
+            float tile_origin_x = center_x + tile_x * TILE * spacing_x;
+            float tile_origin_z = center_z + tile_z * TILE * spacing_z;
+            int tile_width = tile_x == tiles_dim - 1 ? G - tile_x * TILE : TILE;
+            int tile_height = tile_z == tiles_dim - 1 ? G - tile_z * TILE : TILE;
+            int tile_cells = tile_width * tile_height;
+            bool full_tile = tile_width == TILE && tile_height == TILE;
 
-            float tox = center_x + tx * TILE * D;
-            float toz = center_z + tz * TILE * D_sqrt3_2;
-            int tile_w = (tx == tiles_dim-1) ? G - tx*TILE : TILE;
-            int tile_h = (tz == tiles_dim-1) ? G - tz*TILE : TILE;
-            int tile_cells = tile_w * tile_h;
-
-            my_ncells = 0;
-            for (int i = tid; i < tile_cells && my_ncells < MAXC; i += THREADS) {
-                my_cx[my_ncells] = i % tile_w;
-                my_cz[my_ncells] = i / tile_w;
-                float hx = tox + my_cx[my_ncells] * D;
-                float hz = toz + my_cz[my_ncells] * D_sqrt3_2;
-                if (my_cz[my_ncells] & 1) hx += D * 0.5f;
-                my_x[my_ncells] = hx;
-                my_z[my_ncells] = hz;
-                my_ncells++;
-            }
-            for (int c = 0; c < MAXC; c++) my_cont[c] = 0;
-
-            float lf6 = lac6, aj6 = amp6;
-            #pragma unroll
-            for (int c = 0; c < MAXC; c++) {
-                if (c < my_ncells)
-                    my_cont[c] += aj6 * perlin32(s_perm6, oa6, ob6, oc6, h26, d26, t26,
-                                                 my_x[c]*lf6, 0.0f, my_z[c]*lf6);
+            if (!full_tile) {
+                if (tid < TILE) row_masks[tid] = 0u;
+                __syncthreads();
             }
 
-            float lf15 = lac15, aj15 = amp15;
             #pragma unroll
-            for (int c = 0; c < MAXC; c++) {
-                if (c < my_ncells)
-                    my_cont[c] += aj15 * perlin32(s_perm15, oa15, ob15, oc15, h215, d215, t215,
-                                                  my_x[c]*lf15*fr, 0.0f, my_z[c]*lf15*fr);
-            }
+            for (int wave = 0; wave < WAVES; wave++) {
+                int cell_index = tid + wave * THREADS;
+                bool valid;
+                int cell_x;
+                int cell_z;
+                if (full_tile) {
+                    valid = true;
+                    cell_x = lane;
+                    cell_z = warp + wave * (THREADS / 32);
+                } else {
+                    valid = cell_index < tile_cells;
+                    cell_x = valid ? cell_index % tile_width : 0;
+                    cell_z = valid ? cell_index / tile_width : 0;
+                }
 
-            // Write to s_grid
-            #pragma unroll
-            for (int c = 0; c < MAXC; c++)
-                if (c < my_ncells) s_grid[my_cz[c]][my_cx[c]] = my_cont[c] * ct_amp;
+                float sample_x = valid
+                    ? tile_origin_x + cell_x * spacing_x
+                        + (cell_z & 1) * half_spacing_x
+                    : 0.0f;
+                float sample_z = valid
+                    ? tile_origin_z + cell_z * spacing_z
+                    : 0.0f;
+
+#if TIERED_USE_WARP_PERM
+                keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
+                float continentalness = amp6 * perlin_warp(
+                    perm6.x, perm6.y, oa6, oc6, h26, d26, t26,
+                    sample_x * lac6, sample_z * lac6);
+                continentalness += amp15 * perlin_warp(
+                    perm15.x, perm15.y, oa15, oc15, h215, d215, t215,
+                    sample_x * lac15 * frequency_ratio,
+                    sample_z * lac15 * frequency_ratio);
+#else
+                float continentalness = amp6 * perlin_shared(
+                    shared_perm6, oa6, oc6, h26, d26, t26,
+                    sample_x * lac6, sample_z * lac6);
+                continentalness += amp15 * perlin_shared(
+                    shared_perm15, oa15, oc15, h215, d215, t215,
+                    sample_x * lac15 * frequency_ratio,
+                    sample_z * lac15 * frequency_ratio);
+#endif
+
+                bool low = valid && continentalness * ct_amp < -1.00f;
+                if (full_tile) {
+                    uint32_t mask = __ballot_sync(FULL_MASK, low);
+                    if (lane == 0) row_masks[cell_z] = mask;
+                } else if (low) {
+                    atomicOr(&row_masks[cell_z], 1u << cell_x);
+                }
+            }
             __syncthreads();
 
-            // ---- Detection ----
-            for (int i = tid; i < tile_cells; i += THREADS) {
-                int sx = i % tile_w, sz = i / tile_w;
-                if (s_grid[sz][sx] >= -1.00f) continue;
-
-                int has_nb = 0;
-                int hx[6] = {1, -1, 0, 0, 1, -1};
-                int hz[6] = {0, 0, -1, 1, -1, 1};
-                for (int k = 0; k < 6 && !has_nb; k++) {
-                    int nx = sx + hx[k], nz = sz + hz[k];
-                    if (nx >= 0 && nx < tile_w && nz >= 0 && nz < tile_h)
-                        if (s_grid[nz][nx] < -1.00f) has_nb = 1;
+            #pragma unroll
+            for (int wave = 0; wave < WAVES; wave++) {
+                int cell_index = tid + wave * THREADS;
+                bool valid;
+                int cell_x;
+                int cell_z;
+                if (full_tile) {
+                    valid = true;
+                    cell_x = lane;
+                    cell_z = warp + wave * (THREADS / 32);
+                } else {
+                    valid = cell_index < tile_cells;
+                    cell_x = valid ? cell_index % tile_width : 0;
+                    cell_z = valid ? cell_index / tile_width : 0;
                 }
-                if (!has_nb) continue;
 
-                int idx = atomicAdd(&s_hit_count, 1);
-                if (idx < MAX_HITS) {
-                    float hx_v = tox + sx * D + (sz & 1) * (D * 0.5f);
-                    float hz_v = toz + sz * D_sqrt3_2;
-                    int out_idx = atomicAdd(hit_count, 1);
-                    if (out_idx < hit_capacity)
-                        hits[out_idx] = make_int3(seed, (int)hx_v, (int)hz_v);
+                uint32_t row = valid ? row_masks[cell_z] : 0u;
+                uint32_t neighbors = (row << 1) | (row >> 1);
+                if (valid && cell_z > 0) {
+                    uint32_t above = row_masks[cell_z - 1];
+                    neighbors |= above | (above >> 1);
                 }
+                if (valid && cell_z + 1 < tile_height) {
+                    uint32_t below = row_masks[cell_z + 1];
+                    neighbors |= below | (below << 1);
+                }
+
+                uint32_t bit = 1u << cell_x;
+                bool candidate = valid && (row & bit) && (neighbors & bit);
+                uint32_t candidate_mask = __ballot_sync(FULL_MASK, candidate);
+                int hit_x = (int)(tile_origin_x + cell_x * spacing_x
+                    + (cell_z & 1) * half_spacing_x);
+                int hit_z = (int)(tile_origin_z + cell_z * spacing_z);
+                emit_warp_hits(candidate_mask, lane, hit_x, hit_z,
+                               &seed_hit_count, hit_capacity, hit_count,
+                               seed, hits);
             }
             __syncthreads();
+            if (seed_hit_count >= MAX_HITS) return;
         }
     }
-
 }

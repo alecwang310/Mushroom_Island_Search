@@ -68,11 +68,15 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **Octaves**: Only O6 + O15 (cont A/B first octaves). No shift distortion.
   - O6: amp=0.501, wavelength=2000 blocks. O15: amp=0.501, 1.8% detuned.
 - **Threshold**: O6+O15 < -1.00 (lenient, catches island cores)
-- **Threads**: 256 per block, 4 blocks/SM, 64 registers/thread
-- **Tiling**: 32×32 cells per tile, MAXC=4 cells/thread
-- **Perm storage**: uint32_t[257] per octave (zero bank conflict attempt, marginal gain)
-- **Perm load**: Both invariant tables are loaded once per seed block
-- **Detection**: 6-neighbor adjacency on s_grid. Hits are compacted into one global buffer.
+- **Threads**: 256 per block; launch bounds default to 4 blocks/SM
+- **Tiling**: 32×32 cells per tile, processed as four converged one-cell waves
+- **Perm storage**: each warp distributes each 256-byte table across 32 lanes
+  (two packed uint32 registers per lane per octave)
+- **Perm lookup**: seven adjacent-pair stages per Perlin call; each pair uses three
+  `shfl.sync.idx.b32` instructions plus `prmt.b32`, with no shared-memory lookup
+- **Gradient lookup**: branchless hash arithmetic replaces divergent constant-table reads
+- **Detection**: 32 shared row bitmasks replace the float grid; hit writes are warp-compacted
+- **Fallback**: compile with `-DTIERED_USE_WARP_PERM=0` for the shared-memory reference
 - **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
 
 ## CPU Pipeline (hunt_tiered.py)
@@ -89,22 +93,27 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 1. **Octaves 6+15 contribute 80%** of island signal at center. Always negative for islands.
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
-4. **GPU bottleneck**: 14 serial shared-memory loads in hash chain. Bank conflicts 43-54%.
-   Perlin math is 0.7% of time; 99% is perm loads + shared memory stalls + sync.
+4. **Previous GPU bottleneck**: 14 serial shared-memory loads in the hash chain
+   produced 43-54% bank conflicts. The default kernel now uses warp-register
+   permutation storage; it still needs Nsight benchmarking on the CUDA host.
 5. **CPU bottleneck**: flood fill (37-134ms). ≥2 verify filter keeps pass rate low enough.
-6. 2-octave kernel is at performance ceiling without algorithmic change.
+6. The remaining serial dependency is the seven-stage paired permutation hash chain.
 
 ## Build
 
 ```powershell
 # GPU DLL
 cd gpu
-nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
+nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
 
 # Engine DLL (if continentalness.c changes)
 cd engine
 gcc -O3 -shared -o continentalness.dll continentalness.c -lm
 ```
+
+For the shared-memory A/B baseline, add `-DTIERED_USE_WARP_PERM=0`. If ptxas
+reports spills in the warp path, benchmark `-DTIERED_MIN_BLOCKS_PER_SM=3` rather
+than forcing `--maxrregcount`; the launch-bounds setting is intentionally exposed.
 
 ## Run
 
