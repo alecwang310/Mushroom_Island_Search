@@ -61,7 +61,8 @@ extern "C" __global__ void tiered_scan(
     const float *d2, const float *t2,
     const int *ranges, const float *dbl_amps, int num_seeds,
     int G, int step_2x, int K_coarse,
-    int *hit_counts, int *hit_gx, int *hit_gz);
+    int *hit_counts, int *hit_gx, int *hit_gz,
+    unsigned long long *t_perlin, unsigned long long *t_detect);
 
 // ---- Persistent buffers ----
 struct Buffers {
@@ -372,7 +373,7 @@ extern "C" __declspec(dllexport) int hunt_batch_ws(
 }
 
 // ---- Tiered two-stage variant (multi-hit output) ----
-#define MAX_HITS_PER_SEED 256
+#define MAX_HITS_PER_SEED 512
 extern "C" __declspec(dllexport) int hunt_batch_tiered(
     uint64_t start_seed, int n, int step_2x, int K_coarse, int G,
     int *hit_counts_out, int64_t *hit_results)
@@ -432,17 +433,38 @@ extern "C" __declspec(dllexport) int hunt_batch_tiered(
 
     cudaMemset(d_tier_counts, 0, n * sizeof(int));
 
+    // Timing buffers (allocated once)
+    static unsigned long long *d_tperlin, *d_tdetect;
+    static unsigned long long *h_tperlin, *h_tdetect;
+    static int timer_cap = 0;
+    if (n > timer_cap) {
+        if (timer_cap > 0) { cudaFree(d_tperlin); cudaFree(d_tdetect); free(h_tperlin); free(h_tdetect); }
+        cudaMalloc(&d_tperlin, n * sizeof(unsigned long long));
+        cudaMalloc(&d_tdetect, n * sizeof(unsigned long long));
+        h_tperlin = (unsigned long long*)malloc(n * sizeof(unsigned long long));
+        h_tdetect = (unsigned long long*)malloc(n * sizeof(unsigned long long));
+        timer_cap = n;
+    }
+
     tiered_scan<<<n, THREADS>>>(
         g.d_perm, g.d_oa, g.d_ob, g.d_oc, g.d_amp, g.d_lac,
         g.d_h2, g.d_d2, g.d_t2, g.d_ranges, g.d_dbl, n,
         G, step_2x, K_coarse,
-        d_tier_counts, d_tier_gx, d_tier_gz);
+        d_tier_counts, d_tier_gx, d_tier_gz,
+        d_tperlin, d_tdetect);
     cudaDeviceSynchronize();
 
     cudaMemcpy(h_tier_counts, d_tier_counts, n * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_tier_gx, d_tier_gx, n * MAX_HITS_PER_SEED * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_tier_gz, d_tier_gz, n * MAX_HITS_PER_SEED * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_tperlin, d_tperlin, n * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_tdetect, d_tdetect, n * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 
+    // GPU per-seed timing
+    if (n > 0) {
+        unsigned long long tpl = h_tperlin[0], tdt = h_tdetect[0];
+        printf("GPU cycles (seed 0): perlin=%llu detect=%llu total=%llu\n", tpl, tdt, tpl+tdt);
+    }
     int total = 0;
     for (int i = 0; i < n; i++) {
         int cnt = h_tier_counts[i];

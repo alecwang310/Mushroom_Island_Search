@@ -21,7 +21,7 @@ _hunt.hunt_batch_tiered.restype = ctypes.c_int
 _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
-MAX_HITS = 256  # matches MAX_HITS_PER_SEED in hunt_engine.cu
+MAX_HITS = 512  # plenty for G=512
 
 def hunt_batch_tiered(start_seed, n, step_2x, G):
     counts = (ctypes.c_int * n)()
@@ -35,14 +35,15 @@ def hunt_batch_tiered(start_seed, n, step_2x, G):
 
 
 def verify_pair_cpu(seed, gx, gz, step_1x, step_2x, engine_buf=None):
-    """Hex verification with O6+O15 only, threshold -0.95.
-    5 new hex points. If ANY one is < -0.95, trigger full flood fill."""
+    """Hex verification with all cont octaves (6-23, no shifts), threshold -1.0.
+    5 new hex points. If ANY one is < -1.0, trigger full flood fill."""
     import ctypes, struct
     buf = (ctypes.c_ubyte * 8192)()
     _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
     off_amp = 24*257 + 24*8*3
-    for j in range(24):
-        if j not in {6, 15}: struct.pack_into('d', buf, off_amp + j*8, 0.0)
+    # Zero only shift octaves (0-5), keep all cont (6-23)
+    for j in range(6):
+        struct.pack_into('d', buf, off_amp + j*8, 0.0)
 
     def s(x, z):
         return _eng._lib.cont_sample(buf, x, z)
@@ -99,11 +100,11 @@ def verify_and_flood(seed, gx, gz, step_1x, step_2x):
 
 
 if __name__ == '__main__':
-    TARGET = 2_500_000
+    TARGET = 3_000_000
     step_1x = 140
     step_2x = 280
-    G, batch = 512, 2048
-    FF_WORKERS = 28
+    G, batch = 512, 8192
+    FF_WORKERS = 16
 
     print(f'Target: >= {TARGET:,} blocks^2')
     print(f'step_1x={step_1x}  step_2x={step_2x}  G={G}  batch={batch}')
@@ -141,13 +142,13 @@ if __name__ == '__main__':
             seen.add(key)
             hits_big += 1
             entry = {'seed': r['seed'], 'area': r['area'], 'cx': r['cx'], 'cz': r['cz']}
-            with open('islands_25m.jsonl', 'a') as f:
+            with open('islands_3m.jsonl', 'a') as f:
                 f.write(json.dumps(entry) + '\n')
             print(f'\n  BIG ({r["area"]:,}): seed {r["seed"]} at ({r["cx"]},{r["cz"]})')
             if best is None or r['area'] > best['area']:
                 best = r
                 print(f'  *** NEW BEST: {r["seed"]}, {r["area"]:,} ***')
-                with open('best_25m.jsonl', 'w') as f:
+                with open('best_3m.jsonl', 'w') as f:
                     json.dump(entry, f)
 
     def gpu_thread():

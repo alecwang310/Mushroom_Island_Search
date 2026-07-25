@@ -17,7 +17,7 @@
 #define THREADS     256
 #define TILE        32
 #define MAXC        4
-#define MAX_HITS    256    // max adjacent pairs per seed (1-neighbor mode)
+#define MAX_HITS    512    // plenty for G=512 (avg ~40 pairs/seed)
 
 __constant__ float c_grad_tier[16][3] = {
     { 1, 1, 0}, {-1, 1, 0}, { 1,-1, 0}, {-1,-1, 0},
@@ -75,10 +75,13 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
     const float *d2, const float *t2,
     const int *ranges, const float *dbl_amps, int num_seeds,
     int G, int step_2x, int unused_K,
-    int *hit_counts, int *hit_gx, int *hit_gz)
+    int *hit_counts, int *hit_gx, int *hit_gz,
+    unsigned long long *t_perlin, unsigned long long *t_detect)
 {
     int seed = blockIdx.x, tid = threadIdx.x;
     float fr = 337.0f / 331.0f;
+    unsigned long long t_perlin_acc = 0, t_detect_acc = 0;
+    unsigned long long t_phase;
 
     __shared__ float s_oa[MAX_OCTAVES], s_ob[MAX_OCTAVES], s_oc[MAX_OCTAVES];
     __shared__ float s_amp[MAX_OCTAVES], s_lac[MAX_OCTAVES];
@@ -134,6 +137,7 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
             int tile_h = (tz == tiles_dim-1) ? G - tz*TILE : TILE;
             int tile_cells = tile_w * tile_h;
 
+            if (tid == 0) t_phase = clock64();
             my_ncells = 0;
             for (int i = tid; i < tile_cells && my_ncells < MAXC; i += THREADS) {
                 my_cx[my_ncells] = i % tile_w;
@@ -197,7 +201,8 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
                 if (c < my_ncells) s_grid[my_cz[c]][my_cx[c]] = my_cont[c] * ct_amp;
             __syncthreads();
 
-            // ---- Collect ALL adjacent pairs ----
+            // ---- Detection phase ----
+            if (tid == 0) { unsigned long long t_now = clock64(); t_perlin_acc += t_now - t_phase; t_phase = t_now; }
             for (int i = tid; i < tile_cells; i += THREADS) {
                 int sx = i % tile_w, sz = i / tile_w;
                 if (s_grid[sz][sx] >= -1.00f) continue;
@@ -224,10 +229,15 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
                     hit_gz[my_base + idx] = (int)hz;
                 }
             }
+            if (tid == 0) { unsigned long long t_now = clock64(); t_detect_acc += t_now - t_phase; t_phase = t_now; }
             __syncthreads();
         }
     }
 
-    if (tid == 0) hit_counts[seed] = (s_hit_count < MAX_HITS) ? s_hit_count : MAX_HITS;
+    if (tid == 0) {
+        hit_counts[seed] = (s_hit_count < MAX_HITS) ? s_hit_count : MAX_HITS;
+        t_perlin[seed] = t_perlin_acc;
+        t_detect[seed] = t_detect_acc;
+    }
     #undef LOAD_P
 }
