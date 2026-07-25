@@ -9,7 +9,7 @@ CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
      Logs >=3M block^2 islands to islands_3m.jsonl.
 """
-import sys, os, time, ctypes, json, random, array, struct
+import sys, os, time, ctypes, json, random, array, struct, gc
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -89,12 +89,12 @@ def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
         data = f.read()
     n = len(data) // 8
     if n == 0:
-        return 0
+        return 0, 0
     all_seeds = array.array('Q')
     all_seeds.frombytes(data)
     del data
 
-    total_hits = 0
+    total_hits, total_seeds = 0, 0
     for off in range(0, n, CHUNK):
         sz = min(CHUNK, n - off)
         chunk = all_seeds[off:off+sz]
@@ -106,7 +106,9 @@ def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
             seed, gx, gz = int(results[i*3]), int(results[i*3+1]), int(results[i*3+2])
             pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x).add_done_callback(on_done)
         total_hits += hc
-    return total_hits
+        total_seeds += sz
+    del all_seeds
+    return total_hits, total_seeds
 
 
 def verify_pair_cpu(seed, gx, gz, step_1x, step_2x):
@@ -212,7 +214,7 @@ if __name__ == '__main__':
                     json.dump(entry, f)
 
     def gpu_thread():
-        global scanned, hits_gpu, t_gpu
+        global scanned, tiered_scanned, hits_gpu, t_gpu
         sur_file = 'seeds_pass.bin'
         use_prefilter = PREFT_ENABLED
         batch_num = 0
@@ -229,6 +231,7 @@ if __name__ == '__main__':
 
                 # Phase 2: prefilter on GPU
                 n_pass = prefilter_gpu(arr, PREFT_LO, PREFT_HI, sur_file)
+                del arr  # free 800MB before scan starts
                 t_pref = time.perf_counter()
                 with lock: scanned += PREF_BATCH
 
@@ -238,7 +241,7 @@ if __name__ == '__main__':
                     continue
 
                 # Phase 3: tiered scan (streaming — hits submitted as chunks complete)
-                hc = scan_survivors_stream(sur_file, step_2x, G, pool, on_done, step_1x, step_2x)
+                hc, ts = scan_survivors_stream(sur_file, step_2x, G, pool, on_done, step_1x, step_2x)
                 t_end = time.perf_counter()
                 with lock:
                     hits_gpu += hc
@@ -249,6 +252,7 @@ if __name__ == '__main__':
                 print(f'\n  batch {batch_num}: prefilter {PREF_BATCH//1_000_000}M -> {n_pass:,} survivors '
                       f'({t_total:.1f}s: gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
                 print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
+                gc.collect()  # reclaim 800MB arr + survivors from this batch
             else:
                 hits = hunt_batch_tiered(start, batch, step_2x, G)
                 with lock:
