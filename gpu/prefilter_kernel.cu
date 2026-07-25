@@ -63,26 +63,15 @@ __device__ void xSetSeed(uint64_t seed, uint64_t &lo, uint64_t &hi) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ob extraction: simulate RNG path from world seed → ob for one octave.
-//
-// Path: world_seed → xSetSeed → [xlo, xhi] → cont_lo/hi → [ixlo, ixhi]
-//       → [oct_lo, oct_hi] → 256 perm draws → oa → ob
+// ob extraction: PerlinNoise.from_xoroshiro draws oa, ob, oc, THEN 256 perm.
+// Each octave has independent RNG state. We only need ob: draw oa, then ob.
 // ═══════════════════════════════════════════════════════════════════════════
 
 __device__ float extract_ob(uint64_t ixlo, uint64_t ixhi, int octave_md5_idx) {
-    // Start octave's private RNG
     uint64_t lo = ixlo ^ c_md5_octave[octave_md5_idx][0];
     uint64_t hi = ixhi ^ c_md5_octave[octave_md5_idx][1];
-
-    // Generate perm table (256 Fisher-Yates draws). We don't store the perm —
-    // we just consume the RNG calls to reach the offset draws.
-    for (int i = 0; i < 256; i++) {
-        xNextIntFast(lo, hi, 256 - i);  // Fisher-Yates swap index
-    }
-
-    // Draw oa, ob
-    xNextDouble(lo, hi);  // oa
-    return (float)xNextDouble(lo, hi);  // ob
+    xNextDouble(lo, hi);                              // oa (discard)
+    return (float)(xNextDouble(lo, hi) * 256.0);      // ob = raw * 256 (Minecraft scaling)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -107,7 +96,7 @@ __device__ __forceinline__ float lut_lookup(float dy) {
 extern "C" __global__ void prefilter_seeds(
     const uint64_t *seeds, int n,
     float *scores, int *pass_idx, int *pass_count,
-    float threshold, int large_biomes)
+    float lo_thresh, float hi_thresh, int large_biomes)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
@@ -149,8 +138,8 @@ extern "C" __global__ void prefilter_seeds(
 
     scores[tid] = score;
 
-    // ── Step 8: stream compaction ────────────────────────────────────
-    if (score >= threshold) {
+    // ── Step 8: stream compaction (band pass: lo ≤ score < hi) ─────
+    if (score >= lo_thresh && score < hi_thresh) {
         int idx = atomicAdd(pass_count, 1);
         pass_idx[idx] = tid;
     }

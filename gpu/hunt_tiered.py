@@ -2,58 +2,62 @@
 
 GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
      threshold -1.0, 6-neighbor adjacent pair detection. ~20K seeds/s.
-     Optional pre-filter: LUT-based O6+O15 variance filter rejects
-     unpromising seeds BEFORE the expensive hex grid scan.
+     Optional pre-filter: GPU LUT-variance filter on raw seeds in RAM,
+     writes only survivors to disk, hunt scans only survivors.
 
 CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
      Logs >=3M block^2 islands to islands_3m.jsonl.
 """
-import sys, os, time, ctypes, json, math, random
-from collections import deque
+import sys, os, time, ctypes, json, random, array, struct
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import engine as _eng
 
-_hunt = ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'hunt_engine.dll'))
+GPU_DIR = os.path.dirname(__file__)
+_hunt = ctypes.CDLL(os.path.join(GPU_DIR, 'hunt_engine.dll'))
+
 _hunt.hunt_batch_tiered.argtypes = [
     ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
     ctypes.c_int, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),           # hit_counts_out
-    ctypes.POINTER(ctypes.c_int64),         # hit_results
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int64),
 ]
 _hunt.hunt_batch_tiered.restype = ctypes.c_int
 
-_hunt.hunt_batch_prefilter.argtypes = [
-    ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int,                           # G
-    ctypes.c_float,                         # threshold
-    ctypes.c_int,                           # large_biomes
-    ctypes.POINTER(ctypes.c_int),           # hit_counts_out
-    ctypes.POINTER(ctypes.c_int64),         # hit_results
+_hunt.prefilter_gpu.argtypes = [
+    ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+    ctypes.c_float, ctypes.c_float, ctypes.c_char_p,
 ]
-_hunt.hunt_batch_prefilter.restype = ctypes.c_int
+_hunt.prefilter_gpu.restype = ctypes.c_int
+
+_hunt.tiered_scan_mem.argtypes = [
+    ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int64),
+]
+_hunt.tiered_scan_mem.restype = ctypes.c_int
+
+_hunt.hunt_batch_from_file.argtypes = [
+    ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+]
+_hunt.hunt_batch_from_file.restype = ctypes.c_int
 
 _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
-MAX_HITS = 512  # plenty for G=512
+MAX_HITS = 512
 
-# ── Pre-filter score thresholds ───────────────────────────────────────
-# Computed from build_variance_lut.py on 50K random seeds.
-# score = amp6²·LUT[dy6] + amp15²·LUT[dy15]
-# Thresholds reject X% of random seeds while keeping Y% of island seeds.
-PREFT_THRESHOLDS = {
-    50:  0.0365,   # reject  50% randoms, keep ~100% islands
-    75:  0.0393,   # reject  75% randoms, keep ~99.7% islands
-    90:  0.0415,   # reject  90% randoms, keep ~91% islands
-    95:  0.0424,   # reject  95% randoms, keep ~69% islands
-    99:  0.0432,   # reject  99% randoms, keep ~23% islands
-    995: 0.0434,   # reject  99.5% randoms, keep ~12% islands
-    999: 0.0435,   # reject  99.9% randoms, keep ~2.3% islands
-}
+# ── Pre-filter config ──────────────────────────────────────────────────
+# p99.15-p99.25 band: score [0.04330, 0.04331]
+# Keeps seeds BETWEEN these scores (0.1% of randoms)
+# Lower rejects noise, upper rejects score-ceiling randoms
+PREFT_LO = 0.0429   # captures 65% of 4M+ in [0.0429, 0.0433]
+PREFT_HI = 0.0433   # 23× enrichment, ~0.95% random pass
+PREFT_ENABLED = True  # prefilter 100M seeds → survivors to disk → tiered scan
+PREF_BATCH = 100_000_000  # 100M seeds/batch = 800MB RAM
 
 
 def hunt_batch_tiered(start_seed, n, step_2x, G):
@@ -67,78 +71,80 @@ def hunt_batch_tiered(start_seed, n, step_2x, G):
             for i in range(hc)]
 
 
-def hunt_batch_prefilter(start_seed, n, step_2x, G, threshold, large_biomes=0):
-    """GPU pre-filter by O6+O15 variance, then tiered scan on survivors only."""
-    counts = (ctypes.c_int * n)()
-    results = (ctypes.c_int64 * (n * MAX_HITS * 3))()
-    hc = _hunt.hunt_batch_prefilter(
-        ctypes.c_uint64(start_seed), ctypes.c_int(n),
-        ctypes.c_int(step_2x), ctypes.c_int(G),
-        ctypes.c_float(threshold), ctypes.c_int(large_biomes),
-        counts, results)
-    return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
-            for i in range(hc)]
+def prefilter_gpu(seeds, lo, hi, out_file):
+    """Run prefilter kernel (band pass: lo ≤ score < hi), write survivors."""
+    n = len(seeds)
+    ptr = ctypes.cast(seeds.buffer_info()[0], ctypes.POINTER(ctypes.c_uint64))
+    return _hunt.prefilter_gpu(ptr, ctypes.c_int(n),
+                                ctypes.c_float(lo), ctypes.c_float(hi),
+                                ctypes.c_char_p(out_file.encode('utf-8')))
 
 
-def verify_pair_cpu(seed, gx, gz, step_1x, step_2x, engine_buf=None):
-    """Hex verification with all cont octaves (6-23, no shifts), threshold -1.0.
-    5 new hex points. If ANY one is < -1.0, trigger full flood fill."""
-    import ctypes, struct
+CHUNK = 8192
+
+def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
+    """Read survivors from disk, scan in 8192-seed chunks, submit hits
+    incrementally to the thread pool. Islands start appearing immediately."""
+    with open(seed_file, 'rb') as f:
+        data = f.read()
+    n = len(data) // 8
+    if n == 0:
+        return 0
+    all_seeds = array.array('Q')
+    all_seeds.frombytes(data)
+    del data
+
+    total_hits = 0
+    for off in range(0, n, CHUNK):
+        sz = min(CHUNK, n - off)
+        chunk = all_seeds[off:off+sz]
+        ptr = ctypes.cast(chunk.buffer_info()[0], ctypes.POINTER(ctypes.c_uint64))
+        counts = (ctypes.c_int * sz)()
+        results = (ctypes.c_int64 * (sz * MAX_HITS * 3))()
+        hc = _hunt.tiered_scan_mem(ptr, sz, step_2x, G, counts, results)
+        for i in range(hc):
+            seed, gx, gz = int(results[i*3]), int(results[i*3+1]), int(results[i*3+2])
+            pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x).add_done_callback(on_done)
+        total_hits += hc
+    return total_hits
+
+
+def verify_pair_cpu(seed, gx, gz, step_1x, step_2x):
+    import struct as _struct
     buf = (ctypes.c_ubyte * 8192)()
     _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
     off_amp = 24*257 + 24*8*3
-    # Zero only shift octaves (0-5), keep all cont (6-23)
     for j in range(6):
-        struct.pack_into('d', buf, off_amp + j*8, 0.0)
+        _struct.pack_into('d', buf, off_amp + j*8, 0.0)
 
     def s(x, z):
         return _eng._lib.cont_sample(buf, x, z)
 
-    S1, S2 = float(step_1x), float(step_2x)
-    T = -1.00
-    rt32 = 0.8660254037844386
+    S1, T, rt32 = float(step_1x), -1.00, 0.8660254037844386
 
-    # Vertical pair: A=(gx,gz), B=(gx,gz+S2). Center C=(gx, gz+S1)
-    pv = [
-        s(gx, int(gz+S1)),                                         # center
-        s(int(gx+S1*rt32), int(gz+0.5*S1)),                        # V1
-        s(int(gx+S1*rt32), int(gz+1.5*S1)),                        # V2
-        s(int(gx-S1*rt32), int(gz+1.5*S1)),                        # V4
-        s(int(gx-S1*rt32), int(gz+0.5*S1)),                        # V5
-    ]
-    if sum(1 for v in pv if v < T) >= 2:
-        return True
+    pv = [s(gx, int(gz+S1)), s(int(gx+S1*rt32), int(gz+0.5*S1)),
+          s(int(gx+S1*rt32), int(gz+1.5*S1)), s(int(gx-S1*rt32), int(gz+1.5*S1)),
+          s(int(gx-S1*rt32), int(gz+0.5*S1))]
+    if sum(1 for v in pv if v < T) >= 2: return True
 
-    # Horizontal pair: A=(gx,gz), B=(gx+S2,gz). Center C=(gx+S1, gz)
-    ph = [
-        s(int(gx+S1), gz),                                         # center
-        s(int(gx+0.5*S1), int(gz-S1*rt32)),
-        s(int(gx+1.5*S1), int(gz-S1*rt32)),
-        s(int(gx+1.5*S1), int(gz+S1*rt32)),
-        s(int(gx+0.5*S1), int(gz+S1*rt32)),
-    ]
-    if sum(1 for v in ph if v < T) >= 2:
-        return True
-
+    ph = [s(int(gx+S1), gz), s(int(gx+0.5*S1), int(gz-S1*rt32)),
+          s(int(gx+1.5*S1), int(gz-S1*rt32)), s(int(gx+1.5*S1), int(gz+S1*rt32)),
+          s(int(gx+0.5*S1), int(gz+S1*rt32))]
+    if sum(1 for v in ph if v < T) >= 2: return True
     return False
 
 
 def flood_fill_6oct(seed, cx, cz):
-    """C-side flood fill with only 6 essential octaves. ~3.6x faster."""
     return _eng._lib.cont_flood_fill_6oct(
         ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
-        ctypes.c_int(cx), ctypes.c_int(cz),
-        ctypes.c_int(10000000))
+        ctypes.c_int(cx), ctypes.c_int(cz), ctypes.c_int(10000000))
 
 
 def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
-    """Full 24-octave C engine for accurate area."""
     area = _eng._lib.cont_flood_fill(
         ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
-        ctypes.c_int(cx), ctypes.c_int(cz),
-        ctypes.c_int(max_cells))
-    if area <= 0:
-        return None
+        ctypes.c_int(cx), ctypes.c_int(cz), ctypes.c_int(max_cells))
+    if area <= 0: return None
     return {'seed': seed, 'area': area, 'cx': cx, 'cz': cz}
 
 
@@ -146,48 +152,37 @@ def verify_and_flood(seed, gx, gz, step_1x, step_2x):
     t0 = time.perf_counter()
     ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)
     t_vfy = time.perf_counter() - t0
-    if not ok:
-        return (False, None, t_vfy, 0)
-
-    # Tier 1: fast 6-octave C flood
+    if not ok: return (False, None, t_vfy, 0)
     t0 = time.perf_counter()
     area_6 = flood_fill_6oct(seed, gx, gz)
-    if area_6 < 3_000_000:
-        return (True, None, t_vfy, time.perf_counter() - t0)
-
-    # Tier 2: full 24-octave C flood for accurate sizing
+    if area_6 < 3_000_000: return (True, None, t_vfy, time.perf_counter() - t0)
     t1 = time.perf_counter()
     ff = flood_fill_full(seed, gx, gz)
-    t_ff = (t1 - t0) + (time.perf_counter() - t1)
-    return (True, ff, t_vfy, t_ff)
+    return (True, ff, t_vfy, (t1 - t0) + (time.perf_counter() - t1))
 
 
 if __name__ == '__main__':
-    TARGET = 3_000_000
-    step_1x = 140
-    step_2x = 280
+    TARGET = 4_000_000
+    step_1x, step_2x = 140, 280
     G, batch = 512, 8192
     FF_WORKERS = 16
-    # Pre-filter: set PREFT_PCT to a percentile key (90, 95, 99, 995, 999)
-    # or None to disable. Pre-filter rejects unpromising seeds by O6+O15 variance
-    # BEFORE the expensive hex grid GPU scan.
-    PREFT_PCT = None  # e.g. 995 for 99.5% random rejection, ~12% island retention
 
-    print(f'Target: >= {TARGET:,} blocks^2')
+    print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
     print(f'step_1x={step_1x}  step_2x={step_2x}  G={G}  batch={batch}')
     print(f'Coarse grid: {(G-1)*step_2x:,}x{(G-1)*step_2x:,} blocks at 1:1')
-    if PREFT_PCT and PREFT_PCT in PREFT_THRESHOLDS:
-        print(f'Pre-filter: pct={PREFT_PCT} threshold={PREFT_THRESHOLDS[PREFT_PCT]:.4f}')
+    if PREFT_ENABLED:
+        print(f'Pre-filter: ON  band=[{PREFT_LO:.5f}, {PREFT_HI:.5f}]  '
+              f'(p99.15-p99.25, {PREF_BATCH//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print(f'GPU: 2x coarse + adjacent pair. CPU: 13-point verify + flood fill.')
+    print(f'GPU: hex grid + adjacent pair. CPU: verify + flood fill.')
     print()
 
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
     best = None
-    scanned, hits_gpu, hits_verified, hits_ok, hits_big = 0, 0, 0, 0, 0
+    scanned, tiered_scanned, hits_gpu, hits_verified, hits_ok, hits_big = 0, 0, 0, 0, 0, 0
     t_gpu, t_vfy, t_ff = 0.0, 0.0, 0.0
-    seen = set()  # dedup by (seed, area)
+    seen = set()
     lock = threading.Lock()
     t0 = time.perf_counter()
     running = True
@@ -196,51 +191,73 @@ if __name__ == '__main__':
         global best, hits_ok, hits_big, hits_verified, t_vfy, t_ff
         verified, r, tv, tf = future.result()
         with lock:
-            if verified:
-                hits_verified += 1
-            t_vfy += tv
-            t_ff += tf
-        if r is None:
-            return
-        with lock:
-            hits_ok += 1
-        if r['area'] < TARGET:
-            return
+            if verified: hits_verified += 1
+            t_vfy += tv; t_ff += tf
+        if r is None: return
+        with lock: hits_ok += 1
+        if r['area'] < TARGET: return
         with lock:
             key = (r['seed'], r['area'])
-            if key in seen:
-                return
+            if key in seen: return
             seen.add(key)
             hits_big += 1
             entry = {'seed': r['seed'], 'area': r['area'], 'cx': r['cx'], 'cz': r['cz']}
-            with open('islands_3m.jsonl', 'a') as f:
+            with open('islands_4m.jsonl', 'a') as f:
                 f.write(json.dumps(entry) + '\n')
             print(f'\n  BIG ({r["area"]:,}): seed {r["seed"]} at ({r["cx"]},{r["cz"]})')
             if best is None or r['area'] > best['area']:
                 best = r
                 print(f'  *** NEW BEST: {r["seed"]}, {r["area"]:,} ***')
-                with open('best_3m.jsonl', 'w') as f:
+                with open('best_4m.jsonl', 'w') as f:
                     json.dump(entry, f)
 
     def gpu_thread():
         global scanned, hits_gpu, t_gpu
-        threshold = PREFT_THRESHOLDS.get(PREFT_PCT or -1, 0.0)
-        use_prefilter = threshold > 0.0
+        sur_file = 'seeds_pass.bin'
+        use_prefilter = PREFT_ENABLED
+        batch_num = 0
         while running:
             start = random.getrandbits(64)
             t1 = time.perf_counter()
+
             if use_prefilter:
-                hits = hunt_batch_prefilter(start, batch, step_2x, G, threshold)
+                batch_num += 1
+                # Phase 1: generate seeds
+                t_gen0 = time.perf_counter()
+                arr = array.array('Q', range(start, start + PREF_BATCH))
+                t_gen1 = time.perf_counter()
+
+                # Phase 2: prefilter on GPU
+                n_pass = prefilter_gpu(arr, PREFT_LO, PREFT_HI, sur_file)
+                t_pref = time.perf_counter()
+                with lock: scanned += PREF_BATCH
+
+                if n_pass <= 0:
+                    print(f'\n  batch {batch_num}: {PREF_BATCH//1_000_000}M seeds -> 0 survivors '
+                          f'(gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
+                    continue
+
+                # Phase 3: tiered scan (streaming — hits submitted as chunks complete)
+                hc = scan_survivors_stream(sur_file, step_2x, G, pool, on_done, step_1x, step_2x)
+                t_end = time.perf_counter()
+                with lock:
+                    hits_gpu += hc
+                    tiered_scanned += n_pass
+
+                t_total = t_end - t1
+                t_scan_time = t_end - t_pref
+                print(f'\n  batch {batch_num}: prefilter {PREF_BATCH//1_000_000}M -> {n_pass:,} survivors '
+                      f'({t_total:.1f}s: gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
+                print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
             else:
                 hits = hunt_batch_tiered(start, batch, step_2x, G)
-            t2 = time.perf_counter()
-            with lock:
-                scanned += batch
-                hits_gpu += len(hits)
-                t_gpu += (t2 - t1)
-            for seed, gx, gz in hits:
-                pool.submit(verify_and_flood, seed, gx, gz,
-                           step_1x, step_2x).add_done_callback(on_done)
+                with lock:
+                    scanned += batch
+                    tiered_scanned += batch
+                    hits_gpu += len(hits)
+                for seed, gx, gz in hits:
+                    pool.submit(verify_and_flood, seed, gx, gz,
+                               step_1x, step_2x).add_done_callback(on_done)
 
     gpu_t = threading.Thread(target=gpu_thread, daemon=True)
     gpu_t.start()
@@ -250,17 +267,11 @@ if __name__ == '__main__':
             time.sleep(2)
             if scanned > 0:
                 ba = best['area'] if best else 0
-                vrate = 100 * hits_verified / max(hits_gpu, 1)
                 elapsed = time.perf_counter() - t0
-                tg = t_gpu / max(scanned / batch, 1)
-                tv = t_vfy * 1e6 / max(hits_gpu, 1)
-                tf = t_ff * 1e6 / max(hits_verified, 1)
-                print(f'\r  {scanned:,} seeds ({scanned/elapsed:,.0f}/s) | '
-                      f'GPU {tg:.1f}s/batch | '
-                      f'vfy {tv:.0f}us | ff {tf:.0f}us | '
-                      f'{hits_verified} ok ({vrate:.1f}%) | '
-                      f'{hits_big} big | best {ba:,}  ', end='', flush=True)
-
+                print(f'\r  tiered: {tiered_scanned:,} seeds '
+                      f'({tiered_scanned/elapsed:,.0f}/s) | '
+                      f'{hits_verified} ok ({hits_ok} flood) | {hits_big} big | best {ba:,}  ',
+                      end='', flush=True)
     except KeyboardInterrupt:
         pass
     finally:
@@ -272,9 +283,6 @@ if __name__ == '__main__':
 
     elapsed = time.perf_counter() - t0
     print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
-    print(f'Timing: GPU {t_gpu/max(scanned/batch,1):.3f}s/batch | '
-          f'vfy {t_vfy*1e6/max(hits_gpu,1):.0f}us/hit | '
-          f'ff {t_ff*1e6/max(hits_verified,1):.0f}us/ff')
     print(f'{hits_gpu} GPU pairs -> {hits_verified} verified -> {hits_big} big (>= {TARGET:,})')
     if best:
         print(f'BEST: seed {best["seed"]}, {best["area"]:,} at ({best["cx"]},{best["cz"]})')
