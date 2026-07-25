@@ -1,26 +1,23 @@
 /*
- * tiered_kernel.cu — Hex grid O6+O15 mushroom prefilter with GPU timing.
+ * tiered_kernel.cu — Hex grid O6+O15 mushroom prefilter.
  *
- * Grid: hex lattice (staggered rows, D=step_2x spacing, 6 neighbors).
- * Octaves: only O6+O15 (cont A+B first octaves, amp=0.5 each, wl=2000 blocks).
- * Threshold: -1.00 (O6+O15 combined). 8% of cells pass.
+ * Grid: hex lattice (staggered rows, D=step_2x, 6 neighbors).
+ * Only 2 octaves: O6 (cont A first) + O15 (cont B first).
+ * No shift distortion — my_dx=my_dz=0, continentalness sampled at raw (x,z).
+ * Threshold: -1.00 combined.
  *
  * Phase 1: continentalness at hex grid points → s_grid[32][32].
- * Phase 2: 6-neighbor adjacent pair detection in s_grid.
- *          All pairs written to global hit buffer via atomicAdd.
- *
- * Timing: clock64() measures perlin (octave loops) vs detect (s_grid scan).
- * Output: hit_counts[seed], hit_gx/gz[seed*MAX_HITS + i].
+ * Phase 2: 6-neighbor adjacent pair detection → global hit buffer.
+ * Timing: clock64() perlin vs detection.
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-#define MAX_OCTAVES 24
-#define PERM_SIZE   256
 #define THREADS     256
 #define TILE        32
 #define MAXC        4
-#define MAX_HITS    512    // plenty for G=512 (avg ~40 pairs/seed)
+#define MAX_HITS    512
+#define PERM_SIZE   256
 
 __constant__ float c_grad_tier[16][3] = {
     { 1, 1, 0}, {-1, 1, 0}, { 1,-1, 0}, {-1,-1, 0},
@@ -29,7 +26,7 @@ __constant__ float c_grad_tier[16][3] = {
     { 1, 1, 0}, { 0,-1, 1}, {-1, 1, 0}, { 0,-1,-1},
 };
 
-__device__ __forceinline__ float perlin_tier(
+__device__ __forceinline__ float perlin(
     const uint8_t *perm, float oa, float ob, float oc,
     uint8_t cached_h2, float cached_d2, float cached_t2,
     float x, float y, float z)
@@ -82,54 +79,46 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
     unsigned long long *t_perlin, unsigned long long *t_detect)
 {
     int seed = blockIdx.x, tid = threadIdx.x;
-    float fr = 337.0f / 331.0f;
-    unsigned long long t_perlin_acc = 0, t_detect_acc = 0;
-    unsigned long long t_phase;
+    unsigned long long t_perlin_acc = 0, t_detect_acc = 0, t_phase;
 
-    __shared__ float s_oa[MAX_OCTAVES], s_ob[MAX_OCTAVES], s_oc[MAX_OCTAVES];
-    __shared__ float s_amp[MAX_OCTAVES], s_lac[MAX_OCTAVES];
-    __shared__ uint8_t s_h2[MAX_OCTAVES];
-    __shared__ float s_d2[MAX_OCTAVES], s_t2[MAX_OCTAVES];
-    if (tid < MAX_OCTAVES) {
-        int s = seed * MAX_OCTAVES + tid;
-        s_oa[tid]=oa[s]; s_ob[tid]=ob[s]; s_oc[tid]=oc[s];
-        s_amp[tid]=amp[s]; s_lac[tid]=lac[s];
-        s_h2[tid]=h2[s]; s_d2[tid]=d2[s]; s_t2[tid]=t2[s];
-    }
-    __shared__ int s_ranges[8]; __shared__ float s_dbl[2];
-    if (tid < 8) s_ranges[tid] = ranges[seed * 8 + tid];
-    if (tid < 2) s_dbl[tid]   = dbl_amps[seed * 2 + tid];
-
+    // ---- Octave params: only 2 octaves (indices 6 and 15) ----
+    // Both have y=0 always, no cached values needed from shared memory.
+    // We store just the two octaves' params in registers per thread.
     __shared__ uint8_t s_perm[PERM_SIZE];
     __shared__ float s_grid[TILE][TILE];
     __syncthreads();
 
-    int sh_as=s_ranges[0], sh_ac=s_ranges[1], sh_bs=s_ranges[2], sh_bc=s_ranges[3];
-    int ct_as=s_ranges[4], ct_ac=s_ranges[5], ct_bs=s_ranges[6], ct_bc=s_ranges[7];
-    float sh_amp=s_dbl[0], ct_amp=s_dbl[1], sh4=sh_amp*4.0f;
+    // ---- Read octave 6 (cont A) params from global ----
+    int s6 = seed * 24 + 6;
+    float oa6 = oa[s6], ob6 = ob[s6], oc6 = oc[s6];
+    float amp6 = amp[s6], lac6 = lac[s6];
+    uint8_t h26 = h2[s6]; float d26 = d2[s6], t26 = t2[s6];
 
-    // Hex grid constants: D = spacing between adjacent centers
-    // x = tox + sx*D + (sz&1)*(D/2),  z = toz + sz*D*sqrt(3)/2
+    // ---- Read octave 15 (cont B) params from global ----
+    int s15 = seed * 24 + 15;
+    float oa15 = oa[s15], ob15 = ob[s15], oc15 = oc[s15];
+    float amp15 = amp[s15], lac15 = lac[s15];
+    uint8_t h215 = h2[s15]; float d215 = d2[s15], t215 = t2[s15];
+
+    // ---- Read dbl_amps (ct_amp only, shift is 0) ----
+    float ct_amp = dbl_amps[seed * 2 + 1];
+    float fr = 337.0f / 331.0f;  // only used for O15 (cont B)
+
+    // ---- Hex grid constants ----
     float D = (float)step_2x;
     float D_sqrt3_2 = D * 0.8660254037844386f;
     int center_x = (int)(-(G / 2) * D);
     int center_z = (int)(-(G / 2) * D_sqrt3_2);
     int tiles_dim = (G + TILE - 1) / TILE;
 
-    int seed_perm_off = seed * MAX_OCTAVES * PERM_SIZE;
-    int my_base = seed * MAX_HITS;  // this seed's region in the hit buffer
+    int seed_perm_off = seed * 24 * PERM_SIZE;
+    int my_base = seed * MAX_HITS;
     __shared__ int s_hit_count;
     if (tid == 0) s_hit_count = 0;
     __syncthreads();
 
-    float my_dx[MAXC], my_dz[MAXC], my_cont[MAXC];
-    float my_x[MAXC], my_z[MAXC];
+    float my_cont[MAXC], my_x[MAXC], my_z[MAXC];
     int my_cx[MAXC], my_cz[MAXC], my_ncells;
-
-    #define LOAD_P(j) { \
-        const uint8_t *pb = perm + seed_perm_off + (j)*PERM_SIZE; \
-        if (tid < PERM_SIZE) s_perm[tid] = pb[tid]; \
-        __syncthreads(); }
 
     for (int tz = 0; tz < tiles_dim; tz++) {
         for (int tx = 0; tx < tiles_dim; tx++) {
@@ -145,7 +134,6 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
             for (int i = tid; i < tile_cells && my_ncells < MAXC; i += THREADS) {
                 my_cx[my_ncells] = i % tile_w;
                 my_cz[my_ncells] = i / tile_w;
-                // Hex grid: staggered x by half D on odd rows
                 float hx = tox + my_cx[my_ncells] * D;
                 float hz = toz + my_cz[my_ncells] * D_sqrt3_2;
                 if (my_cz[my_ncells] & 1) hx += D * 0.5f;
@@ -153,68 +141,49 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
                 my_z[my_ncells] = hz;
                 my_ncells++;
             }
-            for (int c = 0; c < MAXC; c++) my_dx[c]=my_dz[c]=my_cont[c]=0;
+            for (int c = 0; c < MAXC; c++) my_cont[c] = 0;
 
-            // Shift A, B, Cont A, B (same as sparse_kernel)
-            for (int j = sh_as; j < sh_as + sh_ac; j++) {
-                LOAD_P(j); float lf=s_lac[j], aj=s_amp[j];
-                float joa=s_oa[j], job=s_ob[j], joc=s_oc[j];
-                uint8_t jh2=s_h2[j]; float jd2=s_d2[j], jt2=s_t2[j];
+            // ---- Octave 6 (cont A) ----
+            {
+                const uint8_t *pb = perm + seed_perm_off + 6 * PERM_SIZE;
+                if (tid < PERM_SIZE) s_perm[tid] = pb[tid];
+                __syncthreads();
+                float lf = lac6, aj = amp6;
                 #pragma unroll
-                for (int c=0; c<MAXC; c++) { if(c<my_ncells){
-                    float X=my_x[c], Z=my_z[c];
-                    my_dx[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,X*lf,0,Z*lf);
-                    my_dz[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,Z*lf,X*lf,0);
-                }}
-            }
-            for (int j = sh_bs; j < sh_bs + sh_bc; j++) {
-                LOAD_P(j); float lf=s_lac[j], aj=s_amp[j];
-                float joa=s_oa[j], job=s_ob[j], joc=s_oc[j];
-                uint8_t jh2=s_h2[j]; float jd2=s_d2[j], jt2=s_t2[j];
-                #pragma unroll
-                for (int c=0; c<MAXC; c++) { if(c<my_ncells){
-                    float X=my_x[c], Z=my_z[c];
-                    my_dx[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,X*lf*fr,0,Z*lf*fr);
-                    my_dz[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,Z*lf*fr,X*lf*fr,0);
-                }}
-            }
-            for (int j = ct_as; j < ct_as + ct_ac; j++) {
-                LOAD_P(j); float lf=s_lac[j], aj=s_amp[j];
-                float joa=s_oa[j], job=s_ob[j], joc=s_oc[j];
-                uint8_t jh2=s_h2[j]; float jd2=s_d2[j], jt2=s_t2[j];
-                #pragma unroll
-                for (int c=0; c<MAXC; c++) { if(c<my_ncells){
-                    float px=my_x[c]+my_dx[c]*sh4, pz=my_z[c]+my_dz[c]*sh4;
-                    my_cont[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,px*lf,0,pz*lf);
-                }}
-            }
-            for (int j = ct_bs; j < ct_bs + ct_bc; j++) {
-                LOAD_P(j); float lf=s_lac[j], aj=s_amp[j];
-                float joa=s_oa[j], job=s_ob[j], joc=s_oc[j];
-                uint8_t jh2=s_h2[j]; float jd2=s_d2[j], jt2=s_t2[j];
-                #pragma unroll
-                for (int c=0; c<MAXC; c++) { if(c<my_ncells){
-                    float px=my_x[c]+my_dx[c]*sh4, pz=my_z[c]+my_dz[c]*sh4;
-                    my_cont[c]+=aj*perlin_tier(s_perm,joa,job,joc,jh2,jd2,jt2,px*lf*fr,0,pz*lf*fr);
-                }}
+                for (int c = 0; c < MAXC; c++) {
+                    if (c < my_ncells)
+                        my_cont[c] += aj * perlin(s_perm, oa6, ob6, oc6, h26, d26, t26,
+                                                   my_x[c]*lf, 0.0f, my_z[c]*lf);
+                }
             }
 
+            // ---- Octave 15 (cont B, fr detuned) ----
+            {
+                const uint8_t *pb = perm + seed_perm_off + 15 * PERM_SIZE;
+                if (tid < PERM_SIZE) s_perm[tid] = pb[tid];
+                __syncthreads();
+                float lf = lac15, aj = amp15;
+                #pragma unroll
+                for (int c = 0; c < MAXC; c++) {
+                    if (c < my_ncells)
+                        my_cont[c] += aj * perlin(s_perm, oa15, ob15, oc15, h215, d215, t215,
+                                                   my_x[c]*lf*fr, 0.0f, my_z[c]*lf*fr);
+                }
+            }
+
+            // Write to s_grid
             #pragma unroll
             for (int c = 0; c < MAXC; c++)
                 if (c < my_ncells) s_grid[my_cz[c]][my_cx[c]] = my_cont[c] * ct_amp;
             __syncthreads();
 
-            // ---- Detection phase ----
+            // ---- Detection ----
             if (tid == 0) { unsigned long long t_now = clock64(); t_perlin_acc += t_now - t_phase; t_phase = t_now; }
             for (int i = tid; i < tile_cells; i += THREADS) {
                 int sx = i % tile_w, sz = i / tile_w;
                 if (s_grid[sz][sx] >= -1.00f) continue;
 
-                // Count mushroom neighbors (4-directional)
-                // Report this mushroom cell if it has >=1 mushroom neighbor
-                // Hex grid: check 6 neighbors
                 int has_nb = 0;
-                // Hex offsets on square grid: right, left, up, down, up-right, down-left
                 int hx[6] = {1, -1, 0, 0, 1, -1};
                 int hz[6] = {0, 0, -1, 1, -1, 1};
                 for (int k = 0; k < 6 && !has_nb; k++) {
@@ -226,10 +195,10 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
 
                 int idx = atomicAdd(&s_hit_count, 1);
                 if (idx < MAX_HITS) {
-                    float hx = tox + sx * D + (sz & 1) * (D * 0.5f);
-                    float hz = toz + sz * D_sqrt3_2;
-                    hit_gx[my_base + idx] = (int)hx;
-                    hit_gz[my_base + idx] = (int)hz;
+                    float hx_v = tox + sx * D + (sz & 1) * (D * 0.5f);
+                    float hz_v = toz + sz * D_sqrt3_2;
+                    hit_gx[my_base + idx] = (int)hx_v;
+                    hit_gz[my_base + idx] = (int)hz_v;
                 }
             }
             if (tid == 0) { unsigned long long t_now = clock64(); t_detect_acc += t_now - t_phase; t_phase = t_now; }
@@ -242,5 +211,4 @@ extern "C" __launch_bounds__(THREADS, 4) __global__ void tiered_scan(
         t_perlin[seed] = t_perlin_acc;
         t_detect[seed] = t_detect_acc;
     }
-    #undef LOAD_P
 }

@@ -98,6 +98,12 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
  */
 int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells);
 
+/**
+ * Same as cont_flood_fill but only uses 6 essential octaves (6,7,8,15,16,17).
+ * Much faster for pre-filtering candidates before full flood fill.
+ */
+int64_t cont_flood_fill_6oct(uint64_t seed, int cx, int cz, int max_cells);
+
 #ifdef __cplusplus
 }
 #endif

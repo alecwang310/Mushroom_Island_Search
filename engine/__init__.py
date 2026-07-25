@@ -41,6 +41,9 @@ _lib.cont_batch_init.restype = None
 _lib.cont_flood_fill.argtypes = [c_uint64, c_int, c_int, c_int]
 _lib.cont_flood_fill.restype = c_int64
 
+_lib.cont_flood_fill_6oct.argtypes = [c_uint64, c_int, c_int, c_int]
+_lib.cont_flood_fill_6oct.restype = c_int64
+
 MAX_OCTAVES = 24
 PERM_SIZE = 256     # 32 lanes × 8 bytes, 8-byte aligned
 

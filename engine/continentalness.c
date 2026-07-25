@@ -625,3 +625,58 @@ int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells) {
     free(vs.entries);
     return cells * 16;  /* Each 1:4 cell = 4x4 = 16 blocks at 1:1 */
 }
+
+/* Fast flood fill with only 6 essential octaves (6,7,8,15,16,17).
+   Same BFS as cont_flood_fill but zeros non-essential amplitudes
+   before the search. Much faster because perlin only runs 6 octaves. */
+int64_t cont_flood_fill_6oct(uint64_t seed, int cx, int cz, int max_cells) {
+    ContEngine e;
+    cont_engine_init(&e, seed, 0);
+
+    /* Trim to only 6 essential octaves by adjusting range counts.
+       This skips octave loops entirely — 6 octaves vs 24 (4x faster).
+       cont_flood_fill (full 24-octave) is UNCHANGED. */
+    e.shift_octA_count = 0;
+    e.shift_octB_count = 0;
+    e.cont_octA_count = 3;   /* only 6,7,8 */
+    e.cont_octB_count = 3;   /* only 15,16,17 */
+
+    if (cont_sample(&e, cx, cz) >= -1.05)
+        return 0;
+
+    size_t init_q = 4096;
+    size_t init_vis = 8192;
+    Queue q;
+    VisSet vs;
+    if (!q_init(&q, init_q)) return -1;
+    if (!vis_init(&vs, init_vis)) { q_free(&q); return -1; }
+
+    q_push(&q, cx, cz);
+    vis_insert(&vs, cx, cz);
+    int64_t cells = 0;
+
+    while (!q_empty(&q) && cells < max_cells) {
+        if ((q.tail + 1) % q.cap == q.head) {
+            if (!q_grow(&q)) break;
+        }
+        int x, z;
+        q_pop(&q, &x, &z);
+        cells++;
+        struct { int dx, dz; } dirs[4] = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dirs[d].dx;
+            int nz = z + dirs[d].dz;
+            if (vis_contains(&vs, nx, nz)) continue;
+            if (cont_sample(&e, nx, nz) < -1.05) {
+                vis_insert(&vs, nx, nz);
+                q_push(&q, nx, nz);
+            } else {
+                vis_insert(&vs, nx, nz);
+            }
+        }
+    }
+
+    q_free(&q);
+    free(vs.entries);
+    return cells * 16;
+}

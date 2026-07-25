@@ -7,6 +7,7 @@ CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Logs >=3M block^2 islands to islands_3m.jsonl.
 """
 import sys, os, time, ctypes, json, math, random
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -63,7 +64,7 @@ def verify_pair_cpu(seed, gx, gz, step_1x, step_2x, engine_buf=None):
         s(int(gx-S1*rt32), int(gz+1.5*S1)),                        # V4
         s(int(gx-S1*rt32), int(gz+0.5*S1)),                        # V5
     ]
-    if any(v < T for v in pv):
+    if sum(1 for v in pv if v < T) >= 2:
         return True
 
     # Horizontal pair: A=(gx,gz), B=(gx+S2,gz). Center C=(gx+S1, gz)
@@ -74,13 +75,22 @@ def verify_pair_cpu(seed, gx, gz, step_1x, step_2x, engine_buf=None):
         s(int(gx+1.5*S1), int(gz+S1*rt32)),
         s(int(gx+0.5*S1), int(gz+S1*rt32)),
     ]
-    if any(v < T for v in ph):
+    if sum(1 for v in ph if v < T) >= 2:
         return True
 
     return False
 
 
-def flood_fill(seed, cx, cz, max_cells=10_000_000):
+def flood_fill_6oct(seed, cx, cz):
+    """C-side flood fill with only 6 essential octaves. ~3.6x faster."""
+    return _eng._lib.cont_flood_fill_6oct(
+        ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
+        ctypes.c_int(cx), ctypes.c_int(cz),
+        ctypes.c_int(10000000))
+
+
+def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
+    """Full 24-octave C engine for accurate area."""
     area = _eng._lib.cont_flood_fill(
         ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
         ctypes.c_int(cx), ctypes.c_int(cz),
@@ -92,13 +102,21 @@ def flood_fill(seed, cx, cz, max_cells=10_000_000):
 
 def verify_and_flood(seed, gx, gz, step_1x, step_2x):
     t0 = time.perf_counter()
-    ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)  # O6+O15 only, -0.95
+    ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)
     t_vfy = time.perf_counter() - t0
     if not ok:
         return (False, None, t_vfy, 0)
+
+    # Tier 1: fast 6-octave C flood
     t0 = time.perf_counter()
-    ff = flood_fill(seed, gx, gz)  # full C engine
-    t_ff = time.perf_counter() - t0
+    area_6 = flood_fill_6oct(seed, gx, gz)
+    if area_6 < 3_000_000:
+        return (True, None, t_vfy, time.perf_counter() - t0)
+
+    # Tier 2: full 24-octave C flood for accurate sizing
+    t1 = time.perf_counter()
+    ff = flood_fill_full(seed, gx, gz)
+    t_ff = (t1 - t0) + (time.perf_counter() - t1)
     return (True, ff, t_vfy, t_ff)
 
 
