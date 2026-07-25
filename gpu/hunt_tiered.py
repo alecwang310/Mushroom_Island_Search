@@ -1,7 +1,10 @@
-"""hunt_tiered.py — GPU tiered hunt: 2x coarse + adjacency + CPU verify + flood fill.
+"""hunt_tiered.py — Hex grid O6+O15 GPU prefilter + CPU verify + flood fill.
 
-step_1x=140, step_2x=280. GPU finds adjacent pairs on 2x grid.
-CPU verifies with 13-point 1x sampling. Only verified hits get flood filled.
+GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
+     threshold -1.0, 6-neighbor adjacent pair detection. ~20K seeds/s.
+CPU: 5-point hex verification with all cont octaves (6-23, no shift).
+     Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
+     Logs >=3M block^2 islands to islands_3m.jsonl.
 """
 import sys, os, time, ctypes, json, math, random
 from concurrent.futures import ThreadPoolExecutor

@@ -1,11 +1,14 @@
 /*
- * hunt_engine.cu — C++ GPU hunt engine with phase-level kernel profiling.
+ * hunt_engine.cu — GPU hunt engine DLL.
  *
  * Compile:
  *   nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu
- *        sparse_kernel.cu ../engine/continentalness.c -I../engine -lcudart
+ *        sparse_kernel.cu warp_shuffle.cu tiered_kernel.cu
+ *        ../engine/continentalness.c -I../engine -lcudart
  *
- * Exports: hunt_batch, hunt_get_timings, hunt_get_debug_timings, hunt_cleanup
+ * Exports: hunt_batch (baseline K=2), hunt_batch_ws (warp-shuffle),
+ *          hunt_batch_tiered (hex O6+O15 multi-hit), hunt_cleanup,
+ *          hunt_get_timings, hunt_reset_timings.
  */
 
 #include <cuda_runtime.h>
@@ -372,7 +375,7 @@ extern "C" __declspec(dllexport) int hunt_batch_ws(
     return hit_count;
 }
 
-// ---- Tiered two-stage variant (multi-hit output) ----
+// ---- Hex grid O6+O15 tiered hunt (multi-hit output) ----
 #define MAX_HITS_PER_SEED 512
 extern "C" __declspec(dllexport) int hunt_batch_tiered(
     uint64_t start_seed, int n, int step_2x, int K_coarse, int G,

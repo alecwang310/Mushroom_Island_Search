@@ -1,13 +1,16 @@
 /*
- * tiered_kernel.cu — Multi-hit GPU coarse scan + adjacent-pair detection.
+ * tiered_kernel.cu — Hex grid O6+O15 mushroom prefilter with GPU timing.
  *
- * Phase 1: Continentalness at 2× step → s_grid.
- * Phase 2: Find ALL adjacent pairs in s_grid, write to global hit
- *          buffer via atomicAdd per seed. No early exit — collects
- *          all candidates so CPU can verify all of them.
+ * Grid: hex lattice (staggered rows, D=step_2x spacing, 6 neighbors).
+ * Octaves: only O6+O15 (cont A+B first octaves, amp=0.5 each, wl=2000 blocks).
+ * Threshold: -1.00 (O6+O15 combined). 8% of cells pass.
  *
- * Output: hit_counts[seed] = number of pairs found
- *         hits[seed * MAX_HITS + i] = {gx, gz} for i = 0..hit_counts[seed]-1
+ * Phase 1: continentalness at hex grid points → s_grid[32][32].
+ * Phase 2: 6-neighbor adjacent pair detection in s_grid.
+ *          All pairs written to global hit buffer via atomicAdd.
+ *
+ * Timing: clock64() measures perlin (octave loops) vs detect (s_grid scan).
+ * Output: hit_counts[seed], hit_gx/gz[seed*MAX_HITS + i].
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
