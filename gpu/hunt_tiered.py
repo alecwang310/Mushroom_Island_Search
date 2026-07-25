@@ -2,6 +2,9 @@
 
 GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
      threshold -1.0, 6-neighbor adjacent pair detection. ~20K seeds/s.
+     Optional pre-filter: LUT-based O6+O15 variance filter rejects
+     unpromising seeds BEFORE the expensive hex grid scan.
+
 CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
      Logs >=3M block^2 islands to islands_3m.jsonl.
@@ -22,10 +25,36 @@ _hunt.hunt_batch_tiered.argtypes = [
     ctypes.POINTER(ctypes.c_int64),         # hit_results
 ]
 _hunt.hunt_batch_tiered.restype = ctypes.c_int
+
+_hunt.hunt_batch_prefilter.argtypes = [
+    ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int,                           # G
+    ctypes.c_float,                         # threshold
+    ctypes.c_int,                           # large_biomes
+    ctypes.POINTER(ctypes.c_int),           # hit_counts_out
+    ctypes.POINTER(ctypes.c_int64),         # hit_results
+]
+_hunt.hunt_batch_prefilter.restype = ctypes.c_int
+
 _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
 MAX_HITS = 512  # plenty for G=512
+
+# ── Pre-filter score thresholds ───────────────────────────────────────
+# Computed from build_variance_lut.py on 50K random seeds.
+# score = amp6²·LUT[dy6] + amp15²·LUT[dy15]
+# Thresholds reject X% of random seeds while keeping Y% of island seeds.
+PREFT_THRESHOLDS = {
+    50:  0.0365,   # reject  50% randoms, keep ~100% islands
+    75:  0.0393,   # reject  75% randoms, keep ~99.7% islands
+    90:  0.0415,   # reject  90% randoms, keep ~91% islands
+    95:  0.0424,   # reject  95% randoms, keep ~69% islands
+    99:  0.0432,   # reject  99% randoms, keep ~23% islands
+    995: 0.0434,   # reject  99.5% randoms, keep ~12% islands
+    999: 0.0435,   # reject  99.9% randoms, keep ~2.3% islands
+}
+
 
 def hunt_batch_tiered(start_seed, n, step_2x, G):
     counts = (ctypes.c_int * n)()
@@ -33,6 +62,19 @@ def hunt_batch_tiered(start_seed, n, step_2x, G):
     hc = _hunt.hunt_batch_tiered(
         ctypes.c_uint64(start_seed), ctypes.c_int(n),
         ctypes.c_int(step_2x), ctypes.c_int(1), ctypes.c_int(G),
+        counts, results)
+    return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
+            for i in range(hc)]
+
+
+def hunt_batch_prefilter(start_seed, n, step_2x, G, threshold, large_biomes=0):
+    """GPU pre-filter by O6+O15 variance, then tiered scan on survivors only."""
+    counts = (ctypes.c_int * n)()
+    results = (ctypes.c_int64 * (n * MAX_HITS * 3))()
+    hc = _hunt.hunt_batch_prefilter(
+        ctypes.c_uint64(start_seed), ctypes.c_int(n),
+        ctypes.c_int(step_2x), ctypes.c_int(G),
+        ctypes.c_float(threshold), ctypes.c_int(large_biomes),
         counts, results)
     return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
             for i in range(hc)]
@@ -126,10 +168,18 @@ if __name__ == '__main__':
     step_2x = 280
     G, batch = 512, 8192
     FF_WORKERS = 16
+    # Pre-filter: set PREFT_PCT to a percentile key (90, 95, 99, 995, 999)
+    # or None to disable. Pre-filter rejects unpromising seeds by O6+O15 variance
+    # BEFORE the expensive hex grid GPU scan.
+    PREFT_PCT = None  # e.g. 995 for 99.5% random rejection, ~12% island retention
 
     print(f'Target: >= {TARGET:,} blocks^2')
     print(f'step_1x={step_1x}  step_2x={step_2x}  G={G}  batch={batch}')
     print(f'Coarse grid: {(G-1)*step_2x:,}x{(G-1)*step_2x:,} blocks at 1:1')
+    if PREFT_PCT and PREFT_PCT in PREFT_THRESHOLDS:
+        print(f'Pre-filter: pct={PREFT_PCT} threshold={PREFT_THRESHOLDS[PREFT_PCT]:.4f}')
+    else:
+        print(f'Pre-filter: OFF')
     print(f'GPU: 2x coarse + adjacent pair. CPU: 13-point verify + flood fill.')
     print()
 
@@ -174,10 +224,15 @@ if __name__ == '__main__':
 
     def gpu_thread():
         global scanned, hits_gpu, t_gpu
+        threshold = PREFT_THRESHOLDS.get(PREFT_PCT or -1, 0.0)
+        use_prefilter = threshold > 0.0
         while running:
             start = random.getrandbits(64)
             t1 = time.perf_counter()
-            hits = hunt_batch_tiered(start, batch, step_2x, G)
+            if use_prefilter:
+                hits = hunt_batch_prefilter(start, batch, step_2x, G, threshold)
+            else:
+                hits = hunt_batch_tiered(start, batch, step_2x, G)
             t2 = time.perf_counter()
             with lock:
                 scanned += batch

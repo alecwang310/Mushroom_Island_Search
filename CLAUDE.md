@@ -7,7 +7,8 @@ Find Minecraft seeds with mushroom islands ≥ 3 million blocks², **speed over 
 ## Pipeline (current: hex grid O6+O15)
 
 ```
-Seed → cont_batch_init (CPU, 300ms) → upload (PCIe, 1ms)
+Seed → [optional: prefilter_kernel GPU — LUT variance filter]
+     → cont_batch_init (CPU, 6.9µs/seed) → upload (PCIe)
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
      → download pairs (~500 per batch)
      → CPU verify (≥2 hex points, all cont octaves, 22µs/hit)
@@ -15,7 +16,9 @@ Seed → cont_batch_init (CPU, 300ms) → upload (PCIe, 1ms)
      → log to islands_3m.jsonl
 ```
 
-**Throughput: ~20,000 seeds/s at G=512, step_2x=280. CPU keeps up with 16 workers.**
+**Throughput: ~20,000 seeds/s at G=512, step_2x=280 (no pre-filter).**
+**With pre-filter at p99.5: ~140K seeds/s init-limited, GPU does 200× less work.**
+**CPU keeps up with 16 workers.**
 
 ## File Structure
 
@@ -27,6 +30,8 @@ engine/                        # CPU continentalness engine (C + Python bindings
 
 gpu/
   tiered_kernel.cu             # ★ Current main kernel: hex grid, 2 octaves only
+  prefilter_kernel.cu          # ★ NEW: GPU-side seed init + variance LUT pre-filter
+  variance_lut.h               #    Precomputed analytic LUT + MD5/amplitude constants
   hunt_engine.cu               #    DLL host: upload, launch, download, timing
   hunt_tiered.py               # ★ Current hunt script: GPU thread + CPU verify + flood
   sparse_kernel.cu             #    Baseline kernel (all 24 octaves, K=2, square grid)
@@ -35,8 +40,30 @@ gpu/
   gpu_monitor.py               #    nvidia-smi polling script
 
 continentalness_pipeline.py    # Pure-Python reference implementation (verified vs cubiomes)
+build_variance_lut.py          # Builds analytic variance LUT + pre-filter threshold calibration
+variance_lut.npz               # Saved LUT (256 floats)
 islands_3m.jsonl               # Output: seed, area, center_1:4 coords
 ```
+
+## Pre-Filter (prefilter_kernel.cu)
+
+- **Purpose**: Reject unpromising seeds BEFORE the expensive hex grid GPU scan
+- **Mechanism**: GPU-side Xoroshiro128++ RNG → extract `ob₆`, `ob₁₅` (y-offsets)
+  → LUT lookup → `score = amp²·(LUT[dy₆] + LUT[dy₁₅])`
+- **Theory**: Single-octave variance depends only on `dy = frac(ob)`.
+  Gradient table has `Syy=0.75 > Sxx,Szz=0.625`, so dy controls y-energy
+  coupling into the 2D slice. Island seeds have dy tightly clustered near 0.5.
+- **LUT**: `gpu/variance_lut.h` — 256 floats, analytic integral over (dx,dz)∈[0,1]²
+- **Speed**: ~520 RNG calls/seed, one thread/seed, ~microseconds per batch
+- **Output**: scores[i], plus compacted pass_idx[] for seeds ≥ threshold
+- **Thresholds** (from `build_variance_lut.py`):
+  | pct | threshold | islands kept | randoms rejected |
+  |-----|-----------|-------------|-----------------|
+  | 90  | 0.0415    | ~91%        | 90%             |
+  | 95  | 0.0424    | ~69%        | 95%             |
+  | 99  | 0.0432    | ~23%        | 99%             |
+  | 995 | 0.0434    | ~12%        | 99.5%           |
+  | 999 | 0.0435    | ~2.3%       | 99.9%           |
 
 ## GPU Kernel (tiered_kernel.cu)
 
@@ -75,7 +102,7 @@ islands_3m.jsonl               # Output: seed, area, center_1:4 coords
 ```powershell
 # GPU DLL
 cd gpu
-nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu sparse_kernel.cu warp_shuffle.cu tiered_kernel.cu ../engine/continentalness.c -I../engine -lcudart
+nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll hunt_engine.cu sparse_kernel.cu warp_shuffle.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
 
 # Engine DLL (if continentalness.c changes)
 cd engine
@@ -90,3 +117,9 @@ python gpu\hunt_tiered.py
 ```
 
 Logs islands ≥ 3M to `islands_3m.jsonl`. Ctrl+C to stop.
+
+**Pre-filter mode**: Edit `PREFT_PCT` in `gpu/hunt_tiered.py`:
+- `None` — disabled (full GPU scan on all seeds)
+- `90` — reject 90% randoms, keep 91% islands
+- `99` — reject 99% randoms, keep 23% islands
+- `995` — reject 99.5% randoms, keep 12% islands

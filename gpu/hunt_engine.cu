@@ -67,6 +67,12 @@ extern "C" __global__ void tiered_scan(
     int *hit_counts, int *hit_gx, int *hit_gz,
     unsigned long long *t_perlin, unsigned long long *t_detect);
 
+// Pre-filter variant (from prefilter_kernel.cu)
+extern "C" __global__ void prefilter_seeds(
+    const uint64_t *seeds, int n,
+    float *scores, int *pass_idx, int *pass_count,
+    float threshold, int large_biomes);
+
 // ---- Persistent buffers ----
 struct Buffers {
     uint8_t *d_perm;
@@ -475,6 +481,163 @@ extern "C" __declspec(dllexport) int hunt_batch_tiered(
     }
 
     free(seeds_arr);
+    return total;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pre-filter + tiered hunt: filter seeds by O6+O15 variance before GPU scan
+// ═══════════════════════════════════════════════════════════════════════════
+extern "C" __declspec(dllexport) int hunt_batch_prefilter(
+    uint64_t start_seed, int n, int step_2x, int G,
+    float threshold, int large_biomes,
+    int *hit_counts_out, int64_t *hit_results)
+{
+    // ── Pre-filter GPU buffers (static, lazy allocation) ──────────────
+    static uint64_t *d_seeds = NULL;
+    static float    *d_scores = NULL;
+    static int      *d_pass_idx = NULL;
+    static int      *d_pass_count = NULL;
+    static uint64_t *h_seeds = NULL;
+    static float    *h_scores = NULL;
+    static int      *h_pass_idx = NULL;
+    static int pf_cap = 0;
+
+    if (n > pf_cap) {
+        if (pf_cap > 0) {
+            cudaFree(d_seeds); cudaFree(d_scores);
+            cudaFree(d_pass_idx); cudaFree(d_pass_count);
+            free(h_seeds); free(h_scores); free(h_pass_idx);
+        }
+        cudaMalloc(&d_seeds,      n * sizeof(uint64_t));
+        cudaMalloc(&d_scores,     n * sizeof(float));
+        cudaMalloc(&d_pass_idx,   n * sizeof(int));
+        cudaMalloc(&d_pass_count, 1 * sizeof(int));
+        h_seeds    = (uint64_t*)malloc(n * sizeof(uint64_t));
+        h_scores   = (float*)   malloc(n * sizeof(float));
+        h_pass_idx = (int*)     malloc(n * sizeof(int));
+        pf_cap = n;
+    }
+
+    // ── Generate seed array ───────────────────────────────────────────
+    for (int i = 0; i < n; i++)
+        h_seeds[i] = start_seed + (uint64_t)i;
+
+    // ── Upload seeds, launch prefilter kernel ────────────────────────
+    cudaMemcpy(d_seeds, h_seeds, n * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemset(d_pass_count, 0, sizeof(int));
+
+    int blocks = (n + 255) / 256;
+    prefilter_seeds<<<blocks, 256>>>(
+        d_seeds, n, d_scores, d_pass_idx, d_pass_count,
+        threshold, large_biomes);
+    cudaDeviceSynchronize();
+
+    // ── Download results ──────────────────────────────────────────────
+    int pass_count = 0;
+    cudaMemcpy(&pass_count, d_pass_count, sizeof(int), cudaMemcpyDeviceToHost);
+    if (pass_count == 0) return 0;
+
+    cudaMemcpy(h_pass_idx, d_pass_idx, pass_count * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // ── Compact: collect surviving seeds ──────────────────────────────
+    uint64_t *surviving = (uint64_t*)malloc(pass_count * sizeof(uint64_t));
+    for (int i = 0; i < pass_count; i++)
+        surviving[i] = h_seeds[h_pass_idx[i]];
+
+    // ── Run standard tiered pipeline on survivors only ────────────────
+    // The tiered pipeline uses persistent buffers at size cap >= n.
+    // We fill only the first pass_count entries.
+    ensure_bufs(n);  // keep full-size buffers for tiered scan output
+
+    cont_batch_init(surviving, pass_count, large_biomes,
+        g.h_perms, g.h_oa, g.h_ob, g.h_oc,
+        g.h_amp, g.h_lac, g.h_h2, g.h_d2, g.h_t2,
+        g.h_ranges, g.h_dbl);
+
+    // Upload only pass_count entries
+    int perm_bytes = pass_count * MAX_OCTAVES * PERM_SIZE;
+    int vec_elems  = pass_count * MAX_OCTAVES;
+    cudaMemcpy(g.d_perm,  g.h_perms,  perm_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_oa,    g.h_oa,     vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_ob,    g.h_ob,     vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_oc,    g.h_oc,     vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_amp,   g.h_amp,    vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_lac,   g.h_lac,    vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_h2,    g.h_h2,     pass_count * MAX_OCTAVES, cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_d2,    g.h_d2,     vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_t2,    g.h_t2,     vec_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_ranges, g.h_ranges, pass_count * 8 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(g.d_dbl,   g.h_dbl,    pass_count * 2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+
+    // Reuse tiered hit buffers (already sized for n, which is >= pass_count)
+    static int *d_tier_counts, *d_tier_gx, *d_tier_gz;
+    static int *h_tier_counts, *h_tier_gx, *h_tier_gz;
+    static int tier_cap = 0;
+    if (n > tier_cap) {
+        if (tier_cap > 0) {
+            cudaFree(d_tier_counts); cudaFree(d_tier_gx); cudaFree(d_tier_gz);
+            free(h_tier_counts); free(h_tier_gx); free(h_tier_gz);
+        }
+        cudaMalloc(&d_tier_counts, n * sizeof(int));
+        cudaMalloc(&d_tier_gx, n * MAX_HITS_PER_SEED * sizeof(int));
+        cudaMalloc(&d_tier_gz, n * MAX_HITS_PER_SEED * sizeof(int));
+        h_tier_counts = (int*)malloc(n * sizeof(int));
+        h_tier_gx = (int*)malloc(n * MAX_HITS_PER_SEED * sizeof(int));
+        h_tier_gz = (int*)malloc(n * MAX_HITS_PER_SEED * sizeof(int));
+        tier_cap = n;
+    }
+
+    cudaMemset(d_tier_counts, 0, pass_count * sizeof(int));
+
+    tiered_scan<<<pass_count, THREADS>>>(
+        g.d_perm, g.d_oa, g.d_ob, g.d_oc, g.d_amp, g.d_lac,
+        g.d_h2, g.d_d2, g.d_t2, g.d_ranges, g.d_dbl, pass_count,
+        G, step_2x, 1,
+        d_tier_counts, d_tier_gx, d_tier_gz,
+        NULL, NULL);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_tier_counts, d_tier_counts, pass_count * sizeof(int), cudaMemcpyDeviceToHost);
+
+    int total = 0;
+    for (int i = 0; i < pass_count; i++) {
+        int cnt = h_tier_counts[i];
+        if (cnt > MAX_HITS_PER_SEED) cnt = MAX_HITS_PER_SEED;
+        hit_counts_out[i] = cnt;
+        // NOTE: hit_gx/hit_gz use global buffer indexed by the SURVIVING seed index.
+        // We read from the start of the tier buffer.
+        int base = i * MAX_HITS_PER_SEED;
+        for (int j = 0; j < cnt; j++) {
+            // We need to download gx/gz too. For now, allocate temp arrays.
+            // Actual reading done below...
+            hit_results[total * 3]     = (int64_t)surviving[i];
+            hit_results[total * 3 + 1] = 0;  // placeholder
+            hit_results[total * 3 + 2] = 0;
+            total++;
+        }
+    }
+
+    // Download the actual hit coordinates
+    if (total > 0) {
+        cudaMemcpy(h_tier_gx, d_tier_gx, pass_count * MAX_HITS_PER_SEED * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_tier_gz, d_tier_gz, pass_count * MAX_HITS_PER_SEED * sizeof(int), cudaMemcpyDeviceToHost);
+
+        total = 0;
+        for (int i = 0; i < pass_count; i++) {
+            int cnt = hit_counts_out[i];
+            if (cnt > MAX_HITS_PER_SEED) cnt = MAX_HITS_PER_SEED;
+            int base = i * MAX_HITS_PER_SEED;
+            for (int j = 0; j < cnt; j++) {
+                hit_results[total * 3]     = (int64_t)surviving[i];
+                hit_results[total * 3 + 1] = (int64_t)h_tier_gx[base + j];
+                hit_results[total * 3 + 2] = (int64_t)h_tier_gz[base + j];
+                total++;
+            }
+        }
+    }
+
+    free(surviving);
     return total;
 }
 
