@@ -10,6 +10,7 @@ CPU: 5-point hex verification with all cont octaves (6-23, no shift).
      Logs >=3M block^2 islands to islands_3m.jsonl.
 """
 import sys, os, time, ctypes, json, random, array, struct, gc
+sys.setrecursionlimit(100000)
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -57,7 +58,7 @@ MAX_HITS = 512
 PREFT_LO = 0.0429   # captures 65% of 4M+ in [0.0429, 0.0433]
 PREFT_HI = 0.0433   # 23× enrichment, ~0.95% random pass
 PREFT_ENABLED = True  # prefilter 100M seeds → survivors to disk → tiered scan
-PREF_BATCH = 100_000_000  # 100M seeds/batch = 800MB RAM
+PREF_BATCH = 50_000_000  # 50M seeds/batch = 400MB RAM (less heap fragmentation)
 
 
 def hunt_batch_tiered(start_seed, n, step_2x, G):
@@ -218,7 +219,7 @@ if __name__ == '__main__':
                     json.dump(entry, f)
 
     def gpu_thread():
-        global scanned, hits_gpu, t_gpu, tiered_scanned, live_gpu, live_tiered
+        global scanned, hits_gpu, t_gpu, tiered_scanned, live_gpu, live_tiered, pool
         sur_file = 'seeds_pass.bin'
         use_prefilter = PREFT_ENABLED
         batch_num = 0
@@ -257,6 +258,10 @@ if __name__ == '__main__':
                       f'({t_total:.1f}s: gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
                 print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits ({hc/n_pass*100:.1f}% hit rate)')
                 gc.collect()
+                # Recreate pool every 5 batches to avoid Python internal lock leak
+                if batch_num % 5 == 0:
+                    pool.shutdown(wait=True)
+                    pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
             else:
                 hits = hunt_batch_tiered(start, batch, step_2x, G)
                 with lock:
@@ -265,6 +270,8 @@ if __name__ == '__main__':
                     live_gpu[0] += len(hits)
                     hits_gpu += len(hits)
                 for seed, gx, gz in hits:
+                    with pending_lock:
+                        pending += 1
                     pool.submit(verify_and_flood, seed, gx, gz,
                                step_1x, step_2x).add_done_callback(on_done)
 
