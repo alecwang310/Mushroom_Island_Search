@@ -456,6 +456,228 @@ void cont_sample_grid(const ContEngine *e, float *out,
     }
 }
 
+/* ==========================================================================
+ * Connected 0.5x triple estimator
+ * ========================================================================== */
+#define ESTIMATE_MAX_POINTS 1024
+#define ESTIMATE_MAX_RADIUS 8
+#define ESTIMATE_NEIGHBORS 6
+
+static int estimate_round_to_int(double value) {
+    double lower_value = floor(value);
+    double fraction = value - lower_value;
+    int lower = (int)lower_value;
+
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1;
+    return (lower & 1) ? lower + 1 : lower;
+}
+
+static int estimate_row_bit(int row_delta) {
+    int bit = row_delta % 2;
+    return bit < 0 ? bit + 2 : bit;
+}
+
+static int estimate_lattice_offset_x(int step, int row_parity,
+                                     int axial_x, int row_delta) {
+    int half_step = (int)(0.5 * step);
+    int center_stagger = row_parity ? half_step : 0;
+    int target_parity = row_parity ^ estimate_row_bit(row_delta);
+    int target_stagger = target_parity ? half_step : 0;
+    return axial_x * step + target_stagger - center_stagger;
+}
+
+static int estimate_lattice_offset_z(int step, int row_delta) {
+    return (int)(row_delta * 0.8660254037844386 * step);
+}
+
+static int estimate_hex_distance(int axial_x, int row_delta) {
+    int third = -axial_x - row_delta;
+    int distance = abs(axial_x);
+    if (abs(row_delta) > distance) distance = abs(row_delta);
+    if (abs(third) > distance) distance = abs(third);
+    return distance;
+}
+
+static int estimate_find_point(const int points[][2], int count,
+                               int axial_x, int row_delta) {
+    for (int i = 0; i < count; i++) {
+        if (points[i][0] == axial_x && points[i][1] == row_delta)
+            return i;
+    }
+    return -1;
+}
+
+static int estimate_add_point(int points[][2], int *count,
+                              int axial_x, int row_delta) {
+    if (estimate_find_point(points, *count, axial_x, row_delta) >= 0)
+        return 1;
+    if (*count >= ESTIMATE_MAX_POINTS)
+        return 0;
+    points[*count][0] = axial_x;
+    points[*count][1] = row_delta;
+    (*count)++;
+    return 1;
+}
+
+double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
+                                 int geometry_code, int step_05x,
+                                 int step_2x) {
+    int row_parity = (geometry_code >> 6) & 1;
+    int pair_mask = geometry_code & 0x3F;
+    int radius_steps;
+    int directions[2];
+    int direction_count = 0;
+    int roots[3][2];
+    int points[ESTIMATE_MAX_POINTS][2];
+    int neighbors[ESTIMATE_MAX_POINTS][ESTIMATE_NEIGHBORS];
+    int point_count = 0;
+    int root_indices[3];
+    unsigned char low[ESTIMATE_MAX_POINTS];
+    unsigned char connected[ESTIMATE_MAX_POINTS];
+    unsigned char seeded[ESTIMATE_MAX_POINTS];
+    int queue[ESTIMATE_MAX_POINTS];
+    int queue_head = 0;
+    int queue_tail = 0;
+
+    if (step_05x <= 0 || step_2x <= 0)
+        return 0.0;
+
+    radius_steps = estimate_round_to_int(
+        (double)step_2x / (double)step_05x);
+    if (radius_steps < 1) radius_steps = 1;
+    if (radius_steps > ESTIMATE_MAX_RADIUS)
+        return 0.0;
+
+    for (int direction = 0; direction < 6; direction++) {
+        if (pair_mask & (1 << direction)) {
+            if (direction_count >= 2)
+                return 0.0;
+            directions[direction_count++] = direction;
+        }
+    }
+    if (direction_count != 2)
+        return 0.0;
+
+    roots[0][0] = 0;
+    roots[0][1] = 0;
+    int half_step_2x = (int)(0.5 * step_2x);
+    int signed_stagger = row_parity == 0 ? half_step_2x : -half_step_2x;
+
+    for (int root = 0; root < 2; root++) {
+        int direction = directions[root];
+        int point_x;
+        int point_row;
+
+        if (direction < 2) {
+            point_row = 0;
+            roots[root + 1][0] = direction == 0
+                ? -radius_steps : radius_steps;
+            roots[root + 1][1] = 0;
+            continue;
+        }
+
+        point_row = direction < 4 ? -radius_steps : radius_steps;
+        point_x = (direction == 2 || direction == 4)
+            ? signed_stagger : -signed_stagger;
+        int row_shift = estimate_lattice_offset_x(
+            step_05x, row_parity, 0, point_row);
+        roots[root + 1][0] = estimate_round_to_int(
+            (double)(point_x - row_shift) / (double)step_05x);
+        roots[root + 1][1] = point_row;
+    }
+
+    for (int root = 0; root < 3; root++) {
+        for (int local_x = -radius_steps;
+             local_x <= radius_steps; local_x++) {
+            for (int local_row = -radius_steps;
+                 local_row <= radius_steps; local_row++) {
+                if (estimate_hex_distance(local_x, local_row)
+                        > radius_steps)
+                    continue;
+                if (!estimate_add_point(
+                        points, &point_count,
+                        roots[root][0] + local_x,
+                        roots[root][1] + local_row))
+                    return 0.0;
+            }
+        }
+    }
+
+    for (int i = 0; i < point_count; i++) {
+        static const int neighbor_delta[ESTIMATE_NEIGHBORS][2] = {
+            {-1, 0}, {1, 0}, {0, -1},
+            {0, 1}, {-1, 1}, {1, -1},
+        };
+        for (int direction = 0; direction < ESTIMATE_NEIGHBORS;
+             direction++) {
+            neighbors[i][direction] = estimate_find_point(
+                points, point_count,
+                points[i][0] + neighbor_delta[direction][0],
+                points[i][1] + neighbor_delta[direction][1]);
+        }
+    }
+
+    ContEngine e;
+    cont_engine_init(&e, seed, 0);
+    for (int i = 0; i < point_count; i++) {
+        int offset_x = estimate_lattice_offset_x(
+            step_05x, row_parity, points[i][0], points[i][1]);
+        int offset_z = estimate_lattice_offset_z(step_05x, points[i][1]);
+        low[i] = cont_sample(&e, gx + offset_x, gz + offset_z)
+            < -1.05;
+        connected[i] = 0;
+        seeded[i] = 0;
+    }
+
+    for (int root = 0; root < 3; root++) {
+        root_indices[root] = estimate_find_point(
+            points, point_count, roots[root][0], roots[root][1]);
+        if (root_indices[root] < 0)
+            return 0.0;
+    }
+
+    for (int root = 0; root < 3; root++) {
+        int root_index = root_indices[root];
+        int candidates[ESTIMATE_NEIGHBORS + 1];
+        candidates[0] = root_index;
+        for (int direction = 0; direction < ESTIMATE_NEIGHBORS;
+             direction++)
+            candidates[direction + 1] = neighbors[root_index][direction];
+
+        for (int candidate = 0;
+             candidate < ESTIMATE_NEIGHBORS + 1; candidate++) {
+            int index = candidates[candidate];
+            if (index < 0 || seeded[index])
+                continue;
+            seeded[index] = 1;
+            if (low[index]) {
+                connected[index] = 1;
+                queue[queue_tail++] = index;
+            }
+        }
+    }
+
+    while (queue_head < queue_tail) {
+        int index = queue[queue_head++];
+        for (int direction = 0; direction < ESTIMATE_NEIGHBORS;
+             direction++) {
+            int neighbor = neighbors[index][direction];
+            if (neighbor >= 0 && low[neighbor] && !connected[neighbor]) {
+                connected[neighbor] = 1;
+                queue[queue_tail++] = neighbor;
+            }
+        }
+    }
+
+    int connected_count = 0;
+    for (int i = 0; i < point_count; i++)
+        connected_count += connected[i] != 0;
+
+    return (double)connected_count * step_05x * step_05x
+        * 0.8660254037844386 * 16.0;
+}
+
 void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
                      uint8_t *perms, float *oa, float *ob, float *oc,
                      float *amp, float *lac, uint8_t *h2,

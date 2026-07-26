@@ -34,6 +34,11 @@ _lib.cont_sample_grid.argtypes = [c_void_p, POINTER(c_float),
                                    c_int, c_int, c_int, c_int, c_int]
 _lib.cont_sample_grid.restype = None
 
+_lib.cont_estimate_triple_area.argtypes = [
+    c_uint64, c_int, c_int, c_int, c_int, c_int,
+]
+_lib.cont_estimate_triple_area.restype = c_double
+
 _lib.cont_batch_init.argtypes = [
     POINTER(c_uint64), c_int, c_int,
     c_void_p, c_void_p, c_void_p, c_void_p, c_void_p,

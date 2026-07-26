@@ -243,7 +243,8 @@ TRIPLE_ESTIMATE_LOOKUP = _build_triple_estimate_lookup(
     _DEFAULT_STEP_05X, _DEFAULT_STEP_2X)
 
 
-def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
+def _estimate_triple_area_python(seed, gx, gz, geometry_code,
+                                 step_05x, step_2x):
     buf = (ctypes.c_ubyte * 8192)()
     _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
 
@@ -276,6 +277,13 @@ def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
                 connected.add(neighbor_index)
                 queue.append(neighbor_index)
     return len(connected) * sample_area
+
+
+def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
+    return _eng._lib.cont_estimate_triple_area(
+        ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
+        ctypes.c_int(gx), ctypes.c_int(gz), ctypes.c_int(geometry_code),
+        ctypes.c_int(step_05x), ctypes.c_int(step_2x))
 
 
 def flood_fill_6oct(seed, cx, cz):
