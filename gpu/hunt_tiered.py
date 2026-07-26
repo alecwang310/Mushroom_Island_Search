@@ -319,7 +319,7 @@ if __name__ == '__main__':
     TARGET = 4_000_000
     step_05x, step_2x = 70, 280
     G, batch = 512, 8192
-    FF_WORKERS = 16
+    FF_WORKERS = int(os.environ.get('HUNT_CPU_WORKERS', '24'))
     MAX_PENDING_VERIFICATIONS = FF_WORKERS * 2
 
     print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
