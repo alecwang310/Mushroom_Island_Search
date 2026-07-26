@@ -11,9 +11,7 @@ CPU: a cached 0.5x hex lookup samples the connected low-cell component
      Logs >=4M block^2 islands to islands_4m.jsonl.
 """
 import sys, os, time, ctypes, json, random
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -45,13 +43,7 @@ _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
 INITIAL_HIT_CAP = 65_536
-ISLAND_THRESHOLD = -1.05
 ESTIMATE_TARGET_AREA = 4_000_000
-_SQRT3_OVER_2 = 0.8660254037844386
-_GRID_CELL_AREA_SCALE = 16.0
-_DEFAULT_STEP_05X = 70
-_DEFAULT_STEP_1X = 140
-_DEFAULT_STEP_2X = 280
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -124,159 +116,6 @@ def scan_survivors_stream(seeds, n, step_2x, G, submit_verification,
                     seed, gx, gz, geometry_code, step_05x, s2x):
                 return total_hits
     return total_hits
-
-
-def _coarse_neighbor_offsets(step_2x, row_parity):
-    stagger_x = int(0.5 * step_2x)
-    row_z = int(_SQRT3_OVER_2 * step_2x)
-    signed_stagger_x = stagger_x if row_parity == 0 else -stagger_x
-    return (
-        (-step_2x, 0),
-        (step_2x, 0),
-        (signed_stagger_x, -row_z),
-        (-signed_stagger_x, -row_z),
-        (signed_stagger_x, row_z),
-        (-signed_stagger_x, row_z),
-    )
-
-
-@lru_cache(maxsize=None)
-def _hex_disk_lattice(radius_steps, ring_only=False):
-    lattice = []
-    for axial_x in range(-radius_steps, radius_steps + 1):
-        for row_delta in range(-radius_steps, radius_steps + 1):
-            distance = max(
-                abs(axial_x), abs(row_delta), abs(axial_x + row_delta))
-            if distance > radius_steps:
-                continue
-            if ring_only and distance != radius_steps:
-                continue
-            lattice.append((axial_x, row_delta))
-    return tuple(lattice)
-
-
-def _lattice_offset(step, row_parity, axial_x, row_delta):
-    half_step = int(0.5 * step)
-    center_stagger = half_step if row_parity else 0
-    target_parity = row_parity ^ (row_delta & 1)
-    target_stagger = half_step if target_parity else 0
-    return (
-        axial_x * step + target_stagger - center_stagger,
-        int(row_delta * _SQRT3_OVER_2 * step),
-    )
-
-
-@lru_cache(maxsize=None)
-def _hex_disk_offsets(step, radius_steps, row_parity, ring_only=False):
-    return tuple(
-        _lattice_offset(step, row_parity, axial_x, row_delta)
-        for axial_x, row_delta in _hex_disk_lattice(radius_steps, ring_only))
-
-
-def _point_row_parity(center_parity, direction):
-    return center_parity if direction < 2 else center_parity ^ 1
-
-
-@lru_cache(maxsize=None)
-def _build_triple_estimate_lookup(step_05x, step_2x):
-    radius_steps = max(1, int(round(step_2x / step_05x)))
-    coarse_steps = radius_steps
-    lookup = {}
-    for row_parity in (0, 1):
-        coarse_offsets = ((0, 0),) + _coarse_neighbor_offsets(
-            step_2x, row_parity)
-        for pair_mask in range(64):
-            if pair_mask.bit_count() != 2:
-                continue
-            directions = [
-                direction for direction in range(6)
-                if pair_mask & (1 << direction)]
-            points = [(0, (0, 0))]
-            for direction in directions:
-                point_x, _ = coarse_offsets[direction + 1]
-                if direction < 2:
-                    point_row = 0
-                    point_x_lattice = (-coarse_steps if direction == 0
-                                       else coarse_steps)
-                else:
-                    point_row = (-coarse_steps if direction < 4
-                                 else coarse_steps)
-                    row_shift = _lattice_offset(
-                        step_05x, row_parity, 0, point_row)[0]
-                    point_x_lattice = round(
-                        (point_x - row_shift) / step_05x)
-                points.append((direction, (point_x_lattice, point_row)))
-
-            inner = set()
-            for _, (point_x, point_row) in points:
-                for local_x, local_row in _hex_disk_lattice(radius_steps):
-                    inner.add((point_x + local_x, point_row + local_row))
-
-            lattice_points = tuple(sorted(inner))
-            index_by_lattice = {
-                lattice: index for index, lattice in enumerate(lattice_points)}
-            offsets = tuple(
-                _lattice_offset(step_05x, row_parity, axial_x, row_delta)
-                for axial_x, row_delta in lattice_points)
-            root_indices = tuple(
-                index_by_lattice[point] for _, point in points)
-            neighbor_indices = []
-            for axial_x, row_delta in lattice_points:
-                neighbors = (
-                    (axial_x - 1, row_delta),
-                    (axial_x + 1, row_delta),
-                    (axial_x, row_delta - 1),
-                    (axial_x, row_delta + 1),
-                    (axial_x - 1, row_delta + 1),
-                    (axial_x + 1, row_delta - 1),
-                )
-                neighbor_indices.append(tuple(
-                    index_by_lattice[neighbor]
-                    for neighbor in neighbors
-                    if neighbor in index_by_lattice))
-            lookup[(row_parity, pair_mask)] = (
-                offsets, root_indices, tuple(neighbor_indices))
-    return lookup
-
-
-TRIPLE_ESTIMATE_LOOKUP = _build_triple_estimate_lookup(
-    _DEFAULT_STEP_05X, _DEFAULT_STEP_2X)
-
-
-def _estimate_triple_area_python(seed, gx, gz, geometry_code,
-                                 step_05x, step_2x):
-    buf = (ctypes.c_ubyte * 8192)()
-    _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
-
-    row_parity = (geometry_code >> 6) & 1
-    pair_mask = geometry_code & 0x3F
-    if (step_05x, step_2x) == (_DEFAULT_STEP_05X, _DEFAULT_STEP_2X):
-        lookup = TRIPLE_ESTIMATE_LOOKUP
-    else:
-        lookup = _build_triple_estimate_lookup(step_05x, step_2x)
-    offsets, root_indices, neighbor_indices = lookup.get(
-        (row_parity, pair_mask), ((), (), ()))
-    if not offsets:
-        return 0.0
-
-    low = []
-    for index, (offset_x, offset_z) in enumerate(offsets):
-        low.append(_eng._lib.cont_sample(
-            buf, gx + offset_x, gz + offset_z) < ISLAND_THRESHOLD)
-
-    sample_area = step_05x * step_05x * _SQRT3_OVER_2 * _GRID_CELL_AREA_SCALE
-    seed_indices = set(root_indices)
-    for root_index in root_indices:
-        seed_indices.update(neighbor_indices[root_index])
-    queue = deque(index for index in seed_indices if low[index])
-    connected = set(queue)
-    while queue:
-        index = queue.popleft()
-        for neighbor_index in neighbor_indices[index]:
-            if low[neighbor_index] and neighbor_index not in connected:
-                connected.add(neighbor_index)
-                queue.append(neighbor_index)
-    return len(connected) * sample_area
 
 
 def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
