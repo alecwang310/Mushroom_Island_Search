@@ -154,7 +154,7 @@ and the best result is written to `best_4m.jsonl`.
 1. Optional GPU prefilter: a 100M consecutive-seed range is scored with the variance LUT and compacted into survivor seeds. It enriches the search but does not prove an island.
 2. CPU compact initialization: only O6 and O15 state is created for each survivor and uploaded once per GPU scan chunk.
 3. GPU tiered scan: `tiered_kernel.cu` evaluates a 2x hex grid, with 280-block spacing and `G=512`. A hit is a center plus two connected mushroom points, encoded as line, triangle, or V geometry.
-4. CPU estimate: the cached 0.5x lookup samples at 70-block spacing around the triple and extrapolates a shell. This is currently suspected of severe overestimation.
+4. CPU estimate: the cached 0.5x lookup samples at 70-block spacing and counts only the connected low-cell component touching the triple. It no longer extrapolates a perimeter shell.
 5. Tier-1 flood: six-octave C flood is a cheap gate; only areas >=3M reach the full 24-octave flood.
 6. Final output: only a full 24-octave area >=4M is a valid large mushroom island.
 
@@ -191,6 +191,16 @@ The default coordinate-local radius is two coarse steps (`560` in the current
 configuration). The report also shows exact-coordinate, one-step, and
 seed-level retention so the sacrificed count is not dependent on one matching
 radius.
+
+Compare GPU spacing and random-control pruning with:
+
+```bat
+python gpu\benchmark_step_sizes.py --input historical_islands_3m.jsonl --report step_sizes.json
+```
+
+This uses historical records >=4M as known positives. Random controls are
+seeds not present in the historical file, so their pruning rate measures GPU
+selectivity but is not proof that every control lacks a large island.
 
 ## Local Checks and Git Handoff
 

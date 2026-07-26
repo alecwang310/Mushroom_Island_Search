@@ -5,13 +5,13 @@ GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
      Optional pre-filter: GPU LUT-variance filter generates a consecutive
      seed range on-device and returns only compacted survivors.
 
-CPU: a cached 0.5x hex lookup samples the union of radius-2x regions
-     around the three coarse hit points. The 2x perimeter estimates the
-     continuation into the next shell; only probable >=4M islands reach
+CPU: a cached 0.5x hex lookup samples the connected low-cell component
+     touching the three coarse hit points; only probable >=4M islands reach
      the six-octave flood and then the full flood.
      Logs >=4M block^2 islands to islands_4m.jsonl.
 """
-import sys, os, time, ctypes, json, random, struct
+import sys, os, time, ctypes, json, random
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import threading
@@ -141,11 +141,8 @@ def _coarse_neighbor_offsets(step_2x, row_parity):
 
 
 @lru_cache(maxsize=None)
-def _hex_disk_offsets(step, radius_steps, row_parity, ring_only=False):
-    half_step = int(0.5 * step)
-    row_step = int(_SQRT3_OVER_2 * step)
-    center_stagger = half_step if row_parity else 0
-    offsets = []
+def _hex_disk_lattice(radius_steps, ring_only=False):
+    lattice = []
     for axial_x in range(-radius_steps, radius_steps + 1):
         for row_delta in range(-radius_steps, radius_steps + 1):
             distance = max(
@@ -154,13 +151,26 @@ def _hex_disk_offsets(step, radius_steps, row_parity, ring_only=False):
                 continue
             if ring_only and distance != radius_steps:
                 continue
-            target_parity = row_parity ^ (row_delta & 1)
-            target_stagger = half_step if target_parity else 0
-            offsets.append((
-                axial_x * step + target_stagger - center_stagger,
-                row_delta * row_step,
-            ))
-    return tuple(offsets)
+            lattice.append((axial_x, row_delta))
+    return tuple(lattice)
+
+
+def _lattice_offset(step, row_parity, axial_x, row_delta):
+    half_step = int(0.5 * step)
+    center_stagger = half_step if row_parity else 0
+    target_parity = row_parity ^ (row_delta & 1)
+    target_stagger = half_step if target_parity else 0
+    return (
+        axial_x * step + target_stagger - center_stagger,
+        int(row_delta * _SQRT3_OVER_2 * step),
+    )
+
+
+@lru_cache(maxsize=None)
+def _hex_disk_offsets(step, radius_steps, row_parity, ring_only=False):
+    return tuple(
+        _lattice_offset(step, row_parity, axial_x, row_delta)
+        for axial_x, row_delta in _hex_disk_lattice(radius_steps, ring_only))
 
 
 def _point_row_parity(center_parity, direction):
@@ -170,7 +180,7 @@ def _point_row_parity(center_parity, direction):
 @lru_cache(maxsize=None)
 def _build_triple_estimate_lookup(step_05x, step_2x):
     radius_steps = max(1, int(round(step_2x / step_05x)))
-    outer_radius_steps = radius_steps * 2
+    coarse_steps = radius_steps
     lookup = {}
     for row_parity in (0, 1):
         coarse_offsets = ((0, 0),) + _coarse_neighbor_offsets(
@@ -182,34 +192,50 @@ def _build_triple_estimate_lookup(step_05x, step_2x):
                 direction for direction in range(6)
                 if pair_mask & (1 << direction)]
             points = [(0, (0, 0))]
-            points.extend(
-                (direction, coarse_offsets[direction + 1])
-                for direction in directions)
+            for direction in directions:
+                point_x, _ = coarse_offsets[direction + 1]
+                if direction < 2:
+                    point_row = 0
+                    point_x_lattice = (-coarse_steps if direction == 0
+                                       else coarse_steps)
+                else:
+                    point_row = (-coarse_steps if direction < 4
+                                 else coarse_steps)
+                    row_shift = _lattice_offset(
+                        step_05x, row_parity, 0, point_row)[0]
+                    point_x_lattice = round(
+                        (point_x - row_shift) / step_05x)
+                points.append((direction, (point_x_lattice, point_row)))
 
             inner = set()
-            perimeter = set()
-            outer = set()
-            for direction, (point_x, point_z) in points:
-                point_parity = _point_row_parity(row_parity, direction)
-                for offset in _hex_disk_offsets(
-                        step_05x, radius_steps, point_parity):
-                    inner.add((point_x + offset[0], point_z + offset[1]))
-                for offset in _hex_disk_offsets(
-                        step_05x, radius_steps, point_parity, ring_only=True):
-                    perimeter.add((point_x + offset[0], point_z + offset[1]))
-                for offset in _hex_disk_offsets(
-                        step_05x, outer_radius_steps, point_parity):
-                    outer.add((point_x + offset[0], point_z + offset[1]))
+            for _, (point_x, point_row) in points:
+                for local_x, local_row in _hex_disk_lattice(radius_steps):
+                    inner.add((point_x + local_x, point_row + local_row))
 
-            offsets = tuple(inner)
-            index_by_offset = {offset: index for index, offset in enumerate(offsets)}
-            perimeter_indices = frozenset(
-                index_by_offset[offset]
-                for offset in perimeter
-                if offset in index_by_offset)
-            shell_count = max(0, len(outer) - len(inner))
+            lattice_points = tuple(sorted(inner))
+            index_by_lattice = {
+                lattice: index for index, lattice in enumerate(lattice_points)}
+            offsets = tuple(
+                _lattice_offset(step_05x, row_parity, axial_x, row_delta)
+                for axial_x, row_delta in lattice_points)
+            root_indices = tuple(
+                index_by_lattice[point] for _, point in points)
+            neighbor_indices = []
+            for axial_x, row_delta in lattice_points:
+                neighbors = (
+                    (axial_x - 1, row_delta),
+                    (axial_x + 1, row_delta),
+                    (axial_x, row_delta - 1),
+                    (axial_x, row_delta + 1),
+                    (axial_x - 1, row_delta + 1),
+                    (axial_x + 1, row_delta - 1),
+                )
+                neighbor_indices.append(tuple(
+                    index_by_lattice[neighbor]
+                    for neighbor in neighbors
+                    if neighbor in index_by_lattice))
             lookup[(row_parity, pair_mask)] = (
-                offsets, perimeter_indices, shell_count)
+                offsets, root_indices, tuple(neighbor_indices))
     return lookup
 
 
@@ -220,10 +246,6 @@ TRIPLE_ESTIMATE_LOOKUP = _build_triple_estimate_lookup(
 def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
     buf = (ctypes.c_ubyte * 8192)()
     _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
-    _eng._lib.cont_engine_disable_shift(buf)
-    off_amp = 24*257 + 24*8*3
-    for j in range(6):
-        struct.pack_into('d', buf, off_amp + j*8, 0.0)
 
     row_parity = (geometry_code >> 6) & 1
     pair_mask = geometry_code & 0x3F
@@ -231,27 +253,29 @@ def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
         lookup = TRIPLE_ESTIMATE_LOOKUP
     else:
         lookup = _build_triple_estimate_lookup(step_05x, step_2x)
-    offsets, perimeter_indices, shell_count = lookup.get(
-        (row_parity, pair_mask), ((), frozenset(), 0))
+    offsets, root_indices, neighbor_indices = lookup.get(
+        (row_parity, pair_mask), ((), (), ()))
     if not offsets:
         return 0.0
 
-    low_count = 0
-    perimeter_low_count = 0
+    low = []
     for index, (offset_x, offset_z) in enumerate(offsets):
-        if _eng._lib.cont_sample(
-                buf, gx + offset_x, gz + offset_z) < ISLAND_THRESHOLD:
-            low_count += 1
-            if index in perimeter_indices:
-                perimeter_low_count += 1
+        low.append(_eng._lib.cont_sample(
+            buf, gx + offset_x, gz + offset_z) < ISLAND_THRESHOLD)
 
     sample_area = step_05x * step_05x * _SQRT3_OVER_2 * _GRID_CELL_AREA_SCALE
-    inner_area = low_count * sample_area
-    perimeter_fraction = (
-        perimeter_low_count / len(perimeter_indices)
-        if perimeter_indices else 0.0)
-    estimated_shell_area = shell_count * sample_area * perimeter_fraction
-    return inner_area + estimated_shell_area
+    seed_indices = set(root_indices)
+    for root_index in root_indices:
+        seed_indices.update(neighbor_indices[root_index])
+    queue = deque(index for index in seed_indices if low[index])
+    connected = set(queue)
+    while queue:
+        index = queue.popleft()
+        for neighbor_index in neighbor_indices[index]:
+            if low[neighbor_index] and neighbor_index not in connected:
+                connected.add(neighbor_index)
+                queue.append(neighbor_index)
+    return len(connected) * sample_area
 
 
 def flood_fill_6oct(seed, cx, cz):

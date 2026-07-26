@@ -12,7 +12,7 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → cont_batch_init_tiered (CPU, O6+O15 only) → one compact upload
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
      → download only compacted hit triples plus geometry codes
-     → CPU 0.5x perimeter estimate → only probable ≥4M hits reach flood fill
+     → CPU 0.5x connected estimate → only probable ≥4M hits reach flood fill
      → CPU 6-octave flood (C, six octaves initialized) → if area≥3M, 24-octave flood
      → log results ≥4M to islands_4m.jsonl
 ```
@@ -35,6 +35,7 @@ gpu/
   hunt_engine.cu               #    DLL host: compact init/upload/launch/download
   hunt_tiered.py               # ★ Current hunt script: GPU thread + CPU verify + flood
   benchmark_historical_hits.py #    Historical triple-filter retention benchmark
+  benchmark_step_sizes.py      #    GPU spacing/retention/selectivity benchmark
   gpu_monitor.py               #    nvidia-smi polling script
 
 continentalness_pipeline.py    # Pure-Python reference implementation (verified vs cubiomes)
@@ -84,7 +85,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 - **16 workers** (ThreadPoolExecutor)
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
-- **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the union of radius-2x disks around the three GPU points. The radius-2x ring is used to extrapolate one additional shell; only estimates ≥4M reach flood fill. Samples use all continentalness octaves without shift and the real mushroom threshold.
+- **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the connected low-cell component touching the three GPU points. It uses the full shifted continentalness field and the real mushroom threshold; only connected estimates ≥4M reach flood fill.
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
 - **Dedup**: by (seed, area) to avoid logging the same island from overlapping triples
