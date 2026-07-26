@@ -24,6 +24,9 @@ _CONT_ENGINE_SIZE = 8192
 _lib.cont_engine_init.argtypes = [c_void_p, c_uint64, c_int]
 _lib.cont_engine_init.restype = None
 
+_lib.cont_engine_disable_shift.argtypes = [c_void_p]
+_lib.cont_engine_disable_shift.restype = None
+
 _lib.cont_sample.argtypes = [c_void_p, c_int, c_int]
 _lib.cont_sample.restype = c_double
 

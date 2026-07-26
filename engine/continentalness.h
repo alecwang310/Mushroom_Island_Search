@@ -71,6 +71,11 @@ typedef struct {
 void cont_engine_init(ContEngine *e, uint64_t seed, int large_biomes);
 
 /**
+ * Disable shift distortion after initialization while preserving continentalness.
+ */
+void cont_engine_disable_shift(ContEngine *e);
+
+/**
  * Initialize only the six octaves used by cont_flood_fill_6oct:
  * continentalness octaves 6, 7, 8, 15, 16, and 17.
  */

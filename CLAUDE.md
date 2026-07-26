@@ -12,7 +12,7 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → cont_batch_init_tiered (CPU, O6+O15 only) → one compact upload
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
      → download only compacted hit triples plus geometry codes
-     → CPU verify (≥2 unique 1x neighbors around each triple)
+     → CPU 0.5x perimeter estimate → only probable ≥4M hits reach flood fill
      → CPU 6-octave flood (C, six octaves initialized) → if area≥3M, 24-octave flood
      → log results ≥4M to islands_4m.jsonl
 ```
@@ -83,7 +83,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 - **16 workers** (ThreadPoolExecutor)
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
-- **Verify** (`verify_triple_cpu`): a cached lookup expands the center and the two selected 2x neighbors into unique adjacent 1x-grid points. Verification passes when at least 2 sampled points are below -1.0; all continentalness octaves are used without shift.
+- **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the union of radius-2x disks around the three GPU points. The radius-2x ring is used to extrapolate one additional shell; only estimates ≥4M reach flood fill. Samples use all continentalness octaves without shift and the real mushroom threshold.
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
 - **Dedup**: by (seed, area) to avoid logging the same island from overlapping triples

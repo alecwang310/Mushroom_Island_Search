@@ -343,6 +343,12 @@ void cont_engine_init(ContEngine *e, uint64_t seed, int large_biomes) {
         xlo, xhi, large_biomes, 2/*NP_CONTINENTALNESS*/, -1, idx);
 }
 
+void cont_engine_disable_shift(ContEngine *e) {
+    e->shift_octA_count = 0;
+    e->shift_octB_count = 0;
+    e->shift_dbl_amp = 0.0;
+}
+
 void cont_engine_init_6oct(ContEngine *e, uint64_t seed, int large_biomes) {
     static const double amplitudes[] = {1, 1, 2, 2, 2, 1, 1, 1, 1};
     const int omin = large_biomes ? -11 : -9;
