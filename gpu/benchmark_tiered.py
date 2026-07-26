@@ -18,8 +18,10 @@ from hunt_tiered import (
     PREFT_HI,
     PREFT_LO,
     _hunt,
+    flood_fill_6oct,
+    flood_fill_full,
     prefilter_range,
-    verify_and_flood,
+    verify_pair_cpu,
 )
 
 
@@ -29,6 +31,28 @@ GRID_SIZE = 512
 CPU_WORKERS = int(os.environ.get('HUNT_CPU_WORKERS', '24'))
 MAX_PENDING = CPU_WORKERS * 2
 CPU_HIT_LIMIT = int(os.environ.get('HUNT_CPU_HIT_LIMIT', '0'))
+
+
+def benchmark_verify_and_flood(seed, grid_x, grid_z):
+    verify_started = time.perf_counter()
+    verified = verify_pair_cpu(seed, grid_x, grid_z, STEP_1X, STEP_2X)
+    verify_seconds = time.perf_counter() - verify_started
+    if not verified:
+        return False, None, verify_seconds, 0.0, 0.0, False
+
+    flood6_started = time.perf_counter()
+    flood6_area = flood_fill_6oct(seed, grid_x, grid_z)
+    flood6_seconds = time.perf_counter() - flood6_started
+    if flood6_area < 3_000_000:
+        return True, None, verify_seconds, flood6_seconds, 0.0, False
+
+    full_flood_started = time.perf_counter()
+    result = flood_fill_full(seed, grid_x, grid_z)
+    full_flood_seconds = time.perf_counter() - full_flood_started
+    return (
+        True, result, verify_seconds, flood6_seconds,
+        full_flood_seconds, True,
+    )
 
 
 def scan_survivors_gpu(seeds, seed_count):
@@ -78,9 +102,11 @@ def benchmark_cpu(hits):
             'submit_seconds': 0.0,
             'service_seconds': 0.0,
             'verify_seconds': 0.0,
-            'flood_seconds': 0.0,
+            'flood6_seconds': 0.0,
+            'full_flood_seconds': 0.0,
             'verified': 0,
-            'flooded': 0,
+            'flood6_calls': 0,
+            'full_flood_calls': 0,
             'big': 0,
             'peak_pending': 0,
             'blocked_submissions': 0,
@@ -94,27 +120,36 @@ def benchmark_cpu(hits):
     peak_pending = 0
     completed_count = 0
     verified_count = 0
-    flooded_count = 0
+    flood6_calls = 0
+    full_flood_calls = 0
     big_count = 0
     verify_seconds = 0.0
-    flood_seconds = 0.0
+    flood6_seconds = 0.0
+    full_flood_seconds = 0.0
     blocked_submissions = 0
     submit_wait_seconds = 0.0
 
     def on_done(future):
         nonlocal pending_count, completed_count, verified_count
-        nonlocal flooded_count, big_count, verify_seconds, flood_seconds
+        nonlocal flood6_calls, full_flood_calls, big_count
+        nonlocal verify_seconds, flood6_seconds, full_flood_seconds
         try:
-            verified, result, verify_time, flood_time = future.result()
+            (
+                verified, result, verify_time, flood6_time,
+                full_flood_time, full_flood_called,
+            ) = future.result()
             with state_lock:
                 if verified:
                     verified_count += 1
+                    flood6_calls += 1
+                if full_flood_called:
+                    full_flood_calls += 1
                 if result is not None:
-                    flooded_count += 1
                     if result['area'] >= 4_000_000:
                         big_count += 1
                 verify_seconds += verify_time
-                flood_seconds += flood_time
+                flood6_seconds += flood6_time
+                full_flood_seconds += full_flood_time
         finally:
             with state_lock:
                 pending_count -= 1
@@ -137,7 +172,7 @@ def benchmark_cpu(hits):
             peak_pending = max(peak_pending, pending_count)
         try:
             future = pool.submit(
-                verify_and_flood, seed, grid_x, grid_z, STEP_1X, STEP_2X)
+                benchmark_verify_and_flood, seed, grid_x, grid_z)
             future.add_done_callback(on_done)
         except BaseException:
             with state_lock:
@@ -154,11 +189,13 @@ def benchmark_cpu(hits):
     return {
         'wall_seconds': wall_seconds,
         'submit_seconds': submit_seconds,
-        'service_seconds': verify_seconds + flood_seconds,
+        'service_seconds': verify_seconds + flood6_seconds + full_flood_seconds,
         'verify_seconds': verify_seconds,
-        'flood_seconds': flood_seconds,
+        'flood6_seconds': flood6_seconds,
+        'full_flood_seconds': full_flood_seconds,
         'verified': verified_count,
-        'flooded': flooded_count,
+        'flood6_calls': flood6_calls,
+        'full_flood_calls': full_flood_calls,
         'big': big_count,
         'peak_pending': peak_pending,
         'blocked_submissions': blocked_submissions,
@@ -219,11 +256,14 @@ def main():
         f'{cpu["wall_seconds"]:.3f}s ({cpu_rate:,.0f} hits/s)')
     print(
         f'CPU results: {cpu["verified"]:,} verified, '
-        f'{cpu["flooded"]:,} flood fills, {cpu["big"]:,} >=4M')
+        f'{cpu["flood6_calls"]:,} 6-octave floods, '
+        f'{cpu["full_flood_calls"]:,} full floods, '
+        f'{cpu["big"]:,} >=4M')
     print(
         f'CPU service time: {cpu["service_seconds"]:.3f}s '
         f'(verify {cpu["verify_seconds"]:.3f}s, '
-        f'flood {cpu["flood_seconds"]:.3f}s)')
+        f'6-octave flood {cpu["flood6_seconds"]:.3f}s, '
+        f'full flood {cpu["full_flood_seconds"]:.3f}s)')
     print(
         f'CPU queue: peak {cpu["peak_pending"]}/{MAX_PENDING} pending, '
         f'{cpu["blocked_submissions"]:,} blocked submissions, '
