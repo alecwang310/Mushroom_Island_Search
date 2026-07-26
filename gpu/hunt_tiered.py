@@ -79,7 +79,7 @@ def prefilter_range(start_seed, n, lo, hi, survivors):
 
 CHUNK = 8192
 
-def scan_survivors_stream(seeds, n, step_2x, G, pool, on_done, s1x, s2x):
+def scan_survivors_stream(seeds, n, step_2x, G, submit_verification, s1x, s2x):
     """Scan compacted survivors in chunks and submit hits immediately."""
     if n == 0:
         return 0
@@ -101,10 +101,11 @@ def scan_survivors_stream(seeds, n, step_2x, G, pool, on_done, s1x, s2x):
                 ptr, sz, step_2x, G, hit_capacity, results)
         if hc < 0:
             raise RuntimeError(f'tiered scan overflow retry failed: {-hc} hits')
+        total_hits += hc
         for i in range(hc):
             seed, gx, gz = int(results[i*3]), int(results[i*3+1]), int(results[i*3+2])
-            pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x).add_done_callback(on_done)
-        total_hits += hc
+            if not submit_verification(seed, gx, gz, s1x, s2x):
+                return total_hits
     return total_hits
 
 
@@ -165,6 +166,7 @@ if __name__ == '__main__':
     step_1x, step_2x = 140, 280
     G, batch = 512, 8192
     FF_WORKERS = 16
+    MAX_PENDING_VERIFICATIONS = FF_WORKERS * 2
 
     print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
     print(f'step_1x={step_1x}  step_2x={step_2x}  G={G}  batch={batch}')
@@ -183,6 +185,7 @@ if __name__ == '__main__':
     t_gpu, t_vfy, t_ff = 0.0, 0.0, 0.0
     seen = set()
     lock = threading.Lock()
+    pending = threading.BoundedSemaphore(MAX_PENDING_VERIFICATIONS)
     t0 = time.perf_counter()
     running = True
 
@@ -209,6 +212,26 @@ if __name__ == '__main__':
                 print(f'  *** NEW BEST: {r["seed"]}, {r["area"]:,} ***')
                 with open('best_4m.jsonl', 'w') as f:
                     json.dump(entry, f)
+
+    def on_done_releasing(future):
+        try:
+            on_done(future)
+        finally:
+            pending.release()
+
+    def submit_verification(seed, gx, gz, s1x, s2x):
+        while running:
+            if pending.acquire(timeout=0.5):
+                break
+        else:
+            return False
+        try:
+            future = pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x)
+            future.add_done_callback(on_done_releasing)
+        except BaseException:
+            pending.release()
+            raise
+        return True
 
     def gpu_thread():
         global scanned, tiered_scanned, hits_gpu, t_gpu
@@ -239,7 +262,8 @@ if __name__ == '__main__':
                     continue
 
                 hc = scan_survivors_stream(
-                    survivors, n_pass, step_2x, G, pool, on_done, step_1x, step_2x)
+                    survivors, n_pass, step_2x, G,
+                    submit_verification, step_1x, step_2x)
                 t_end = time.perf_counter()
                 with lock:
                     hits_gpu += hc
@@ -257,8 +281,7 @@ if __name__ == '__main__':
                     tiered_scanned += batch
                     hits_gpu += len(hits)
                 for seed, gx, gz in hits:
-                    pool.submit(verify_and_flood, seed, gx, gz,
-                               step_1x, step_2x).add_done_callback(on_done)
+                    submit_verification(seed, gx, gz, step_1x, step_2x)
 
     gpu_t = threading.Thread(target=gpu_thread, daemon=True)
     gpu_t.start()
