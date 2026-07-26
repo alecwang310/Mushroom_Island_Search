@@ -11,9 +11,9 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → compact survivor seeds in RAM (no 800MB host seed array or disk round trip)
      → cont_batch_init_tiered (CPU, O6+O15 only) → one compact upload
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
-     → download only compacted hit pairs
-     → CPU verify (≥2 hex points, all cont octaves, 22µs/hit)
-     → CPU 6-octave flood (C, 37ms) → if area≥3M, 24-octave flood (134ms)
+     → download only compacted hit triples plus geometry codes
+     → CPU verify (≥2 unique 1x neighbors around each triple)
+     → CPU 6-octave flood (C, six octaves initialized) → if area≥3M, 24-octave flood
      → log results ≥4M to islands_4m.jsonl
 ```
 
@@ -75,7 +75,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **Perm lookup**: seven adjacent-pair stages per Perlin call; each pair uses three
   `shfl.sync.idx.b32` instructions plus `prmt.b32`, with no shared-memory lookup
 - **Gradient lookup**: branchless hash arithmetic replaces divergent constant-table reads
-- **Detection**: 32 shared row bitmasks replace the float grid; hit writes are warp-compacted
+- **Detection**: 32 shared row bitmasks replace the float grid; a hit requires the center plus at least two true hex neighbors. The two selected neighbor bits and row parity are returned as a geometry code, so line, triangle, and V-shaped triples are represented without rescanning the GPU grid.
 - **Fallback**: compile with `-DTIERED_USE_WARP_PERM=0` for the shared-memory reference
 - **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
 
@@ -83,10 +83,10 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 - **16 workers** (ThreadPoolExecutor)
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
-- **Verify** (`verify_pair_cpu`): all continentalness octaves without shift, up to 10 hex points
+- **Verify** (`verify_triple_cpu`): a cached lookup expands the center and the two selected 2x neighbors into unique adjacent 1x-grid points. Verification passes when at least 2 sampled points are below -1.0; all continentalness octaves are used without shift.
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
-- **Dedup**: by (seed, area) to avoid logging same island from adjacent pairs
+- **Dedup**: by (seed, area) to avoid logging the same island from overlapping triples
 
 ## Key Findings (from analysis)
 
@@ -96,7 +96,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 4. **Previous GPU bottleneck**: 14 serial shared-memory loads in the hash chain
    produced 43-54% bank conflicts. The default kernel now uses warp-register
    permutation storage; it still needs Nsight benchmarking on the CUDA host.
-5. **CPU bottleneck**: flood fill (37-134ms). ≥2 verify filter keeps pass rate low enough.
+5. **CPU bottleneck**: flood fill (37-134ms). The triple filter and ≥2-of-all-neighbors verification threshold are intentionally stricter to reduce this workload while preserving clustered islands.
 6. The remaining serial dependency is the seven-stage paired permutation hash chain.
 
 ## Build

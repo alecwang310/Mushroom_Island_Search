@@ -21,7 +21,7 @@ from hunt_tiered import (
     flood_fill_6oct,
     flood_fill_full,
     prefilter_range,
-    verify_pair_cpu,
+    verify_triple_cpu,
 )
 
 
@@ -33,9 +33,10 @@ MAX_PENDING = CPU_WORKERS * 2
 CPU_HIT_LIMIT = int(os.environ.get('HUNT_CPU_HIT_LIMIT', '0'))
 
 
-def benchmark_verify_and_flood(seed, grid_x, grid_z):
+def benchmark_verify_and_flood(seed, grid_x, grid_z, geometry_code):
     verify_started = time.perf_counter()
-    verified = verify_pair_cpu(seed, grid_x, grid_z, STEP_1X, STEP_2X)
+    verified = verify_triple_cpu(
+        seed, grid_x, grid_z, geometry_code, STEP_1X, STEP_2X)
     verify_seconds = time.perf_counter() - verify_started
     if not verified:
         return False, None, verify_seconds, 0.0, 0.0, False
@@ -58,7 +59,7 @@ def benchmark_verify_and_flood(seed, grid_x, grid_z):
 def scan_survivors_gpu(seeds, seed_count):
     hits = []
     hit_capacity = INITIAL_HIT_CAP
-    results = (ctypes.c_int64 * (hit_capacity * 3))()
+    results = (ctypes.c_int64 * (hit_capacity * 4))()
     kernel_seconds = 0.0
     scan_started = time.perf_counter()
 
@@ -75,7 +76,7 @@ def scan_survivors_gpu(seeds, seed_count):
 
         if hit_count < 0:
             hit_capacity = -hit_count
-            results = (ctypes.c_int64 * (hit_capacity * 3))()
+            results = (ctypes.c_int64 * (hit_capacity * 4))()
             kernel_started = time.perf_counter()
             hit_count = _hunt.tiered_scan_mem(
                 seed_ptr, chunk_size, STEP_2X, GRID_SIZE,
@@ -85,11 +86,12 @@ def scan_survivors_gpu(seeds, seed_count):
             raise RuntimeError(f'GPU hit buffer overflow retry failed: {-hit_count}')
 
         for hit_index in range(hit_count):
-            hit_offset = hit_index * 3
+            hit_offset = hit_index * 4
             hits.append((
                 int(results[hit_offset]),
                 int(results[hit_offset + 1]),
                 int(results[hit_offset + 2]),
+                int(results[hit_offset + 3]),
             ))
 
     return hits, kernel_seconds, time.perf_counter() - scan_started
@@ -160,7 +162,7 @@ def benchmark_cpu(hits):
 
     pool = ThreadPoolExecutor(max_workers=CPU_WORKERS)
     cpu_started = time.perf_counter()
-    for seed, grid_x, grid_z in hits:
+    for seed, grid_x, grid_z, geometry_code in hits:
         wait_started = time.perf_counter()
         pending.acquire()
         waited = time.perf_counter() - wait_started
@@ -172,7 +174,8 @@ def benchmark_cpu(hits):
             peak_pending = max(peak_pending, pending_count)
         try:
             future = pool.submit(
-                benchmark_verify_and_flood, seed, grid_x, grid_z)
+                benchmark_verify_and_flood,
+                seed, grid_x, grid_z, geometry_code)
             future.add_done_callback(on_done)
         except BaseException:
             with state_lock:

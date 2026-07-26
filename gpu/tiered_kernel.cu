@@ -1,5 +1,5 @@
 /*
- * tiered_kernel.cu — Hex-grid O6+O15 mushroom prefilter.
+ * tiered_kernel.cu — Hex-grid O6+O15 mushroom triple prefilter.
  *
  * Default path:
  *   - Each warp keeps both 256-byte permutation tables in packed registers.
@@ -8,6 +8,8 @@
  *     fourteen conflict-prone shared-memory loads per Perlin evaluation.
  *   - One cell is evaluated per thread wave to keep register pressure bounded.
  *   - Detection uses one 32-bit mask per row instead of a float shared grid.
+ *     A hit is the center plus two true hex neighbors; the two directions
+ *     and coarse-row parity are packed into the returned geometry code.
  *
  * Build with -DTIERED_USE_WARP_PERM=0 for the shared-memory reference path.
  * If ptxas reports spills, benchmark TIERED_MIN_BLOCKS_PER_SM=3 before raising
@@ -219,9 +221,9 @@ __device__ __forceinline__ float perlin_shared(
 #endif
 
 __device__ __forceinline__ void emit_warp_hits(
-    uint32_t candidate_mask, int lane, int hit_x, int hit_z,
+    uint32_t candidate_mask, int lane, int hit_x, int hit_z, int hit_code,
     int *seed_hit_count, int hit_capacity, int *hit_count,
-    int seed, int3 *hits)
+    int seed, int4 *hits)
 {
     if (candidate_mask == 0u) return;
 
@@ -245,7 +247,7 @@ __device__ __forceinline__ void emit_warp_hits(
     if ((candidate_mask & lane_bit) && rank < accepted) {
         int output_index = output_base + rank;
         if (output_index < hit_capacity)
-            hits[output_index] = make_int3(seed, hit_x, hit_z);
+            hits[output_index] = make_int4(seed, hit_x, hit_z, hit_code);
     }
 }
 
@@ -254,7 +256,7 @@ __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_2x,
     int hit_capacity, int *hit_count,
-    int3 *hits)
+    int4 *hits)
 {
     int seed = blockIdx.x;
     int tid = threadIdx.x;
@@ -391,23 +393,39 @@ __global__ void tiered_scan(
                 }
 
                 uint32_t row = valid ? row_masks[cell_z] : 0u;
-                uint32_t neighbors = (row << 1) | (row >> 1);
+                uint32_t bit = 1u << cell_x;
+                uint32_t neighbor_mask = 0u;
+                neighbor_mask |= ((row << 1) & bit) ? (1u << 0) : 0u;
+                neighbor_mask |= ((row >> 1) & bit) ? (1u << 1) : 0u;
+                int row_parity = cell_z & 1;
                 if (valid && cell_z > 0) {
                     uint32_t above = row_masks[cell_z - 1];
-                    neighbors |= above | (above >> 1);
+                    neighbor_mask |= (above & bit) ? (1u << 2) : 0u;
+                    uint32_t above_diagonal = row_parity
+                        ? (above >> 1) : (above << 1);
+                    neighbor_mask |= (above_diagonal & bit) ? (1u << 3) : 0u;
                 }
                 if (valid && cell_z + 1 < tile_height) {
                     uint32_t below = row_masks[cell_z + 1];
-                    neighbors |= below | (below << 1);
+                    neighbor_mask |= (below & bit) ? (1u << 4) : 0u;
+                    uint32_t below_diagonal = row_parity
+                        ? (below >> 1) : (below << 1);
+                    neighbor_mask |= (below_diagonal & bit) ? (1u << 5) : 0u;
                 }
 
-                uint32_t bit = 1u << cell_x;
-                bool candidate = valid && (row & bit) && (neighbors & bit);
+                bool candidate = valid && (row & bit)
+                    && (__popc(neighbor_mask) >= 2);
                 uint32_t candidate_mask = __ballot_sync(FULL_MASK, candidate);
+                uint32_t first_neighbor = neighbor_mask & (~neighbor_mask + 1u);
+                uint32_t remaining_neighbors = neighbor_mask ^ first_neighbor;
+                uint32_t second_neighbor = remaining_neighbors
+                    & (~remaining_neighbors + 1u);
+                int hit_code = (int)(first_neighbor | second_neighbor)
+                    | ((cell_z & 1) << 6);
                 int hit_x = (int)(tile_origin_x + cell_x * spacing_x
                     + (cell_z & 1) * half_spacing_x);
                 int hit_z = (int)(tile_origin_z + cell_z * spacing_z);
-                emit_warp_hits(candidate_mask, lane, hit_x, hit_z,
+                emit_warp_hits(candidate_mask, lane, hit_x, hit_z, hit_code,
                                &seed_hit_count, hit_capacity, hit_count,
                                seed, hits);
             }

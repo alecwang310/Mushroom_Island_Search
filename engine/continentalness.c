@@ -343,6 +343,46 @@ void cont_engine_init(ContEngine *e, uint64_t seed, int large_biomes) {
         xlo, xhi, large_biomes, 2/*NP_CONTINENTALNESS*/, -1, idx);
 }
 
+void cont_engine_init_6oct(ContEngine *e, uint64_t seed, int large_biomes) {
+    static const double amplitudes[] = {1, 1, 2, 2, 2, 1, 1, 1, 1};
+    const int omin = large_biomes ? -11 : -9;
+    const uint64_t cont_md5_lo = large_biomes
+        ? 0x9a3f51a113fce8dcULL : 0x83886c9d0ae3a662ULL;
+    const uint64_t cont_md5_hi = large_biomes
+        ? 0xee2dbd157e5dcdadULL : 0xafa638a61b42e8adULL;
+
+    memset(e, 0, sizeof(*e));
+    e->freq_ratio = 337.0 / 331.0;
+
+    Xoroshiro root;
+    xSetSeed(&root, seed);
+    uint64_t xlo = xNextLong(&root);
+    uint64_t xhi = xNextLong(&root);
+
+    Xoroshiro cont_rng = {
+        xlo ^ cont_md5_lo,
+        xhi ^ cont_md5_hi,
+    };
+    uint64_t axlo = xNextLong(&cont_rng);
+    uint64_t axhi = xNextLong(&cont_rng);
+    uint64_t bxlo = xNextLong(&cont_rng);
+    uint64_t bxhi = xNextLong(&cont_rng);
+
+    e->shift_octA_start = 0;
+    e->shift_octA_count = 0;
+    e->shift_octB_start = 0;
+    e->shift_octB_count = 0;
+    e->shift_dbl_amp = 0.0;
+
+    e->cont_octA_start = 0;
+    e->cont_octA_count = octave_init(
+        e, 0, axlo, axhi, amplitudes, omin, 9, 3);
+    e->cont_octB_start = e->cont_octA_count;
+    e->cont_octB_count = octave_init(
+        e, e->cont_octB_start, bxlo, bxhi, amplitudes, omin, 9, 3);
+    e->cont_dbl_amp = amp_ini[9];
+}
+
 /* Sample one DoublePerlinNoise at (x, y, z) */
 static inline double sample_double_perlin(
     const ContEngine *e,
@@ -682,15 +722,7 @@ int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells) {
    before the search. Much faster because perlin only runs 6 octaves. */
 int64_t cont_flood_fill_6oct(uint64_t seed, int cx, int cz, int max_cells) {
     ContEngine e;
-    cont_engine_init(&e, seed, 0);
-
-    /* Trim to only 6 essential octaves by adjusting range counts.
-       This skips octave loops entirely — 6 octaves vs 24 (4x faster).
-       cont_flood_fill (full 24-octave) is UNCHANGED. */
-    e.shift_octA_count = 0;
-    e.shift_octB_count = 0;
-    e.cont_octA_count = 3;   /* only 6,7,8 */
-    e.cont_octB_count = 3;   /* only 15,16,17 */
+    cont_engine_init_6oct(&e, seed, 0);
 
     if (cont_sample(&e, cx, cz) >= -1.05)
         return 0;

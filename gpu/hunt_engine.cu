@@ -23,7 +23,7 @@ extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_2x,
     int hit_capacity, int *hit_count,
-    int3 *hits);
+    int4 *hits);
 
 extern "C" __global__ void prefilter_seeds(
     uint64_t start_seed, int n,
@@ -34,8 +34,8 @@ struct TierBuffers {
     ContTieredParams *h_params;
     ContTieredParams *d_params;
     int *d_hit_count;
-    int3 *d_hits;
-    int3 *h_hits;
+    int4 *d_hits;
+    int4 *h_hits;
     int seed_cap;
     int hit_cap;
 } g_tier = {0};
@@ -60,8 +60,8 @@ static void ensure_hit_capacity(int capacity) {
     if (g_tier.d_hits) cudaFree(g_tier.d_hits);
     if (g_tier.h_hits) free(g_tier.h_hits);
 
-    cudaMalloc(&g_tier.d_hits, (size_t)capacity * sizeof(int3));
-    g_tier.h_hits = (int3*)malloc((size_t)capacity * sizeof(int3));
+    cudaMalloc(&g_tier.d_hits, (size_t)capacity * sizeof(int4));
+    g_tier.h_hits = (int4*)malloc((size_t)capacity * sizeof(int4));
     g_tier.hit_cap = capacity;
 }
 
@@ -125,13 +125,14 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         return 0;
 
     cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
-               (size_t)total * sizeof(int3), cudaMemcpyDeviceToHost);
+               (size_t)total * sizeof(int4), cudaMemcpyDeviceToHost);
 
     for (int i = 0; i < total; i++) {
         int seed_idx = g_tier.h_hits[i].x;
-        hit_results[i * 3] = (int64_t)seeds[seed_idx];
-        hit_results[i * 3 + 1] = (int64_t)g_tier.h_hits[i].y;
-        hit_results[i * 3 + 2] = (int64_t)g_tier.h_hits[i].z;
+        hit_results[i * 4] = (int64_t)seeds[seed_idx];
+        hit_results[i * 4 + 1] = (int64_t)g_tier.h_hits[i].y;
+        hit_results[i * 4 + 2] = (int64_t)g_tier.h_hits[i].z;
+        hit_results[i * 4 + 3] = (int64_t)g_tier.h_hits[i].w;
     }
     return total;
 }
@@ -178,7 +179,7 @@ extern "C" __declspec(dllexport) int hunt_batch_from_file(
     if (!output) { free(seeds); return -1; }
 
     int hit_capacity = INITIAL_HIT_CAP;
-    int64_t *chunk_hits = (int64_t*)malloc((size_t)hit_capacity * 3 * sizeof(int64_t));
+    int64_t *chunk_hits = (int64_t*)malloc((size_t)hit_capacity * 4 * sizeof(int64_t));
     int total = 0;
     for (int offset = 0; offset < n; offset += TIER_CHUNK) {
         int size = (n - offset < TIER_CHUNK) ? (n - offset) : TIER_CHUNK;
@@ -187,12 +188,12 @@ extern "C" __declspec(dllexport) int hunt_batch_from_file(
         if (hit_count < 0) {
             hit_capacity = -hit_count;
             chunk_hits = (int64_t*)realloc(
-                chunk_hits, (size_t)hit_capacity * 3 * sizeof(int64_t));
+                chunk_hits, (size_t)hit_capacity * 4 * sizeof(int64_t));
             hit_count = tiered_chunk(seeds + offset, size, step_2x, G,
                                      hit_capacity, chunk_hits);
         }
         if (hit_count < 0) break;
-        fwrite(chunk_hits, 3 * sizeof(int64_t), hit_count, output);
+        fwrite(chunk_hits, 4 * sizeof(int64_t), hit_count, output);
         total += hit_count;
     }
 

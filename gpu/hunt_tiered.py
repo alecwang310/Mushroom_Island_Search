@@ -1,16 +1,18 @@
 """hunt_tiered.py — Hex grid O6+O15 GPU prefilter + CPU verify + flood fill.
 
 GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
-     threshold -1.0, 6-neighbor adjacent pair detection. ~20K seeds/s.
+     threshold -1.0, 3-connected hit detection. ~20K seeds/s.
      Optional pre-filter: GPU LUT-variance filter generates a consecutive
      seed range on-device and returns only compacted survivors.
 
-CPU: 5-point hex verification with all cont octaves (6-23, no shift).
-     Any hex point < -1.0 triggers full 24-octave cont_flood_fill.
-     Logs >=3M block^2 islands to islands_3m.jsonl.
+CPU: all unique 1x-grid neighbors of the three coarse hit points are
+     checked with all cont octaves (6-23, no shift). Two points < -1.0
+     pass verification and trigger full 24-octave cont_flood_fill.
+     Logs >=4M block^2 islands to islands_4m.jsonl.
 """
 import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -42,6 +44,10 @@ _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
 INITIAL_HIT_CAP = 65_536
+VERIFY_THRESHOLD = -1.00
+_SQRT3_OVER_2 = 0.8660254037844386
+_DEFAULT_STEP_1X = 140
+_DEFAULT_STEP_2X = 280
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -57,7 +63,7 @@ PREF_SURVIVOR_CAP = 2_000_000
 def hunt_batch_tiered(start_seed, n, step_2x, G):
     hit_capacity = INITIAL_HIT_CAP
     while True:
-        results = (ctypes.c_int64 * (hit_capacity * 3))()
+        results = (ctypes.c_int64 * (hit_capacity * 4))()
         hc = _hunt.hunt_batch_tiered(
             ctypes.c_uint64(start_seed), ctypes.c_int(n),
             ctypes.c_int(step_2x), ctypes.c_int(G), ctypes.c_int(hit_capacity),
@@ -65,7 +71,8 @@ def hunt_batch_tiered(start_seed, n, step_2x, G):
         if hc >= 0:
             break
         hit_capacity = -hc
-    return [(int(results[i*3]), int(results[i*3+1]), int(results[i*3+2]))
+    return [(int(results[i*4]), int(results[i*4+1]),
+             int(results[i*4+2]), int(results[i*4+3]))
             for i in range(hc)]
 
 
@@ -86,7 +93,7 @@ def scan_survivors_stream(seeds, n, step_2x, G, submit_verification, s1x, s2x):
 
     total_hits = 0
     hit_capacity = INITIAL_HIT_CAP
-    results = (ctypes.c_int64 * (hit_capacity * 3))()
+    results = (ctypes.c_int64 * (hit_capacity * 4))()
     for off in range(0, n, CHUNK):
         sz = min(CHUNK, n - off)
         ptr = ctypes.cast(
@@ -96,20 +103,84 @@ def scan_survivors_stream(seeds, n, step_2x, G, submit_verification, s1x, s2x):
             ptr, sz, step_2x, G, hit_capacity, results)
         if hc < 0:
             hit_capacity = -hc
-            results = (ctypes.c_int64 * (hit_capacity * 3))()
+            results = (ctypes.c_int64 * (hit_capacity * 4))()
             hc = _hunt.tiered_scan_mem(
                 ptr, sz, step_2x, G, hit_capacity, results)
         if hc < 0:
             raise RuntimeError(f'tiered scan overflow retry failed: {-hc} hits')
         total_hits += hc
         for i in range(hc):
-            seed, gx, gz = int(results[i*3]), int(results[i*3+1]), int(results[i*3+2])
-            if not submit_verification(seed, gx, gz, s1x, s2x):
+            hit_offset = i * 4
+            seed = int(results[hit_offset])
+            gx = int(results[hit_offset + 1])
+            gz = int(results[hit_offset + 2])
+            geometry_code = int(results[hit_offset + 3])
+            if not submit_verification(
+                    seed, gx, gz, geometry_code, s1x, s2x):
                 return total_hits
     return total_hits
 
 
-def verify_pair_cpu(seed, gx, gz, step_1x, step_2x):
+def _fine_neighbor_offsets(step_1x):
+    diagonal_x = int(0.5 * step_1x)
+    diagonal_z = int(_SQRT3_OVER_2 * step_1x)
+    return (
+        (-step_1x, 0),
+        (step_1x, 0),
+        (-diagonal_x, -diagonal_z),
+        (diagonal_x, -diagonal_z),
+        (-diagonal_x, diagonal_z),
+        (diagonal_x, diagonal_z),
+    )
+
+
+def _coarse_neighbor_offsets(step_2x, row_parity):
+    stagger_x = int(0.5 * step_2x)
+    row_z = int(_SQRT3_OVER_2 * step_2x)
+    signed_stagger_x = stagger_x if row_parity == 0 else -stagger_x
+    return (
+        (-step_2x, 0),
+        (step_2x, 0),
+        (signed_stagger_x, -row_z),
+        (-signed_stagger_x, -row_z),
+        (signed_stagger_x, row_z),
+        (-signed_stagger_x, row_z),
+    )
+
+
+@lru_cache(maxsize=None)
+def _build_triple_verify_lookup(step_1x, step_2x):
+    fine_offsets = _fine_neighbor_offsets(step_1x)
+    lookup = {}
+    for row_parity in (0, 1):
+        coarse_offsets = ((0, 0),) + _coarse_neighbor_offsets(
+            step_2x, row_parity)
+        for pair_mask in range(64):
+            if pair_mask.bit_count() != 2:
+                continue
+            points = [coarse_offsets[0]]
+            points.extend(
+                coarse_offsets[direction + 1]
+                for direction in range(6)
+                if pair_mask & (1 << direction))
+
+            offsets = []
+            seen = set()
+            for point_x, point_z in points:
+                for offset_x, offset_z in fine_offsets:
+                    offset = (point_x + offset_x, point_z + offset_z)
+                    if offset not in seen:
+                        seen.add(offset)
+                        offsets.append(offset)
+            lookup[(row_parity, pair_mask)] = tuple(offsets)
+    return lookup
+
+
+TRIPLE_VERIFY_LOOKUP = _build_triple_verify_lookup(
+    _DEFAULT_STEP_1X, _DEFAULT_STEP_2X)
+
+
+def verify_triple_cpu(seed, gx, gz, geometry_code, step_1x, step_2x):
     import struct as _struct
     buf = (ctypes.c_ubyte * 8192)()
     _eng._lib.cont_engine_init(buf, seed & 0xFFFFFFFFFFFFFFFF, 0)
@@ -117,20 +188,19 @@ def verify_pair_cpu(seed, gx, gz, step_1x, step_2x):
     for j in range(6):
         _struct.pack_into('d', buf, off_amp + j*8, 0.0)
 
-    def s(x, z):
-        return _eng._lib.cont_sample(buf, x, z)
-
-    S1, T, rt32 = float(step_1x), -1.00, 0.8660254037844386
-
-    pv = [s(gx, int(gz+S1)), s(int(gx+S1*rt32), int(gz+0.5*S1)),
-          s(int(gx+S1*rt32), int(gz+1.5*S1)), s(int(gx-S1*rt32), int(gz+1.5*S1)),
-          s(int(gx-S1*rt32), int(gz+0.5*S1))]
-    if sum(1 for v in pv if v < T) >= 2: return True
-
-    ph = [s(int(gx+S1), gz), s(int(gx+0.5*S1), int(gz-S1*rt32)),
-          s(int(gx+1.5*S1), int(gz-S1*rt32)), s(int(gx+1.5*S1), int(gz+S1*rt32)),
-          s(int(gx+0.5*S1), int(gz+S1*rt32))]
-    if sum(1 for v in ph if v < T) >= 2: return True
+    row_parity = (geometry_code >> 6) & 1
+    pair_mask = geometry_code & 0x3F
+    if (step_1x, step_2x) == (_DEFAULT_STEP_1X, _DEFAULT_STEP_2X):
+        offsets = TRIPLE_VERIFY_LOOKUP.get((row_parity, pair_mask), ())
+    else:
+        offsets = _build_triple_verify_lookup(step_1x, step_2x).get(
+            (row_parity, pair_mask), ())
+    passed = 0
+    for offset_x, offset_z in offsets:
+        if _eng._lib.cont_sample(buf, gx + offset_x, gz + offset_z) < VERIFY_THRESHOLD:
+            passed += 1
+            if passed >= 2:
+                return True
     return False
 
 
@@ -148,9 +218,9 @@ def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
     return {'seed': seed, 'area': area, 'cx': cx, 'cz': cz}
 
 
-def verify_and_flood(seed, gx, gz, step_1x, step_2x):
+def verify_and_flood(seed, gx, gz, geometry_code, step_1x, step_2x):
     t0 = time.perf_counter()
-    ok = verify_pair_cpu(seed, gx, gz, step_1x, step_2x)
+    ok = verify_triple_cpu(seed, gx, gz, geometry_code, step_1x, step_2x)
     t_vfy = time.perf_counter() - t0
     if not ok: return (False, None, t_vfy, 0)
     t0 = time.perf_counter()
@@ -176,7 +246,7 @@ if __name__ == '__main__':
               f'(p99.15-p99.25, {PREF_BATCH//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print(f'GPU: hex grid + adjacent pair. CPU: verify + flood fill.')
+    print(f'GPU: hex grid + connected triple. CPU: verify + flood fill.')
     print()
 
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
@@ -219,14 +289,15 @@ if __name__ == '__main__':
         finally:
             pending.release()
 
-    def submit_verification(seed, gx, gz, s1x, s2x):
+    def submit_verification(seed, gx, gz, geometry_code, s1x, s2x):
         while running:
             if pending.acquire(timeout=0.5):
                 break
         else:
             return False
         try:
-            future = pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x)
+            future = pool.submit(
+                verify_and_flood, seed, gx, gz, geometry_code, s1x, s2x)
             future.add_done_callback(on_done_releasing)
         except BaseException:
             pending.release()
@@ -280,8 +351,9 @@ if __name__ == '__main__':
                     scanned += batch
                     tiered_scanned += batch
                     hits_gpu += len(hits)
-                for seed, gx, gz in hits:
-                    submit_verification(seed, gx, gz, step_1x, step_2x)
+                for seed, gx, gz, geometry_code in hits:
+                    submit_verification(
+                        seed, gx, gz, geometry_code, step_1x, step_2x)
 
     gpu_t = threading.Thread(target=gpu_thread, daemon=True)
     gpu_t.start()
@@ -307,6 +379,6 @@ if __name__ == '__main__':
 
     elapsed = time.perf_counter() - t0
     print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
-    print(f'{hits_gpu} GPU pairs -> {hits_verified} verified -> {hits_big} big (>= {TARGET:,})')
+    print(f'{hits_gpu} GPU triples -> {hits_verified} verified -> {hits_big} big (>= {TARGET:,})')
     if best:
         print(f'BEST: seed {best["seed"]}, {best["area"]:,} at ({best["cx"]},{best["cz"]})')

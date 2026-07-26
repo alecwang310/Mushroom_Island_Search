@@ -71,6 +71,12 @@ typedef struct {
 void cont_engine_init(ContEngine *e, uint64_t seed, int large_biomes);
 
 /**
+ * Initialize only the six octaves used by cont_flood_fill_6oct:
+ * continentalness octaves 6, 7, 8, 15, 16, and 17.
+ */
+void cont_engine_init_6oct(ContEngine *e, uint64_t seed, int large_biomes);
+
+/**
  * Sample continentalness at a single block coordinate.
  * Returns value in ~[-2, 2]; mushroom fields when in (-1.2, -1.05).
  * Thread-safe (read-only after init). ~30ns per call.
