@@ -28,6 +28,7 @@ STEP_2X = 280
 GRID_SIZE = 512
 CPU_WORKERS = int(os.environ.get('HUNT_CPU_WORKERS', '24'))
 MAX_PENDING = CPU_WORKERS * 2
+CPU_HIT_LIMIT = int(os.environ.get('HUNT_CPU_HIT_LIMIT', '0'))
 
 
 def scan_survivors_gpu(seeds, seed_count):
@@ -165,6 +166,14 @@ def benchmark_cpu(hits):
     }
 
 
+def sample_hits(hits, limit):
+    if limit <= 0 or len(hits) <= limit:
+        return hits
+    stride = len(hits) / limit
+    return [hits[min(int(index * stride), len(hits) - 1)]
+            for index in range(limit)]
+
+
 def main():
     start_seed = random.getrandbits(64)
     survivors = (ctypes.c_uint64 * PREF_SURVIVOR_CAP)()
@@ -183,11 +192,12 @@ def main():
 
     hits, kernel_seconds, scan_seconds = scan_survivors_gpu(
         survivors, survivor_count)
-    cpu = benchmark_cpu(hits)
+    cpu_hits = sample_hits(hits, CPU_HIT_LIMIT)
+    cpu = benchmark_cpu(cpu_hits)
 
     survivor_ratio = survivor_count / PREF_BATCH
     gpu_hit_rate = len(hits) / scan_seconds if scan_seconds else 0.0
-    cpu_rate = len(hits) / cpu['wall_seconds'] if cpu['wall_seconds'] else 0.0
+    cpu_rate = len(cpu_hits) / cpu['wall_seconds'] if cpu['wall_seconds'] else 0.0
     if cpu_rate < gpu_hit_rate:
         bottleneck = 'CPU verification/flood stage'
     else:
@@ -205,7 +215,7 @@ def main():
         f'GPU kernel/transfer calls: {kernel_seconds:.3f}s '
         f'({survivor_count / kernel_seconds:,.0f} survivors/s)')
     print(
-        f'CPU workers: {CPU_WORKERS}; {len(hits):,} hits in '
+        f'CPU workers: {CPU_WORKERS}; {len(cpu_hits):,}/{len(hits):,} sampled hits in '
         f'{cpu["wall_seconds"]:.3f}s ({cpu_rate:,.0f} hits/s)')
     print(
         f'CPU results: {cpu["verified"]:,} verified, '
