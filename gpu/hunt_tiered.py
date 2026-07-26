@@ -143,19 +143,22 @@ def _coarse_neighbor_offsets(step_2x, row_parity):
 @lru_cache(maxsize=None)
 def _hex_disk_offsets(step, radius_steps, row_parity, ring_only=False):
     half_step = int(0.5 * step)
-    signed_half_step = half_step if row_parity == 0 else -half_step
+    row_step = int(_SQRT3_OVER_2 * step)
+    center_stagger = half_step if row_parity else 0
     offsets = []
     for axial_x in range(-radius_steps, radius_steps + 1):
-        for axial_z in range(-radius_steps, radius_steps + 1):
+        for row_delta in range(-radius_steps, radius_steps + 1):
             distance = max(
-                abs(axial_x), abs(axial_z), abs(axial_x + axial_z))
+                abs(axial_x), abs(row_delta), abs(axial_x + row_delta))
             if distance > radius_steps:
                 continue
             if ring_only and distance != radius_steps:
                 continue
+            target_parity = row_parity ^ (row_delta & 1)
+            target_stagger = half_step if target_parity else 0
             offsets.append((
-                axial_x * step + axial_z * signed_half_step,
-                int(axial_z * _SQRT3_OVER_2 * step),
+                axial_x * step + target_stagger - center_stagger,
+                row_delta * row_step,
             ))
     return tuple(offsets)
 

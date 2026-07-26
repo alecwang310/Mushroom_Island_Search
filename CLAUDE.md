@@ -34,6 +34,7 @@ gpu/
   variance_lut.h               #    Precomputed analytic LUT + MD5/amplitude constants
   hunt_engine.cu               #    DLL host: compact init/upload/launch/download
   hunt_tiered.py               # ★ Current hunt script: GPU thread + CPU verify + flood
+  benchmark_historical_hits.py #    Historical triple-filter retention benchmark
   gpu_monitor.py               #    nvidia-smi polling script
 
 continentalness_pipeline.py    # Pure-Python reference implementation (verified vs cubiomes)
@@ -126,3 +127,17 @@ Logs islands ≥ 4M to `islands_4m.jsonl`. Ctrl+C to stop.
 
 Pre-filter mode is controlled by `PREFT_ENABLED`, `PREFT_LO`, and `PREFT_HI`
 in `gpu/hunt_tiered.py`.
+
+## Persistent Operations Handoff
+
+Read `PROJECT_RUNBOOK.md` before using the Windows CUDA host. It contains the
+SSH/VPN procedure, safe branch synchronization, exact Visual Studio/CUDA build
+commands, benchmark commands, pipeline interpretation, and historical-filter
+test protocol.
+
+Current handoff state on 2026-07-26: branch `gpt` and `origin/gpt` are at
+`442b300`; `main` / `origin/main` is at `b7fcd38` (`refine prefilter`) and
+deleted `islands_3m.jsonl`, which is available at `2b1c2f2:islands_3m.jsonl`.
+The current 0.5x estimator is not trusted: a
+4,096-hit benchmark passed 3,419 hits to six-octave flood but produced only one
+actual result >=4M. Diagnose this before treating estimator passes as evidence.
