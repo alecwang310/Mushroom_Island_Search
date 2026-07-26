@@ -82,9 +82,9 @@ def prefilter_gpu(seeds, lo, hi, out_file):
 
 CHUNK = 8192
 
-def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
+def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x, lock, live_gpu, live_tiered):
     """Read survivors from disk, scan in 8192-seed chunks, submit hits
-    incrementally to the thread pool. Islands start appearing immediately."""
+    incrementally. Updates live counters so status line shows progress."""
     with open(seed_file, 'rb') as f:
         data = f.read()
     n = len(data) // 8
@@ -107,6 +107,9 @@ def scan_survivors_stream(seed_file, step_2x, G, pool, on_done, s1x, s2x):
             pool.submit(verify_and_flood, seed, gx, gz, s1x, s2x).add_done_callback(on_done)
         total_hits += hc
         total_seeds += sz
+        with lock:
+            live_gpu[0] += hc
+            live_tiered[0] += sz
     del all_seeds
     return total_hits, total_seeds
 
@@ -167,7 +170,7 @@ if __name__ == '__main__':
     TARGET = 4_000_000
     step_1x, step_2x = 140, 280
     G, batch = 512, 8192
-    FF_WORKERS = 16
+    FF_WORKERS = 24
 
     print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
     print(f'step_1x={step_1x}  step_2x={step_2x}  G={G}  batch={batch}')
@@ -183,6 +186,7 @@ if __name__ == '__main__':
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
     best = None
     scanned, tiered_scanned, hits_gpu, hits_verified, hits_ok, hits_big = 0, 0, 0, 0, 0, 0
+    live_gpu = [0]; live_tiered = [0]  # updated live by scan_survivors_stream
     t_gpu, t_vfy, t_ff = 0.0, 0.0, 0.0
     seen = set()
     lock = threading.Lock()
@@ -214,7 +218,7 @@ if __name__ == '__main__':
                     json.dump(entry, f)
 
     def gpu_thread():
-        global scanned, tiered_scanned, hits_gpu, t_gpu
+        global scanned, hits_gpu, t_gpu, tiered_scanned, live_gpu, live_tiered
         sur_file = 'seeds_pass.bin'
         use_prefilter = PREFT_ENABLED
         batch_num = 0
@@ -231,7 +235,7 @@ if __name__ == '__main__':
 
                 # Phase 2: prefilter on GPU
                 n_pass = prefilter_gpu(arr, PREFT_LO, PREFT_HI, sur_file)
-                del arr  # free 800MB before scan starts
+                del arr  # free 800MB before tiered scan
                 t_pref = time.perf_counter()
                 with lock: scanned += PREF_BATCH
 
@@ -241,23 +245,24 @@ if __name__ == '__main__':
                     continue
 
                 # Phase 3: tiered scan (streaming — hits submitted as chunks complete)
-                hc, ts = scan_survivors_stream(sur_file, step_2x, G, pool, on_done, step_1x, step_2x)
+                hc, ts = scan_survivors_stream(sur_file, step_2x, G, pool, on_done,
+                                                 step_1x, step_2x, lock, live_gpu, live_tiered)
                 t_end = time.perf_counter()
                 with lock:
                     hits_gpu += hc
-                    tiered_scanned += n_pass
 
                 t_total = t_end - t1
                 t_scan_time = t_end - t_pref
                 print(f'\n  batch {batch_num}: prefilter {PREF_BATCH//1_000_000}M -> {n_pass:,} survivors '
                       f'({t_total:.1f}s: gen {t_gen1-t_gen0:.1f}s, pref {t_pref-t_gen1:.2f}s)')
-                print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
-                gc.collect()  # reclaim 800MB arr + survivors from this batch
+                print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits ({hc/n_pass*100:.1f}% hit rate)')
+                gc.collect()
             else:
                 hits = hunt_batch_tiered(start, batch, step_2x, G)
                 with lock:
                     scanned += batch
-                    tiered_scanned += batch
+                    live_tiered[0] += batch
+                    live_gpu[0] += len(hits)
                     hits_gpu += len(hits)
                 for seed, gx, gz in hits:
                     pool.submit(verify_and_flood, seed, gx, gz,
@@ -272,8 +277,9 @@ if __name__ == '__main__':
             if scanned > 0:
                 ba = best['area'] if best else 0
                 elapsed = time.perf_counter() - t0
-                print(f'\r  tiered: {tiered_scanned:,} seeds '
-                      f'({tiered_scanned/elapsed:,.0f}/s) | '
+                lg = live_gpu[0]; lt = live_tiered[0]
+                hr = lg / max(lt, 1) * 100
+                print(f'\r  tiered: {lt:,} seeds ({lt/elapsed:,.0f}/s, {hr:.0f}% hit) | '
                       f'{hits_verified} ok ({hits_ok} flood) | {hits_big} big | best {ba:,}  ',
                       end='', flush=True)
     except KeyboardInterrupt:
