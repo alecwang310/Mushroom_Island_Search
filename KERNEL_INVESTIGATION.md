@@ -4,24 +4,26 @@ Date: July 27, 2026
 
 ## Baseline
 
-The pre-change production path was `gpu/tiered_kernel.cu` with warp-register
-permutation tables, `G=512`, `step_2x=300`, threshold `-0.95`, and the O6+O15
-two-octave scan. Measurements use the RTX 5080 / `sm_120` Windows host with
-identical deterministic survivor seeds. The packed shared path is now the
-default after the correctness and throughput checks recorded below; pass
-`-DTIERED_USE_WARP_PERM=1` to build the warp-register control.
+The current production path is `gpu/tiered_kernel.cu` with ordinary packed
+shared permutation pairs, `G=512`, `step_2x=300`, threshold `-0.95`, and the
+O6+O15 two-octave scan. Measurements use the RTX 5080 / `sm_120` Windows host
+with one materialized deterministic survivor buffer so that every A/B build
+sees the same seeds and produces comparable work.
 
-The latest production warp path measured:
+The current fixed-buffer baseline measured:
 
-- Pure CUDA kernel: about `158.6k survivors/s` at `G=512`.
-- Full tiered DLL call: about `143.6k survivors/s`.
-- Live GPU/CPU pipeline: about `133k survivors/s` with the 2,048-task bounded
-  verification queue.
+- Pure CUDA kernel: `1.0888 s` for `262,144` survivors, or `240.8k/s`.
+- Hit output: exactly `36,175` sorted records across the compared builds.
+- Full DLL-call throughput: approximately `203-208k survivors/s`, including
+  compact CPU initialization and host timing overhead.
+
+The old warp-register result is retained below as a historical control, not as
+the production baseline. Build it with `-DTIERED_USE_WARP_PERM=1`.
 
 ## Perlin Prefix LUT Option
 
-Each `perlin_warp` evaluation has seven permutation-pair lookups. The first
-three are independent of z:
+Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair
+lookups. The first three are independent of z:
 
 1. `P[x]`.
 2. `P[P[x] + h2]`.
@@ -35,10 +37,9 @@ For a full 32x32 tile, `cell_z = warp + wave * 8`, so row parity is constant
 for all four waves of a warp. A register prefix LUT could therefore compute the
 first three pairs once per warp per tile and reuse them across four waves. The
 stored prefix would be four packed bytes per octave, or four additional
-32-bit registers for both octaves. This option is set aside until the table
-storage path is settled because it increases register pressure and does not
-address the fact that the current warp-shuffle implementation is slower than
-the shared-memory reference.
+32-bit registers for both octaves. This option remains set aside because it
+increases register pressure and the packed shared path is already faster than
+the warp-shuffle reference.
 
 Seed-wide LUT storage is not promising: each seed executes one block, x-cell
 coordinates change across tiles, and a full-seed table would consume much more
@@ -47,57 +48,45 @@ prefix work but would add shared loads for every cell.
 
 ## Warp Versus Shared A/B
 
-The existing shared-memory reference was compiled with
-`-DTIERED_USE_WARP_PERM=0`. The results were:
+The fixed-buffer comparison at `G=512` is:
 
-| Path | G=512 pure kernel | G=448 pure kernel |
+| Path | Pure CUDA kernel | ptxas registers/shared memory |
 | --- | ---: | ---: |
-| Warp-register permutation | `158.6k/s` | `206.7k/s` |
-| Shared permutation | `226.5k/s` | `296.0k/s` |
+| Ordinary packed shared | `240.8k/s` | `64` / `2,180 B` |
+| Shared byte-table control | `225.9k/s` | `64` / `2,180 B` |
+| Warp-register historical control | approximately `158k/s` | `64` / `132 B` |
 
-The shared path is consistently about `1.43x` faster. Both builds use 64
-registers/thread and have zero spills. The shared build uses about 2.2 KiB of
-shared memory for the two permutation tables; the warp build uses only the row
-masks and hit counter.
+The packed shared path is about `1.52x` faster than the warp-register control
+on the fixed buffer. All three builds are spill-free. The warp path performs
+three dynamic `shfl.sync.idx` operations plus `prmt.b32` for every permutation
+pair, with a long dependent chain across seven pairs. The shared path performs
+one indexed shared load per packed pair; conflicts expand the load wavefronts,
+but they do not saturate the shared pipeline.
 
-The shared Nsight Compute capture reports:
-
-- `53.31%` excessive shared-load wavefronts, averaging about `2.1-way`
-  conflicts.
-- Only `45.98%` shared-memory throughput and `0.82%` DRAM throughput.
-- `90.77%` of cycles with at least one eligible warp.
-- Much less sampled math-pipe pressure than the warp path.
-
-The warp capture reports `84.64%` eligible cycles and substantially more
-math-pipe, wait, and scoreboard stalls. The warp path performs three dynamic
-`shfl.sync.idx` operations plus `prmt.b32` for every permutation pair, with a
-long dependent chain across seven pairs. The shared path performs two indexed
-shared loads per pair; conflicts expand the load wavefronts but do not saturate
-the shared pipeline.
-
-At `G=512` and `158,638 survivors/s`, the warp path issues approximately:
+At `G=512` and the historical `158,638 survivors/s`, the warp path issued:
 
 - `344,064` warp-level shuffle instructions per seed.
 - `54.6 billion` warp shuffle instructions per second.
 - `18.2 billion` `PRMT` instructions per second.
 
-The shared path issues approximately `229,376` shared-load instructions per
-seed, or `52.0 billion` shared-load instructions per second at `226,542/s`,
-before conflict wavefront expansion. These are aggregate issue rates, not
-isolated instruction latencies, but they show that the shared path replaces a
-larger dependent instruction sequence with an LSU workload that still has
-substantial headroom.
+The current packed shared path issues approximately `229,376` shared-load
+instructions per seed, or `55.2 billion` shared-load instructions per second
+at `240,759/s`, before conflict wavefront expansion. These are aggregate issue
+rates, not isolated instruction latencies, but they show that the shared path
+replaces a larger dependent instruction sequence with an LSU workload that
+still has measurable headroom.
 
-The current 53% conflict percentage is therefore an optimization warning, not
+The current `50.9%` conflict percentage is therefore an optimization warning, not
 proof that shared memory is the bottleneck. The shared path can be faster while
 having more conflicts because it removes the shuffle/`PRMT` dependency chain and
 lets the compiler schedule ordinary loads more effectively.
 
-The two early A/B runs differed by 15 GPU hits at `G=512` (`36,156` versus
-`36,171`), so a direct hit-coordinate comparison was required before changing
-the default permutation representation.
+The fixed-buffer A/B builds all returned the same `36,175` sorted hit records,
+including seed, coordinates, and geometry code. This removes the earlier
+confounding effect from regenerating a nondeterministically compacted
+survivor prefix for each run.
 
-## Low-Complexity Shared-Memory Upgrade
+## Packed Shared-Memory Upgrade
 
 The shared byte-table path performs two shared loads for every adjacent
 permutation pair: one for `P[index]` and one for `P[index + 1]`. The values are
@@ -107,36 +96,59 @@ exact lookup sequence and reduces the shared-load instruction count by half;
 it does not skip any Perlin lookup or add register-resident state. The source
 keeps `TIERED_SHARED_PACKED_PAIRS=0` as an A/B switch for the original layout.
 
-This packed layout is the first optimization to benchmark because it avoids
-the register pressure and dependent shuffle/`PRMT` chain of the warp path while
-also reducing the shared-memory traffic. Its remaining risk is random-index
-bank conflicts, which should affect one load instruction rather than two.
-
-The Windows A/B result on `442ddff` at `G=512` was:
-
-| Path | Pure CUDA kernel | ptxas registers/shared memory |
-| --- | ---: | ---: |
-| Warp-register control | `158.4k survivors/s` | `64` / `132 B` |
-| Shared byte-table control | `226.1k survivors/s` | `64` / `2,180 B` |
-| Shared packed-pair path | `241.0k survivors/s` | `64` / `2,180 B` |
-
-All three builds reported zero register spills and zero local-memory spills.
-Using one materialized list of `262,144` survivors, the packed path and both
-controls each returned exactly `36,175` sorted hit records, including seed,
-coordinates, and geometry code. This resolves the earlier apparent A/B count
-difference: each benchmark had regenerated the survivor prefix, and the
-prefilter's atomic append order is nondeterministic.
-
-The transposed shared experiment was also compiled. It requires `65,668`
-bytes of static shared memory, while this RTX 5080 reports a `49,152`-byte
-per-block limit, so that design cannot launch on the target and is rejected.
+This packed layout avoids the register pressure and dependent shuffle/`PRMT`
+chain of the warp path while also reducing the shared-memory lookup count. The
+fixed-buffer comparison is recorded in the A/B section above. It is the
+production default; `TIERED_SHARED_PACKED_PAIRS=0` remains only as a control.
 
 Nsight Compute on the packed path still reports approximately `50.9%` shared
 load wavefront expansion at an average `2.0-way` conflict. This is expected
 for random permutation indices, but the packed table reduces the number of
 conflict-prone load instructions by half. The kernel remains spill-free and
 DRAM-light, so further work should target instruction scheduling or a smaller
-lookup representation rather than attempting a 64 KiB transposed table.
+lookup representation rather than assuming that removing all conflicts would
+double throughput.
+
+## Logical Memory Traffic Ceiling
+
+This is a calculation of the work performed by the current kernel, not a claim
+about DRAM bandwidth. The permutation tables and row masks reside in shared
+memory; Nsight reports negligible DRAM traffic. At `G=512`, one seed evaluates
+`512 x 512 = 262,144` cells. Each cell evaluates two octaves, and each Perlin
+call performs seven packed adjacent-pair lookups:
+
+| Operation | Bytes per seed | Rate at `240,759 survivors/s` |
+| --- | ---: | ---: |
+| Packed permutation reads (`14 x 4 B/cell`) | `14,680,064 B` (`14.0 MiB`) | `3.53 TB/s` |
+| Row-mask logical reads | `3,080,192 B` (`2.94 MiB`) | `0.742 TB/s` |
+| Row-mask writes | `32,768 B` (`32 KiB`) | `7.89 GB/s` |
+| Permutation-table initialization writes | `2,048 B` | `0.493 GB/s` |
+
+The dominant logical traffic is therefore about `4.28 TB/s` of shared-memory
+reads, overwhelmingly from the packed permutation table. Row-mask reads are
+mostly warp broadcasts, and the writes are negligible compared with the pair
+loads. These figures are logical request rates after multiplying by the
+measured seed throughput; they are not a usable DRAM-bandwidth target.
+
+The closest measured isolation of shared lookup cost is the packed-versus-byte
+control. Their kernel times were `1.088822 s` and `1.160628 s` for the same
+`262,144` survivors. Treating the removed second byte-table load as the only
+changed component assigns `0.071806 s`, or `6.595%` of packed runtime, to one
+packed lookup-load component. If eliminating conflicts could halve that entire
+component, the upper estimate is:
+
+```text
+240,759 / (1 - 0.5 x 0.06595) = approximately 248,969 survivors/s
+```
+
+That is only about `3.4%` above the current result. If the `50.9%` Nsight
+wavefront expansion is interpreted literally as `1.509x` serialized load work,
+the corresponding estimate is approximately `246,237 survivors/s`; the
+reasonable no-conflict range is therefore about `246-249K survivors/s`.
+Removing all measured shared-load time, an intentionally unrealistic upper
+bound, would be approximately `257.8K/s`. Without changing the arithmetic
+chain, reducing launch waste, or changing the algorithm, bank-conflict removal
+alone cannot approach a 2x speedup.
 
 ## CPU Register and Clock Assessment
 
@@ -156,16 +168,17 @@ not change the GPU lookup bottleneck. CPU-specific compilation such as `-O3`
 with the target's native ISA should be measured separately from algorithmic
 changes, while the CPU verification result must remain the FP32/FP64 reference.
 
-## Current Upgrade
+## Partial Transpose Experiment
 
-The first implementation experiment is a transposed shared permutation table.
-It stores entries as `perm[index * replicas + (lane & (replicas - 1))]`.
+The tested alternative is a transposed shared permutation table. It stores
+entries as `perm[index * replicas + (lane & (replicas - 1))]`.
 With `replicas=32`, every lane accesses its own bank and the two packed tables
 use 64 KiB. With `replicas=16`, the two tables use 32 KiB plus row-mask state
 and each lookup has at most approximately a 2-way lane alias; `replicas=8`
 uses 16 KiB and caps the alias at approximately 4-way. The implementation is
-compile-time disabled by default while the 16- and 8-replica variants are
-benchmarked against the ordinary packed path.
+compile-time disabled by default. A 32-replica full transpose would exceed the
+target's `49,152`-byte per-block limit, while the 16- and 8-replica variants
+fit and were benchmarked against the ordinary packed path.
 
 The fixed-survivor Windows benchmark used the same `262,144` survivor buffer
 for every build and returned the same `36,175` sorted hit records:

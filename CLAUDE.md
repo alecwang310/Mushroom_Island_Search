@@ -17,14 +17,13 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → log results ≥4M to islands_4m.jsonl
 ```
 
-The pre-change July 27, 2026 RTX 5080 warp-register baseline at `G=512`,
-`step_2x=300`, and threshold `-0.95` was ~158K survivors/s in the pure kernel
-and ~143K survivors/s including compact CPU initialization and transfers. The
-current packed shared default measures about 234-241K pure-kernel survivors/s
-under the same settings, with identical hit records on a fixed survivor list.
-With a 2,048-task verification queue, the live GPU/CPU pipeline previously
-sustained ~133K survivors/s on the deterministic test; remeasure the live
-pipeline after changing the GPU stage.
+The current packed shared default at `G=512`, `step_2x=300`, and threshold
+`-0.95` measures `240.8K survivors/s` in the pure kernel on a fixed survivor
+buffer, with identical hit records across the packed, byte-table, and warp
+controls. Full DLL-call throughput varies around `203-208K survivors/s` because
+CPU initialization and clock state are included. A 24-worker CPU estimate
+sample processed `55.2K hits/s`; no sampled estimate reached 4M, so positive
+flood-fill throughput still requires a separate benchmark.
 
 ## File Structure
 
@@ -97,7 +96,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
   from overlapping the next CUDA launch.
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
 - **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the connected low-cell component touching the three GPU points. It uses the full shifted continentalness field and the real mushroom threshold; only connected estimates ≥4M reach flood fill.
-- **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
+- **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS gate before the full flood
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
 - **Dedup**: by (seed, area) to avoid logging the same island from overlapping triples
 
@@ -106,15 +105,20 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 1. **Octaves 6+15 contribute 80%** of island signal at center. Always negative for islands.
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
-4. **Previous GPU bottleneck**: 14 serial shared-memory loads in the hash chain
-   produced 43-54% bank conflicts. Packing each adjacent pair cuts the shared
-   load count in half and is faster than the warp-register path despite about
-   50.9% remaining shared-load wavefront expansion.
-5. **CPU bottleneck**: flood fill (37-134ms). The triple filter and ≥2-of-all-neighbors verification threshold are intentionally stricter to reduce this workload while preserving clustered islands.
-6. The pre-change warp Nsight capture measured 86.3% SM issue utilization,
-   64 registers/thread, 65.8% achieved occupancy, 0.21% DRAM throughput, and
-   zero spills. The packed shared path is also spill-free; its remaining
-   limitation is random-index shared wavefront expansion rather than DRAM.
+4. **GPU memory behavior**: each cell performs 14 packed permutation-pair
+   loads, or `3,670,016` pair loads per `G=512` seed. At `240,759 survivors/s`
+   that is `3.53 TB/s` of logical pair reads and `4.28 TB/s` including row-mask
+   reads; these are shared-memory request rates, not DRAM traffic. Nsight still
+   reports about `50.9%` shared-load wavefront expansion. The measured
+   no-conflict ceiling is only about `246-249K survivors/s` because the kernel
+   is not purely shared-memory bound.
+5. **CPU behavior**: the estimate path is scalar FP64 Perlin work; flood fill
+   adds allocation, hash-table, branch, and cache pressure. More CPU registers
+   alone are unlikely to create a large speedup; higher clocks and cores help
+   until the memory system or allocator saturates.
+6. The packed shared build uses 64 registers/thread, 2,180 B shared memory,
+   zero spills, and negligible DRAM traffic. Its main remaining limiter is
+   random-index shared wavefront expansion plus the Perlin arithmetic chain.
 7. Keep `G` divisible by 32. Partial edge tiles execute a full 32x32 tile and use
    the slower validity/atomic path; for example, `G=449` measured ~181K/s while
    `G=448` measured ~207K/s.
@@ -155,9 +159,10 @@ SSH/VPN procedure, safe branch synchronization, exact Visual Studio/CUDA build
 commands, benchmark commands, pipeline interpretation, and historical-filter
 test protocol.
 
-Current handoff state on 2026-07-26: branch `gpt` and `origin/gpt` are at
-`442b300`; `main` / `origin/main` is at `b7fcd38` (`refine prefilter`) and
-deleted `islands_3m.jsonl`, which is available at `2b1c2f2:islands_3m.jsonl`.
-The current 0.5x estimator is not trusted: a
-4,096-hit benchmark passed 3,419 hits to six-octave flood but produced only one
-actual result >=4M. Diagnose this before treating estimator passes as evidence.
+Current handoff state on July 27, 2026: branch `gpt` uses the ordinary packed
+shared permutation default and the 16/8-replica transpose switches are retained
+only for architecture-specific A/B tests. `main` / `origin/main` remains at
+`b7fcd38` (`refine prefilter`); the historical `islands_3m.jsonl` file remains
+available at `2b1c2f2:islands_3m.jsonl` and must stay out of `gpt` commits.
+Only final full-flood results >=4M are valid evidence; estimator passes are
+screening signals, not confirmed islands.

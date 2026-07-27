@@ -8,7 +8,8 @@ Nsight profiling.
 ## Current State
 
 - Branch: `gpt`.
-- Profiling baseline: `ade3e2b`, `Add live tiered pipeline timing`.
+- Current kernel baseline: ordinary packed shared permutation pairs; see
+  `KERNEL_INVESTIGATION.md` for fixed-survivor A/B timings and memory ceilings.
 - Original branch: `main` / `origin/main` at `b7fcd38`, `refine prefilter`.
 - Historical dataset: `2b1c2f2:islands_3m.jsonl`; `b7fcd38` deleted it while refining the prefilter, so keep the materialized file out of `gpt` commits.
 - `continentalness_pipeline.py` is verified and is the correctness reference.
@@ -16,9 +17,10 @@ Nsight profiling.
   `-0.95`, 24 CPU workers, and prefilter band `[0.0432, 0.0434]`.
 - The 0.5x connected estimator and six-octave/full-flood gates are active; only
   final full-flood areas >=4M are valid results.
-- July 27 profiling found the kernel compute-bound and the live pipeline limited
-  by an undersized verification queue. A 2,048-task bounded queue restores GPU/CPU
-  overlap without returning to the old unbounded-Future memory growth.
+- GPU scanning and CPU verification run concurrently. The 2,048-task bounded
+  queue preserves overlap without returning to the old unbounded-Future memory
+  growth; current CPU pressure samples are estimate-only unless flood-positive
+  hits are deliberately supplied.
 
 ## Required Change Workflow
 
@@ -169,13 +171,12 @@ set HUNT_MAX_PENDING=2048
 python gpu\hunt_tiered.py
 ```
 
-The deterministic July 27 result for 262,144 survivors was:
-
-- 1.83 seconds in DLL scans across 32 chunks.
-- 0.13 seconds in Python decode/submission with a 2,048-task queue.
-- 0.01 seconds waiting for queue capacity, with no blocked submissions.
-- About 133K live survivors/s, versus 105K/s with the old 48-task queue.
-- About 157K survivors/s in the pure CUDA kernel and 142K/s for the full DLL call.
+The current fixed-survivor kernel baseline is `240.8K survivors/s` pure CUDA
+throughput at `G=512`, with `36,175` identical hit records from `262,144`
+survivors. The ordinary packed shared path is the production default. The
+24-worker CPU sample processed `4,096` hits at `55.2K hits/s`, with peak queue
+depth `48` and no blocked submissions; no estimate crossed 4M, so this does
+not measure positive flood-fill service.
 
 Run the continuous hunt with:
 
@@ -212,12 +213,17 @@ Nsight Compute 2025.4.1, and `sm_120`.
 
 - Nsight Systems: `tiered_scan` was 99.8% of GPU kernel time. H2D averaged
   about 0.26 ms/chunk and D2H was negligible.
-- Nsight Compute: 86.3% compute/SM throughput, 64 registers/thread, 65.8%
-  achieved occupancy, zero spills, 0.21% DRAM throughput, and 92.4% L1 hit rate.
-- Shared-memory conflicts are no longer material: 30 total conflicts in the
-  representative launch and no shared atomic conflicts.
-- The primary not-issued stall is math-pipe throttle. Source correlation points
-  to `perm_pair_warp` lane selection/shuffles and `grad_dot` sign/gradient work.
+- Nsight Compute on the packed shared path: 64 registers/thread, 2,180 B shared
+  memory, zero spills, negligible DRAM traffic, and approximately 50.9% shared
+  load wavefront expansion at an average 2-way conflict.
+- Shared conflicts remain measurable, but the packed path is faster than the
+  warp-register control. The logical traffic is about `3.53 TB/s` for packed
+  permutation reads and `4.28 TB/s` including row-mask reads. A fixed-buffer
+  estimate puts the practical no-conflict ceiling at roughly `246-249K
+  survivors/s`, not 2× current throughput.
+- The remaining work is the Perlin arithmetic chain plus random-index shared
+  lookup scheduling; the tested 16- and 8-replica transposes did not improve
+  throughput and remain compile-time A/B switches only.
 - Global coalescing is not a practical issue: source counters found only 18
   excessive sectors in the 1,024-seed line-mapped capture.
 - `G` must stay divisible by 32. Partial edge tiles still run all Perlin samples

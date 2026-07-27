@@ -1,11 +1,19 @@
-Benchmark seed range: 100,000,000 consecutive seeds
-Prefilter band: [0.04290, 0.04330]
-Prefilter: 1,877,721 survivors in 0.085s (1.878% pass, 98.122% rejected)
-GPU tiered: 1,877,721 survivors -> 79,517 hits in 13.263s (5,995 hits/s)
-GPU kernel/transfer calls: 13.238s (141,847 survivors/s)
-CPU workers: 24; 79,517/79,517 sampled hits in 46.106s (1,725 hits/s)
-CPU results: 7 area estimates passed, 7 6-octave floods, 5 full floods, 4 >=4M
-CPU service time: 1105.205s (estimate 1104.469s, 6-octave flood 0.186s, full flood 0.551s)
-CPU estimate: mean 1,678,726, max 4,345,369, gate 4,000,000
-CPU queue: peak 48/48 pending, 14,401 blocked submissions, 21.426s waiting
-Backlog bottleneck: CPU area-estimate/flood stage
+Tiered benchmark snapshot: July 27, 2026
+Production kernel: packed shared permutation pairs, G=512, step_2x=300,
+threshold=-0.95, 64 registers, 2,180 B shared memory, zero spills
+
+Fixed survivor A/B buffer: 262,144 survivors, 36,175 identical sorted hits
+Ordinary packed shared: 1.0888 s pure kernel, 240.8K survivors/s
+Shared byte-table control: 1.1606 s pure kernel, 225.9K survivors/s
+Warp-register control: approximately 158K survivors/s from the prior control run
+Partial transpose controls: 16 replicas 235.8K/s; 8 replicas 240.7K/s
+
+Logical shared traffic at 240,759 survivors/s: 3.53 TB/s packed permutation
+reads, 0.742 TB/s row-mask reads, 7.89 GB/s row-mask writes, and 0.493 GB/s
+permutation initialization writes. Practical no-conflict estimate: 246-249K/s;
+unrealistic removal of all measured shared-load time: approximately 257.8K/s.
+
+24-worker CPU sample: 4,096/36,171 sampled hits in 0.074 s (55.2K hits/s)
+CPU service: 1.192 s estimate-only; 0 flood-positive estimates; peak queue 48
+This fixed-buffer sample is GPU-stage limited; it does not measure positive
+flood-fill service or full-search throughput.
