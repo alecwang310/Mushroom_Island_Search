@@ -12,6 +12,9 @@
  *     and coarse-row parity are packed into the returned geometry code.
  *
  * Build with -DTIERED_USE_WARP_PERM=0 for the shared-memory reference path.
+ * The shared path stores each adjacent permutation pair in one 32-bit word,
+ * so each permutation-pair lookup needs one shared load instead of two.
+ * Build with -DTIERED_SHARED_PACKED_PAIRS=0 to restore the byte-table path.
  * If ptxas reports spills, benchmark TIERED_MIN_BLOCKS_PER_SM=3 before raising
  * register limits manually; the four permutation words are used every wave and
  * should remain resident rather than being spilled to local/L2 memory.
@@ -28,6 +31,14 @@
 
 #ifndef TIERED_USE_WARP_PERM
 #define TIERED_USE_WARP_PERM 1
+#endif
+
+#ifndef TIERED_USE_TRANSPOSED_SHARED_PERM
+#define TIERED_USE_TRANSPOSED_SHARED_PERM 0
+#endif
+
+#ifndef TIERED_SHARED_PACKED_PAIRS
+#define TIERED_SHARED_PACKED_PAIRS 1
 #endif
 
 #ifndef TIERED_MIN_BLOCKS_PER_SM
@@ -154,15 +165,29 @@ __device__ __forceinline__ float perlin_warp(
 #else
 
 __device__ __forceinline__ uint32_t perm_pair_shared(
-    const uint32_t *perm, uint32_t index)
+    const uint32_t *perm, int lane, uint32_t index)
 {
     uint32_t wrapped = index & 0xFFu;
+#if TIERED_USE_TRANSPOSED_SHARED_PERM
+#if TIERED_SHARED_PACKED_PAIRS
+    return perm[wrapped * 32u + (uint32_t)lane];
+#else
+    uint32_t first = perm[wrapped * 32u + (uint32_t)lane] & 0xFFu;
+    uint32_t second = perm[((wrapped + 1u) & 0xFFu) * 32u
+        + (uint32_t)lane] & 0xFFu;
+    return first | (second << 8);
+#endif
+#elif TIERED_SHARED_PACKED_PAIRS
+    return perm[wrapped];
+#else
     return (perm[wrapped] & 0xFFu)
         | ((perm[(wrapped + 1u) & 0xFFu] & 0xFFu) << 8);
+#endif
 }
 
 __device__ __forceinline__ float perlin_shared(
     const uint32_t *perm,
+    int lane,
     float offset_x, float offset_z,
     uint32_t cached_h2, float cached_d2, float cached_t2,
     float x, float z)
@@ -178,25 +203,25 @@ __device__ __forceinline__ float perlin_shared(
     float tx = fade(dx);
     float tz = fade(dz);
 
-    uint32_t pair = perm_pair_shared(perm, h1);
+    uint32_t pair = perm_pair_shared(perm, lane, h1);
     uint32_t va = (pair & 0xFFu) + cached_h2;
     uint32_t vb = (pair >> 8) + cached_h2;
-    pair = perm_pair_shared(perm, va);
+    pair = perm_pair_shared(perm, lane, va);
     uint32_t v2a = (pair & 0xFFu) + h3;
     uint32_t v2b = (pair >> 8) + h3;
-    pair = perm_pair_shared(perm, vb);
+    pair = perm_pair_shared(perm, lane, vb);
     uint32_t v3a = (pair & 0xFFu) + h3;
     uint32_t v3b = (pair >> 8) + h3;
-    pair = perm_pair_shared(perm, v2a);
+    pair = perm_pair_shared(perm, lane, v2a);
     uint32_t v4a = pair & 0xFFu;
     uint32_t v4b = pair >> 8;
-    pair = perm_pair_shared(perm, v2b);
+    pair = perm_pair_shared(perm, lane, v2b);
     uint32_t v5a = pair & 0xFFu;
     uint32_t v5b = pair >> 8;
-    pair = perm_pair_shared(perm, v3a);
+    pair = perm_pair_shared(perm, lane, v3a);
     uint32_t v6a = pair & 0xFFu;
     uint32_t v6b = pair >> 8;
-    pair = perm_pair_shared(perm, v3b);
+    pair = perm_pair_shared(perm, lane, v3b);
     uint32_t v7a = pair & 0xFFu;
     uint32_t v7b = pair >> 8;
 
@@ -289,12 +314,42 @@ __global__ void tiered_scan(
     uint2 perm6 = perm6_words[lane];
     uint2 perm15 = perm15_words[lane];
 #else
+#if TIERED_USE_TRANSPOSED_SHARED_PERM
+    __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE * 32];
+    __shared__ uint32_t shared_perm15[CONT_TIERED_PERM_SIZE * 32];
+    if (tid < CONT_TIERED_PERM_SIZE) {
+        uint32_t perm6_value = (uint32_t)seed_params->perm[0][tid];
+        uint32_t perm15_value = (uint32_t)seed_params->perm[1][tid];
+#if TIERED_SHARED_PACKED_PAIRS
+        perm6_value |= (uint32_t)seed_params->perm[0]
+            [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8;
+        perm15_value |= (uint32_t)seed_params->perm[1]
+            [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8;
+#endif
+        #pragma unroll
+        for (int copy_lane = 0; copy_lane < 32; copy_lane++) {
+            int destination_lane = (lane + copy_lane) & 31;
+            shared_perm6[tid * 32 + destination_lane] = perm6_value;
+            shared_perm15[tid * 32 + destination_lane] = perm15_value;
+        }
+    }
+#else
     __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE];
     __shared__ uint32_t shared_perm15[CONT_TIERED_PERM_SIZE];
     if (tid < CONT_TIERED_PERM_SIZE) {
+#if TIERED_SHARED_PACKED_PAIRS
+        shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid]
+            | ((uint32_t)seed_params->perm[0]
+                [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
+        shared_perm15[tid] = (uint32_t)seed_params->perm[1][tid]
+            | ((uint32_t)seed_params->perm[1]
+                [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
+#else
         shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid];
         shared_perm15[tid] = (uint32_t)seed_params->perm[1][tid];
+#endif
     }
+#endif
 #endif
 
     __shared__ uint32_t row_masks[TILE];
@@ -358,10 +413,10 @@ __global__ void tiered_scan(
                     sample_z * lac15 * frequency_ratio);
 #else
                 float continentalness = amp6 * perlin_shared(
-                    shared_perm6, oa6, oc6, h26, d26, t26,
+                    shared_perm6, lane, oa6, oc6, h26, d26, t26,
                     sample_x * lac6, sample_z * lac6);
                 continentalness += amp15 * perlin_shared(
-                    shared_perm15, oa15, oc15, h215, d215, t215,
+                    shared_perm15, lane, oa15, oc15, h215, d215, t215,
                     sample_x * lac15 * frequency_ratio,
                     sample_z * lac15 * frequency_ratio);
 #endif
