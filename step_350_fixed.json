@@ -1,0 +1,23 @@
+{
+  "input": "historical_islands_3m.jsonl",
+  "min_area": 4000000,
+  "grid_size": 410,
+  "match_radius": 560,
+  "control_count": 10000,
+  "steps": [
+    {
+      "step_2x": 350,
+      "coverage": 143150,
+      "gpu_hits": 6,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 2,
+      "positive_record_local_retained": 2,
+      "control_count": 10000,
+      "control_passed": 0,
+      "control_pruned": 10000,
+      "control_prune_fraction": 1.0,
+      "positive_scan_seconds": 0.08334239991381764,
+      "control_scan_seconds": 0.05267510004341602
+    }
+  ]
+}

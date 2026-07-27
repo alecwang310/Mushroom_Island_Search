@@ -1,0 +1,11 @@
+Benchmark seed range: 100,000,000 consecutive seeds
+Prefilter band: [0.04290, 0.04330]
+Prefilter: 1,877,721 survivors in 0.085s (1.878% pass, 98.122% rejected)
+GPU tiered: 1,877,721 survivors -> 79,517 hits in 13.263s (5,995 hits/s)
+GPU kernel/transfer calls: 13.238s (141,847 survivors/s)
+CPU workers: 24; 79,517/79,517 sampled hits in 46.106s (1,725 hits/s)
+CPU results: 7 area estimates passed, 7 6-octave floods, 5 full floods, 4 >=4M
+CPU service time: 1105.205s (estimate 1104.469s, 6-octave flood 0.186s, full flood 0.551s)
+CPU estimate: mean 1,678,726, max 4,345,369, gate 4,000,000
+CPU queue: peak 48/48 pending, 14,401 blocked submissions, 21.426s waiting
+Backlog bottleneck: CPU area-estimate/flood stage

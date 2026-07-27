@@ -254,7 +254,7 @@ __device__ __forceinline__ void emit_warp_hits(
 extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
 __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_2x,
+    int G, int step_2x, float threshold,
     int hit_capacity, int *hit_count,
     int4 *hits)
 {
@@ -366,7 +366,7 @@ __global__ void tiered_scan(
                     sample_z * lac15 * frequency_ratio);
 #endif
 
-                bool low = valid && continentalness * ct_amp < -1.00f;
+                bool low = valid && continentalness * ct_amp < threshold;
                 if (full_tile) {
                     uint32_t mask = __ballot_sync(FULL_MASK, low);
                     if (lane == 0) row_masks[cell_z] = mask;

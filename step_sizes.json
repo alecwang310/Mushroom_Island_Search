@@ -1,0 +1,93 @@
+{
+  "input": "historical_islands_3m.jsonl",
+  "min_area": 4000000,
+  "grid_size": 512,
+  "match_radius": 560,
+  "control_count": 10000,
+  "steps": [
+    {
+      "step_2x": 140,
+      "coverage": 71540,
+      "gpu_hits": 571,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 45,
+      "positive_record_local_retained": 14,
+      "control_count": 10000,
+      "control_passed": 3142,
+      "control_pruned": 6858,
+      "control_prune_fraction": 0.6858,
+      "positive_scan_seconds": 0.09427010000217706,
+      "control_scan_seconds": 0.07805879996158183
+    },
+    {
+      "step_2x": 210,
+      "coverage": 107310,
+      "gpu_hits": 126,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 35,
+      "positive_record_local_retained": 27,
+      "control_count": 10000,
+      "control_passed": 393,
+      "control_pruned": 9607,
+      "control_prune_fraction": 0.9607,
+      "positive_scan_seconds": 0.0014491999754682183,
+      "control_scan_seconds": 0.07196999993175268
+    },
+    {
+      "step_2x": 280,
+      "coverage": 143080,
+      "gpu_hits": 42,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 23,
+      "positive_record_local_retained": 23,
+      "control_count": 10000,
+      "control_passed": 13,
+      "control_pruned": 9987,
+      "control_prune_fraction": 0.9987,
+      "positive_scan_seconds": 0.001232400070875883,
+      "control_scan_seconds": 0.07165359996724874
+    },
+    {
+      "step_2x": 350,
+      "coverage": 178850,
+      "gpu_hits": 3,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 1,
+      "positive_record_local_retained": 1,
+      "control_count": 10000,
+      "control_passed": 0,
+      "control_pruned": 10000,
+      "control_prune_fraction": 1.0,
+      "positive_scan_seconds": 0.0011850000591948628,
+      "control_scan_seconds": 0.0715819998877123
+    },
+    {
+      "step_2x": 420,
+      "coverage": 214620,
+      "gpu_hits": 0,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 0,
+      "positive_record_local_retained": 0,
+      "control_count": 10000,
+      "control_passed": 0,
+      "control_pruned": 10000,
+      "control_prune_fraction": 1.0,
+      "positive_scan_seconds": 0.0013211999321356416,
+      "control_scan_seconds": 0.07174980000127107
+    },
+    {
+      "step_2x": 560,
+      "coverage": 286160,
+      "gpu_hits": 0,
+      "positive_seed_count": 46,
+      "positive_seed_retained": 0,
+      "positive_record_local_retained": 0,
+      "control_count": 10000,
+      "control_passed": 0,
+      "control_pruned": 10000,
+      "control_prune_fraction": 1.0,
+      "positive_scan_seconds": 0.001145999995060265,
+      "control_scan_seconds": 0.07177079992834479
+    }
+  ]
+}

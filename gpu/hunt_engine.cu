@@ -21,7 +21,7 @@ extern "C" {
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_2x,
+    int G, int step_2x, float threshold,
     int hit_capacity, int *hit_count,
     int4 *hits);
 
@@ -99,7 +99,7 @@ extern "C" __declspec(dllexport) int prefilter_range(
 }
 
 static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
-                        int hit_capacity, int64_t *hit_results)
+                        float threshold, int hit_capacity, int64_t *hit_results)
 {
     if (n <= 0) return 0;
     ensure_seed_capacity(n);
@@ -113,7 +113,7 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
     cudaMemset(g_tier.d_hit_count, 0, sizeof(int));
 
     tiered_scan<<<n, THREADS>>>(
-        g_tier.d_params, n, G, step_2x,
+        g_tier.d_params, n, G, step_2x, threshold,
         hit_capacity, g_tier.d_hit_count,
         g_tier.d_hits);
 
@@ -138,26 +138,27 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
 }
 
 extern "C" __declspec(dllexport) int hunt_batch_tiered(
-    uint64_t start_seed, int n, int step_2x, int G,
+    uint64_t start_seed, int n, int step_2x, int G, float threshold,
     int hit_capacity, int64_t *hit_results)
 {
     uint64_t *seeds = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
     for (int i = 0; i < n; i++) seeds[i] = start_seed + (uint64_t)i;
-    int total = tiered_chunk(seeds, n, step_2x, G, hit_capacity, hit_results);
+    int total = tiered_chunk(seeds, n, step_2x, G, threshold, hit_capacity, hit_results);
     free(seeds);
     return total;
 }
 
 extern "C" __declspec(dllexport) int tiered_scan_mem(
-    const uint64_t *seeds, int n, int step_2x, int G,
+    const uint64_t *seeds, int n, int step_2x, int G, float threshold,
     int hit_capacity, int64_t *hit_results)
 {
     if (n > TIER_CHUNK) return -1;
-    return tiered_chunk(seeds, n, step_2x, G, hit_capacity, hit_results);
+    return tiered_chunk(seeds, n, step_2x, G, threshold, hit_capacity, hit_results);
 }
 
 extern "C" __declspec(dllexport) int hunt_batch_from_file(
-    const char *seed_file, int step_2x, int G, const char *hits_file)
+    const char *seed_file, int step_2x, int G, float threshold,
+    const char *hits_file)
 {
     FILE *input = fopen(seed_file, "rb");
     if (!input) return -1;
@@ -184,13 +185,13 @@ extern "C" __declspec(dllexport) int hunt_batch_from_file(
     for (int offset = 0; offset < n; offset += TIER_CHUNK) {
         int size = (n - offset < TIER_CHUNK) ? (n - offset) : TIER_CHUNK;
         int hit_count = tiered_chunk(seeds + offset, size, step_2x, G,
-                                     hit_capacity, chunk_hits);
+                                     threshold, hit_capacity, chunk_hits);
         if (hit_count < 0) {
             hit_capacity = -hit_count;
             chunk_hits = (int64_t*)realloc(
                 chunk_hits, (size_t)hit_capacity * 4 * sizeof(int64_t));
             hit_count = tiered_chunk(seeds + offset, size, step_2x, G,
-                                     hit_capacity, chunk_hits);
+                                     threshold, hit_capacity, chunk_hits);
         }
         if (hit_count < 0) break;
         fwrite(chunk_hits, 4 * sizeof(int64_t), hit_count, output);

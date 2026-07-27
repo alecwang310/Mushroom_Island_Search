@@ -21,7 +21,8 @@ GPU_DIR = os.path.dirname(__file__)
 _hunt = ctypes.CDLL(os.path.join(GPU_DIR, 'hunt_engine.dll'))
 
 _hunt.hunt_batch_tiered.argtypes = [
-    ctypes.c_uint64, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_uint64, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
+    ctypes.c_int,
     ctypes.POINTER(ctypes.c_int64),
 ]
 _hunt.hunt_batch_tiered.restype = ctypes.c_int
@@ -34,7 +35,7 @@ _hunt.prefilter_range.restype = ctypes.c_int
 
 _hunt.tiered_scan_mem.argtypes = [
     ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int,
+    ctypes.c_float, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int64),
 ]
 _hunt.tiered_scan_mem.restype = ctypes.c_int
@@ -49,21 +50,21 @@ ESTIMATE_TARGET_AREA = 4_000_000
 # p99.15-p99.25 band: score [0.04330, 0.04331]
 # Keeps seeds BETWEEN these scores (0.1% of randoms)
 # Lower rejects noise, upper rejects score-ceiling randoms
-PREFT_LO = 0.0429   # captures 65% of 4M+ in [0.0429, 0.0433]
-PREFT_HI = 0.0433   # 23× enrichment, ~0.95% random pass
+PREFT_LO = 0.0432   # captures 65% of 4M+ in [0.0429, 0.0433]
+PREFT_HI = 0.0434   # 23× enrichment, ~0.95% random pass
 PREFT_ENABLED = True
-PREF_BATCH = 100_000_000
+PREF_BATCH = 500_000_000
 PREF_SURVIVOR_CAP = 2_000_000
 
 
-def hunt_batch_tiered(start_seed, n, step_2x, G):
+def hunt_batch_tiered(start_seed, n, step_2x, G, threshold=-1.0):
     hit_capacity = INITIAL_HIT_CAP
     while True:
         results = (ctypes.c_int64 * (hit_capacity * 4))()
         hc = _hunt.hunt_batch_tiered(
             ctypes.c_uint64(start_seed), ctypes.c_int(n),
-            ctypes.c_int(step_2x), ctypes.c_int(G), ctypes.c_int(hit_capacity),
-            results)
+            ctypes.c_int(step_2x), ctypes.c_int(G), ctypes.c_float(threshold),
+            ctypes.c_int(hit_capacity), results)
         if hc >= 0:
             break
         hit_capacity = -hc
@@ -82,8 +83,8 @@ def prefilter_range(start_seed, n, lo, hi, survivors):
 
 CHUNK = 8192
 
-def scan_survivors_stream(seeds, n, step_2x, G, submit_verification,
-                          step_05x, s2x):
+def scan_survivors_stream(seeds, n, step_2x, G, threshold,
+                          submit_verification, step_05x, s2x):
     """Scan compacted survivors in chunks and submit hits immediately."""
     if n == 0:
         return 0
@@ -97,12 +98,14 @@ def scan_survivors_stream(seeds, n, step_2x, G, submit_verification,
             ctypes.byref(seeds, off * ctypes.sizeof(ctypes.c_uint64)),
             ctypes.POINTER(ctypes.c_uint64))
         hc = _hunt.tiered_scan_mem(
-            ptr, sz, step_2x, G, hit_capacity, results)
+            ptr, sz, step_2x, G, ctypes.c_float(threshold),
+            hit_capacity, results)
         if hc < 0:
             hit_capacity = -hc
             results = (ctypes.c_int64 * (hit_capacity * 4))()
             hc = _hunt.tiered_scan_mem(
-                ptr, sz, step_2x, G, hit_capacity, results)
+                ptr, sz, step_2x, G, ctypes.c_float(threshold),
+                hit_capacity, results)
         if hc < 0:
             raise RuntimeError(f'tiered scan overflow retry failed: {-hc} hits')
         total_hits += hc
@@ -156,13 +159,14 @@ def verify_and_flood(seed, gx, gz, geometry_code, step_05x, step_2x):
 
 if __name__ == '__main__':
     TARGET = 4_000_000
-    step_05x, step_2x = 70, 280
+    step_05x, step_2x = 75, 300
     G, batch = 512, 8192
+    THRESHOLD = -0.95
     FF_WORKERS = int(os.environ.get('HUNT_CPU_WORKERS', '24'))
     MAX_PENDING_VERIFICATIONS = FF_WORKERS * 2
 
     print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
-    print(f'step_05x={step_05x}  step_2x={step_2x}  G={G}  batch={batch}')
+    print(f'step_05x={step_05x}  step_2x={step_2x}  G={G}  threshold={THRESHOLD}  batch={batch}')
     print(f'Coarse grid: {(G-1)*step_2x:,}x{(G-1)*step_2x:,} blocks at 1:1')
     if PREFT_ENABLED:
         print(f'Pre-filter: ON  band=[{PREFT_LO:.5f}, {PREFT_HI:.5f}]  '
@@ -257,7 +261,7 @@ if __name__ == '__main__':
                     continue
 
                 hc = scan_survivors_stream(
-                    survivors, n_pass, step_2x, G,
+                    survivors, n_pass, step_2x, G, THRESHOLD,
                     submit_verification, step_05x, step_2x)
                 t_end = time.perf_counter()
                 with lock:
@@ -270,7 +274,7 @@ if __name__ == '__main__':
                       f'({t_total:.1f}s: pref {t_pref-t1:.2f}s)')
                 print(f'    tiered scan: {n_pass:,} seeds in {t_scan_time:.1f}s = {n_pass/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
             else:
-                hits = hunt_batch_tiered(start, batch, step_2x, G)
+                hits = hunt_batch_tiered(start, batch, step_2x, G, THRESHOLD)
                 with lock:
                     scanned += batch
                     tiered_scanned += batch
