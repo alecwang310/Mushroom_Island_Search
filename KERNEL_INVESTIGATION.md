@@ -51,8 +51,10 @@ The normal path performs `14` pair loads per cell. A full tile has `1,024`
 cells and `256` lanes, so prefix construction performs
 `2 octaves x 256 lanes x 3 loads = 1,536` pair loads per tile; the remaining
 four stages perform `2 octaves x 1,024 cells x 4 loads = 8,192` loads. The
-total is `9,728` loads instead of `14,336`, a `32.1%` reduction in packed
-permutation-load instructions for full tiles. The selected three-block build
+total is `9,728` logical pair-load calls instead of `14,336`, a `32.1%`
+reduction in the algorithmic lookup count for full tiles. This is not a measured
+32.1% reduction in elapsed time or Nsight shared-memory wavefronts. The selected
+three-block build
 uses `80` registers/thread, `2,180 B` shared memory, and one `4`-byte spill load
 and store per thread. Four blocks use `64` registers with the same tiny spill;
 two blocks use `128` registers without spills but lose too much occupancy.
@@ -147,9 +149,11 @@ four pair loads per cell afterward:
 | Row-mask writes | `32,768 B` (`32 KiB`) | unchanged | `7.89 GB/s` |
 | Permutation-table initialization writes | `2,048 B` | unchanged | `0.493 GB/s` |
 
-The no-prefix baseline is `3,670,016` pair loads per seed. The prefix path is
-`2,490,368` pair loads per seed, a theoretical `32.1%` reduction. At the old
-throughput, projected prefix reads plus row-mask reads are about `3.14 TB/s`.
+The no-prefix baseline is `3,670,016` logical pair-load calls per seed. The
+prefix path is `2,490,368`, a theoretical `32.1%` reduction in calls and
+logical bytes. At the old throughput, projected prefix reads plus row-mask
+reads are about `3.14 TB/s`; actual hardware transactions still depend on
+bank conflicts and compiler scheduling.
 Row-mask reads are mostly warp broadcasts, and the writes are negligible
 compared with pair loads. These are logical request rates after multiplying by
 the measured seed throughput; they are not a usable DRAM-bandwidth target.

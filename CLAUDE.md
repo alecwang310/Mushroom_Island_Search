@@ -110,12 +110,13 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 1. **Octaves 6+15 contribute 80%** of island signal at center. Always negative for islands.
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
-4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016` pair
-   loads per `G=512` seed. The full-tile prefix path performs `2,490,368`, a
-   `32.1%` reduction, and measures approximately `10%` faster. The gain is
-   larger than the memory-only estimate because the prefix also shortens the
-   serial hash dependency chain. Nsight reports about `50.9%` shared-load
-   wavefront expansion on the no-prefix capture.
+4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016`
+   logical pair-load calls per `G=512` seed. The full-tile prefix path performs
+   `2,490,368`, a `32.1%` reduction in algorithmic lookup calls and logical
+   bytes—not a 32.1% runtime or measured wavefront reduction. It measures
+   approximately `10%` faster because it also shortens the serial hash
+   dependency chain. Nsight reports about `50.9%` shared-load wavefront
+   expansion on the no-prefix capture.
 5. **CPU behavior**: the estimate path is scalar FP64 Perlin work; flood fill
    adds allocation, hash-table, branch, and cache pressure. More CPU registers
    alone are unlikely to create a large speedup; higher clocks and cores help

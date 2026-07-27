@@ -222,9 +222,9 @@ Nsight Compute 2025.4.1, and `sm_120`.
   2,180 B shared memory, zero spills, negligible DRAM traffic, and
   approximately 50.9% shared load wavefront expansion at an average 2-way
   conflict.
-- The prefix LUT reduces pair-load instructions by 32.1% and measures
-  `263.9-265.6K survivors/s` after warm-up, approximately 10% above the
-  no-prefix kernel.
+- The prefix LUT reduces logical pair-load calls by 32.1%—not elapsed time or
+  measured shared-memory wavefronts—and measures `263.9-265.6K survivors/s`
+  after warm-up, approximately 10% above the no-prefix kernel.
   The selected three-block build uses 80 registers/thread and a 4-byte spill.
 - Shared conflicts remain measurable, but the packed path is faster than the
   warp-register control. The logical traffic is about `3.53 TB/s` for packed

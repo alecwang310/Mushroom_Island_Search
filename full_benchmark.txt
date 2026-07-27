@@ -17,9 +17,10 @@ runs are used for the comparison.
 Correctness: prefix and no-prefix builds returned the same 2,274 sorted seed,
 coordinate, and geometry records on 262,144 consecutive fixed seeds.
 
-Logical pair loads per G=512 seed:
+Logical pair-load calls and bytes per G=512 seed (not measured hardware
+transactions or elapsed-time reduction):
 No-prefix: 3,670,016 loads, 14,680,064 B
-Prefix LUT: 2,490,368 loads, 9,961,472 B (32.1% fewer)
+Prefix LUT: 2,490,368 loads, 9,961,472 B (32.1% fewer logical calls/bytes)
 
 The earlier memory-only model predicted approximately 246.0K/s for the prefix.
 The measured 265.6K/s result shows that removing the three x-only stages also
