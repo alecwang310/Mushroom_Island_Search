@@ -21,6 +21,8 @@ extern "C" {
 #define CONT_PERM_SIZE 257
 #define CONT_TIERED_OCTAVES 2
 #define CONT_TIERED_PERM_SIZE 256
+#define CONT_VERIFY_OCTAVES 6
+#define CONT_VERIFY_PERM_SIZE 256
 
 typedef struct {
     /* Perlin noise parameters — one flat array per field (SoA layout for SIMD) */
@@ -62,6 +64,22 @@ typedef struct {
     float cached_t2[CONT_TIERED_OCTAVES];
     float cont_dbl_amp;
 } ContTieredParams;
+
+/* Compact six-octave state for the GPU coarse verifier.  The octave order is
+ * O6, O7, O8, O15, O16, O17, matching cont_engine_init_6oct(). */
+typedef struct {
+    uint8_t perm[CONT_VERIFY_OCTAVES][CONT_VERIFY_PERM_SIZE];
+    float offset_a[CONT_VERIFY_OCTAVES];
+    float offset_b[CONT_VERIFY_OCTAVES];
+    float offset_c[CONT_VERIFY_OCTAVES];
+    float amplitude[CONT_VERIFY_OCTAVES];
+    float lacunarity[CONT_VERIFY_OCTAVES];
+    uint8_t cached_h2[CONT_VERIFY_OCTAVES];
+    uint8_t padding[2];
+    float cached_d2[CONT_VERIFY_OCTAVES];
+    float cached_t2[CONT_VERIFY_OCTAVES];
+    float cont_dbl_amp;
+} ContVerifyParams;
 
 /**
  * Initialize the engine for a world seed.
@@ -105,8 +123,8 @@ void cont_sample_grid(const ContEngine *e, float *out,
  * C so callers do not pay a Python/ctypes boundary for every sample.
  * @param geometry_code low 6 bits = two GPU neighbor directions;
  *                      bit 6 = coarse-grid row parity
- * @param step_05x      0.5x sample spacing, normally 70 blocks
- * @param step_2x       GPU coarse spacing, normally 280 blocks
+ * @param step_05x      0.5x sample spacing, normally 125 blocks
+ * @param step_2x       GPU coarse spacing, normally 500 blocks
  * @return estimated area in blocks^2 at 1:1 scale
  */
 double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
@@ -137,6 +155,13 @@ void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,
  */
 void cont_batch_init_tiered(const uint64_t *seeds, int n, int large_biomes,
                             ContTieredParams *out);
+
+/**
+ * Initialize the six essential continentalness octaves used by the GPU
+ * coarse verifier: O6, O7, O8, O15, O16, and O17.
+ */
+void cont_batch_init_6oct(const uint64_t *seeds, int n, int large_biomes,
+                          ContVerifyParams *out);
 
 /**
  * Flood fill to measure mushroom island area.

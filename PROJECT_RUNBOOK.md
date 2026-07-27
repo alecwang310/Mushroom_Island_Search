@@ -14,10 +14,12 @@ Nsight profiling.
 - Original branch: `main` / `origin/main` at `b7fcd38`, `refine prefilter`.
 - Historical dataset: `2b1c2f2:islands_3m.jsonl`; `b7fcd38` deleted it while refining the prefilter, so keep the materialized file out of `gpt` commits.
 - `continentalness_pipeline.py` is verified and is the correctness reference.
-- Current hunt defaults: `step_05x=75`, `step_2x=300`, `G=512`, GPU threshold
+- Current hunt defaults: `step_05x=125`, `step_2x=500`, `G=512`, GPU threshold
   `-0.95`, 24 CPU workers, and prefilter band `[0.0432, 0.0434]`.
-- The 0.5x connected estimator and six-octave/full-flood gates are active; only
-  final full-flood areas >=4M are valid results.
+- The GPU R=2 coarse gate is `6_000_000` estimated blocks²; only final
+  full-flood areas >=4M are valid results.
+- Override the device-side coarse gate with `HUNT_GPU_COARSE_MIN_AREA` for
+  controlled retention experiments; clipped R=2 components are always kept.
 - GPU scanning and CPU verification run concurrently. The 2,048-task bounded
   queue preserves overlap without returning to the old unbounded-Future memory
   growth; current CPU pressure samples are estimate-only unless flood-positive
@@ -116,7 +118,7 @@ Then rebuild the GPU DLL:
 
 ```bat
 cd /d D:\Code\Seeds\gpu
-nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ..\engine\continentalness.c -I..\engine -lcudart
+nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu coarse_verify_kernel.cu prefilter_kernel.cu ..\engine\continentalness.c -I..\engine -lcudart
 ```
 
 The default build uses packed shared permutation pairs. For the warp-register
@@ -157,8 +159,8 @@ set HUNT_START_SEED=0x123456789ABCDEF0
 set HUNT_PREF_BATCH=100000000
 set HUNT_SCAN_LIMIT=262144
 set HUNT_SKIP_CPU=1
-set HUNT_STEP_05X=75
-set HUNT_STEP_2X=300
+set HUNT_STEP_05X=125
+set HUNT_STEP_2X=500
 set HUNT_GRID_SIZE=512
 set HUNT_THRESHOLD=-0.95
 python gpu\benchmark_tiered.py
@@ -197,14 +199,16 @@ and the best result is written to `best_4m.jsonl`.
 ## Pipeline Mental Model
 
 1. Optional GPU prefilter: a 100M consecutive-seed range is scored with the variance LUT and compacted into survivor seeds. It enriches the search but does not prove an island.
-2. CPU compact initialization: only O6 and O15 state is created for each survivor and uploaded once per GPU scan chunk.
-3. GPU tiered scan: `tiered_kernel.cu` evaluates a 2x hex grid, with 300-block spacing and `G=512`. A hit is a center plus two connected mushroom points, encoded as line, triangle, or V geometry.
-4. CPU estimate: the cached 0.5x lookup samples at 75-block spacing and counts only the connected low-cell component touching the triple. It no longer extrapolates a perimeter shell.
-5. Tier-1 flood: six-octave C flood is a cheap gate; only areas >=3M reach the full 24-octave flood.
-6. Final output: only a full 24-octave area >=4M is a valid large mushroom island.
+2. CPU compact initialization: O6/O15 state and six-octave verifier state are created for each survivor and uploaded once per GPU scan chunk.
+3. GPU tiered scan: `tiered_kernel.cu` evaluates a 2x hex grid, with 500-block spacing and `G=512`. A hit is a center plus two connected mushroom points, encoded as line, triangle, or V geometry.
+4. GPU coarse verifier: `coarse_verify_kernel.cu` evaluates the fixed R=2 1x hex neighborhood at 250-block spacing, counts connected six-octave cells, and keeps estimates >=6M or clipped components.
+5. CPU estimate: the cached 0.5x lookup samples at 125-block spacing and counts only the connected low-cell component touching the triple. It no longer extrapolates a perimeter shell.
+6. Tier-1 flood: six-octave C flood is a cheap gate; only areas >=3M reach the full 24-octave flood.
+7. Final output: only a full 24-octave area >=4M is a valid large mushroom island.
 
-Key units are `step_05x=75`, `step_1x=150`, `step_2x=300`, `G=512`, target
-`4_000_000`, and the tier-1 gate `3_000_000`. The GPU O6+O15 threshold
+Key units are `step_05x=125`, `step_1x=250`, `step_2x=500`, `G=512`, coarse
+gate `6_000_000`, final target `4_000_000`, and the tier-1 gate `3_000_000`.
+The GPU O6+O15 threshold
 `-0.95` is intentionally lenient; the CPU flood remains the authority.
 
 The runtime hunt and `benchmark_tiered.py` use 24 workers by default. The live

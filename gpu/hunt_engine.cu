@@ -3,7 +3,8 @@
  *
  * Compile:
  *   nvcc -O3 -arch=sm_120 -shared -o hunt_engine.dll
- *        hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu
+ *        hunt_engine.cu tiered_kernel.cu coarse_verify_kernel.cu
+ *        prefilter_kernel.cu
  *        ../engine/continentalness.c -I../engine -lcudart
  */
 #include <cuda_runtime.h>
@@ -17,15 +18,25 @@ extern "C" {
 }
 
 #define THREADS             256
+#define VERIFY_THREADS      128
 #define TIER_CHUNK          8192
 #define INITIAL_HIT_CAP     65536
-#define TIER_TIMING_COUNT   8
+#define TIER_TIMING_COUNT   9
+#define COARSE_MIN_AREA     6000000LL
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_2x, float threshold,
     int hit_capacity, int *hit_count,
     int4 *hits);
+
+extern "C" __global__ void coarse_verify_r2(
+    const ContVerifyParams *params,
+    const int4 *hits,
+    int hit_count,
+    int step_1x,
+    int step_2x,
+    int4 *results);
 
 extern "C" __global__ void prefilter_seeds(
     uint64_t start_seed, int n,
@@ -35,14 +46,19 @@ extern "C" __global__ void prefilter_seeds(
 struct TierBuffers {
     ContTieredParams *h_params;
     ContTieredParams *d_params;
+    ContVerifyParams *h_verify_params;
+    ContVerifyParams *d_verify_params;
     int *d_hit_count;
     int4 *d_hits;
     int4 *h_hits;
+    int4 *d_coarse_results;
+    int4 *h_coarse_results;
     int seed_cap;
     int hit_cap;
     cudaEvent_t phase_start;
     cudaEvent_t memset_done;
     cudaEvent_t kernel_done;
+    cudaEvent_t coarse_done;
     int timing_events_ready;
 } g_tier = {0};
 
@@ -55,6 +71,7 @@ struct TierTimings {
     double count_d2h_ms;
     double hits_d2h_ms;
     double pack_ms;
+    double coarse_kernel_ms;
 };
 
 using TierClock = std::chrono::steady_clock;
@@ -64,11 +81,22 @@ static double elapsed_ms(TierClock::time_point start,
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+static int64_t coarse_min_area() {
+    const char *value = getenv("HUNT_GPU_COARSE_MIN_AREA");
+    if (!value || !*value) return COARSE_MIN_AREA;
+    char *end = nullptr;
+    long long parsed = strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0)
+        return COARSE_MIN_AREA;
+    return (int64_t)parsed;
+}
+
 static void ensure_timing_events() {
     if (g_tier.timing_events_ready) return;
     cudaEventCreate(&g_tier.phase_start);
     cudaEventCreate(&g_tier.memset_done);
     cudaEventCreate(&g_tier.kernel_done);
+    cudaEventCreate(&g_tier.coarse_done);
     g_tier.timing_events_ready = 1;
 }
 
@@ -83,6 +111,7 @@ static void write_timings(const TierTimings *timings,
     output[5] = timings->count_d2h_ms;
     output[6] = timings->hits_d2h_ms;
     output[7] = timings->pack_ms;
+    output[8] = timings->coarse_kernel_ms;
 }
 
 struct PrefilterBuffers {
@@ -95,8 +124,14 @@ static void ensure_seed_capacity(int n) {
     if (g_tier.seed_cap >= n) return;
     if (g_tier.h_params) free(g_tier.h_params);
     if (g_tier.d_params) cudaFree(g_tier.d_params);
+    if (g_tier.h_verify_params) free(g_tier.h_verify_params);
+    if (g_tier.d_verify_params) cudaFree(g_tier.d_verify_params);
     g_tier.h_params = (ContTieredParams*)malloc((size_t)n * sizeof(ContTieredParams));
     cudaMalloc(&g_tier.d_params, (size_t)n * sizeof(ContTieredParams));
+    g_tier.h_verify_params = (ContVerifyParams*)malloc(
+        (size_t)n * sizeof(ContVerifyParams));
+    cudaMalloc(&g_tier.d_verify_params,
+               (size_t)n * sizeof(ContVerifyParams));
     g_tier.seed_cap = n;
 }
 
@@ -104,9 +139,14 @@ static void ensure_hit_capacity(int capacity) {
     if (g_tier.hit_cap >= capacity) return;
     if (g_tier.d_hits) cudaFree(g_tier.d_hits);
     if (g_tier.h_hits) free(g_tier.h_hits);
+    if (g_tier.d_coarse_results) cudaFree(g_tier.d_coarse_results);
+    if (g_tier.h_coarse_results) free(g_tier.h_coarse_results);
 
     cudaMalloc(&g_tier.d_hits, (size_t)capacity * sizeof(int4));
     g_tier.h_hits = (int4*)malloc((size_t)capacity * sizeof(int4));
+    cudaMalloc(&g_tier.d_coarse_results, (size_t)capacity * sizeof(int4));
+    g_tier.h_coarse_results = (int4*)malloc(
+        (size_t)capacity * sizeof(int4));
     g_tier.hit_cap = capacity;
 }
 
@@ -161,12 +201,15 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
 
     auto stage_started = TierClock::now();
     cont_batch_init_tiered(seeds, n, 0, g_tier.h_params);
+    cont_batch_init_6oct(seeds, n, 0, g_tier.h_verify_params);
     if (timings)
         timings->init_ms = elapsed_ms(stage_started, TierClock::now());
 
     stage_started = TierClock::now();
     cudaMemcpy(g_tier.d_params, g_tier.h_params,
                (size_t)n * sizeof(ContTieredParams), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_tier.d_verify_params, g_tier.h_verify_params,
+               (size_t)n * sizeof(ContVerifyParams), cudaMemcpyHostToDevice);
     if (timings)
         timings->h2d_ms = elapsed_ms(stage_started, TierClock::now());
 
@@ -209,25 +252,51 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         return 0;
     }
 
+    int step_1x = step_2x / 2;
+    coarse_verify_r2<<<total, VERIFY_THREADS>>>(
+        g_tier.d_verify_params, g_tier.d_hits, total,
+        step_1x, step_2x, g_tier.d_coarse_results);
+    if (timings) {
+        cudaEventRecord(g_tier.coarse_done);
+        cudaEventSynchronize(g_tier.coarse_done);
+        float coarse_ms = 0.0f;
+        cudaEventElapsedTime(
+            &coarse_ms, g_tier.kernel_done, g_tier.coarse_done);
+        timings->coarse_kernel_ms = coarse_ms;
+    }
+
     stage_started = TierClock::now();
     cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
+               (size_t)total * sizeof(int4), cudaMemcpyDeviceToHost);
+    cudaMemcpy(g_tier.h_coarse_results, g_tier.d_coarse_results,
                (size_t)total * sizeof(int4), cudaMemcpyDeviceToHost);
     if (timings)
         timings->hits_d2h_ms = elapsed_ms(stage_started, TierClock::now());
 
     stage_started = TierClock::now();
+    int output_count = 0;
+    const double coarse_cell_area = (double)step_1x * step_1x
+        * 0.8660254037844386 * 16.0;
+    const int64_t coarse_target = coarse_min_area();
     for (int i = 0; i < total; i++) {
+        const int4 coarse = g_tier.h_coarse_results[i];
+        int64_t coarse_area = (int64_t)(
+            (double)coarse.y * coarse_cell_area);
+        if (coarse.z == 0 && coarse_area < coarse_target)
+            continue;
+
         int seed_idx = g_tier.h_hits[i].x;
-        hit_results[i * 4] = (int64_t)seeds[seed_idx];
-        hit_results[i * 4 + 1] = (int64_t)g_tier.h_hits[i].y;
-        hit_results[i * 4 + 2] = (int64_t)g_tier.h_hits[i].z;
-        hit_results[i * 4 + 3] = (int64_t)g_tier.h_hits[i].w;
+        hit_results[output_count * 4] = (int64_t)seeds[seed_idx];
+        hit_results[output_count * 4 + 1] = (int64_t)g_tier.h_hits[i].y;
+        hit_results[output_count * 4 + 2] = (int64_t)g_tier.h_hits[i].z;
+        hit_results[output_count * 4 + 3] = (int64_t)g_tier.h_hits[i].w;
+        output_count++;
     }
     if (timings) {
         timings->pack_ms = elapsed_ms(stage_started, TierClock::now());
         timings->total_ms = elapsed_ms(total_started, TierClock::now());
     }
-    return total;
+    return output_count;
 }
 
 extern "C" __declspec(dllexport) int hunt_batch_tiered(
@@ -319,12 +388,17 @@ extern "C" __declspec(dllexport) void hunt_cleanup() {
         cudaEventDestroy(g_tier.phase_start);
         cudaEventDestroy(g_tier.memset_done);
         cudaEventDestroy(g_tier.kernel_done);
+        cudaEventDestroy(g_tier.coarse_done);
     }
     if (g_tier.d_params) cudaFree(g_tier.d_params);
+    if (g_tier.d_verify_params) cudaFree(g_tier.d_verify_params);
     if (g_tier.d_hit_count) cudaFree(g_tier.d_hit_count);
     if (g_tier.d_hits) cudaFree(g_tier.d_hits);
+    if (g_tier.d_coarse_results) cudaFree(g_tier.d_coarse_results);
     free(g_tier.h_params);
+    free(g_tier.h_verify_params);
     free(g_tier.h_hits);
+    free(g_tier.h_coarse_results);
     g_tier = {};
 
     if (g_prefilter.d_survivors) cudaFree(g_prefilter.d_survivors);

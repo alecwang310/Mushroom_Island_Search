@@ -763,6 +763,32 @@ void cont_batch_init_tiered(const uint64_t *seeds, int n, int large_biomes,
     }
 }
 
+void cont_batch_init_6oct(const uint64_t *seeds, int n, int large_biomes,
+                          ContVerifyParams *out)
+{
+    for (int s = 0; s < n; s++) {
+        ContEngine e;
+        cont_engine_init_6oct(&e, seeds[s], large_biomes);
+        ContVerifyParams *params = out + s;
+
+        for (int octave = 0; octave < CONT_VERIFY_OCTAVES; octave++) {
+            memcpy(params->perm[octave], e.perm[octave],
+                   CONT_VERIFY_PERM_SIZE);
+            params->offset_a[octave] = (float)e.offset_a[octave];
+            params->offset_b[octave] = (float)e.offset_b[octave];
+            params->offset_c[octave] = (float)e.offset_c[octave];
+            params->amplitude[octave] = (float)e.amplitude[octave];
+            params->lacunarity[octave] = (float)e.lacunarity[octave];
+            params->cached_h2[octave] = e.cached_h2[octave];
+            params->cached_d2[octave] = (float)e.cached_d2[octave];
+            params->cached_t2[octave] = (float)e.cached_t2[octave];
+        }
+        params->padding[0] = 0;
+        params->padding[1] = 0;
+        params->cont_dbl_amp = (float)e.cont_dbl_amp;
+    }
+}
+
 /* ==========================================================================
  * Flood fill — BFS to measure island area. No Python in the loop.
  * ========================================================================== */

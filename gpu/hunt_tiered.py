@@ -1,12 +1,15 @@
-"""hunt_tiered.py — Hex grid O6+O15 GPU prefilter + CPU verify + flood fill.
+"""hunt_tiered.py — Hex grid GPU prefilter/coarse verify + CPU flood fill.
 
-GPU: hex grid (staggered rows, 280-block spacing), only O6+O15 octaves,
+GPU: hex grid (staggered rows, 500-block spacing), only O6+O15 octaves,
      threshold -1.0, 3-connected hit detection. ~20K seeds/s.
      Optional pre-filter: GPU LUT-variance filter generates a consecutive
      seed range on-device and returns only compacted survivors.
 
+GPU: a separate six-octave R=2, 1x hex screen at 250-block spacing removes
+     small first-layer hits before host download.
+
 CPU: a cached 0.5x hex lookup samples the connected low-cell component
-     touching the three coarse hit points; only probable >=4M islands reach
+     touching the three coarse hit points; only probable >=6M islands reach
      the six-octave flood and then the full flood.
      Logs >=4M block^2 islands to islands_4m.jsonl.
 """
@@ -52,7 +55,10 @@ _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
 INITIAL_HIT_CAP = 65_536
-ESTIMATE_TARGET_AREA = 4_000_000
+ESTIMATE_TARGET_AREA = int(
+    os.environ.get('HUNT_ESTIMATE_TARGET', '6000000'))
+GPU_COARSE_MIN_AREA = int(
+    os.environ.get('HUNT_GPU_COARSE_MIN_AREA', '6000000'))
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -207,9 +213,9 @@ def verify_and_flood_profiled(submitted_at, seed, gx, gz, geometry_code,
 
 
 if __name__ == '__main__':
-    TARGET = 4_000_000
-    step_05x = _env_int('HUNT_STEP_05X', 75)
-    step_2x = _env_int('HUNT_STEP_2X', 300)
+    TARGET = _env_int('HUNT_TARGET_AREA', 4_000_000)
+    step_05x = _env_int('HUNT_STEP_05X', 125)
+    step_2x = _env_int('HUNT_STEP_2X', 500)
     G = _env_int('HUNT_GRID_SIZE', 512)
     batch = _env_int('HUNT_BATCH_SIZE', 8192)
     THRESHOLD = _env_float('HUNT_THRESHOLD', -0.95)
@@ -225,7 +231,8 @@ if __name__ == '__main__':
     fixed_start_value = os.environ.get('HUNT_START_SEED')
     fixed_start = int(fixed_start_value, 0) if fixed_start_value else None
 
-    print(f'Target: >= {TARGET:,} blocks^2 (4M+)')
+    print(f'Target: >= {TARGET:,} blocks^2 (final flood)')
+    print(f'GPU coarse gate: >= {GPU_COARSE_MIN_AREA:,} estimated blocks^2')
     print(f'step_05x={step_05x}  step_2x={step_2x}  G={G}  threshold={THRESHOLD}  batch={batch}')
     print(f'Coarse grid: {(G-1)*step_2x:,}x{(G-1)*step_2x:,} blocks at 1:1')
     if PREFT_ENABLED:
@@ -233,7 +240,8 @@ if __name__ == '__main__':
               f'(p99.15-p99.25, {pref_batch//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print(f'GPU: hex grid + connected triple. CPU: area estimate + flood fill.')
+    print('GPU: hex grid + connected triple + R=2 coarse area screen.')
+    print('CPU: 0.5x area estimate + flood fill.')
     print()
 
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
@@ -393,7 +401,7 @@ if __name__ == '__main__':
                 t_scan_time = t_end - t_pref
                 print(f'\n  batch {batch_num}: prefilter {pref_batch//1_000_000}M -> {n_pass:,} survivors '
                       f'({t_total:.1f}s: pref {t_pref-t1:.2f}s)')
-                print(f'    tiered scan: {n_scan:,} seeds in {t_scan_time:.1f}s = {n_scan/t_scan_time:,.0f} seeds/s, {hc} GPU hits')
+                print(f'    tiered+coarse: {n_scan:,} seeds in {t_scan_time:.1f}s = {n_scan/t_scan_time:,.0f} seeds/s, {hc} coarse candidates')
                 if max_prefilter_batches and batch_num >= max_prefilter_batches:
                     running = False
             else:
@@ -462,6 +470,6 @@ if __name__ == '__main__':
 
     elapsed = time.perf_counter() - t0
     print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
-    print(f'{hits_gpu} GPU triples -> {hits_estimated} area estimates passed -> {hits_big} big (>= {TARGET:,})')
+    print(f'{hits_gpu} GPU coarse candidates -> {hits_estimated} CPU estimates passed -> {hits_big} big (>= {TARGET:,})')
     if best:
         print(f'BEST: seed {best["seed"]}, {best["area"]:,} at ({best["cx"]},{best["cz"]})')

@@ -4,20 +4,24 @@
 
 Find Minecraft seeds with mushroom islands ≥ 4 million blocks², **speed over accuracy**. We prioritize scanning more seeds faster over catching every island.
 
-## Pipeline (current: hex grid O6+O15)
+## Pipeline (current: hex grid O6+O15 plus GPU coarse screen)
 
 ```
 Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → compact survivor seeds in RAM (no 800MB host seed array or disk round trip)
-     → cont_batch_init_tiered (CPU, O6+O15 only) → one compact upload
+     → cont_batch_init_tiered + cont_batch_init_6oct (CPU) → one compact upload
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
-     → download only compacted hit triples plus geometry codes
-     → CPU 0.5x connected estimate → only probable ≥4M hits reach flood fill
+     → separate GPU R=2 1x coarse estimate
+     → download only coarse survivors
+     → CPU 0.5x connected estimate
+     → only probable ≥6M hits reach flood fill
      → CPU 6-octave flood (C, six octaves initialized) → if area≥3M, 24-octave flood
-     → log results ≥4M to islands_4m.jsonl
+     → log final full-flood results ≥4M to islands_4m.jsonl
 ```
 
-At `G=512`, `step_2x=300`, and threshold `-0.95`, the current full-tile prefix
+The historical warmed benchmark used `G=512`, `step_2x=300`, and threshold
+`-0.95`; the current coarse-screen defaults are `step_2x=500` and
+`step_05x=125`. The historical full-tile prefix
 LUT measures `263.9-265.6K survivors/s` in warmed pure-kernel runs and
 `225.3-226.8K/s` through the complete DLL stages. The no-prefix control measures
 `240.7-241.1K/s`, so the kernel gain is approximately `10%`. An exact
@@ -36,6 +40,7 @@ engine/                        # CPU continentalness engine (C + Python bindings
 
 gpu/
   tiered_kernel.cu             # ★ Current main kernel: hex grid, 2 octaves only
+  coarse_verify_kernel.cu      #    Separate six-octave R=2 coarse area screen
   prefilter_kernel.cu          #    GPU seed-range variance LUT pre-filter
   variance_lut.h               #    Precomputed analytic LUT + MD5/amplitude constants
   hunt_engine.cu               #    DLL host: compact init/upload/launch/download
@@ -72,7 +77,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 ## GPU Kernel (tiered_kernel.cu)
 
-- **Grid**: Hex lattice (staggered rows), D=300-block spacing, 6 neighbors
+- **Grid**: Hex lattice (staggered rows), current `step_2x=500` spacing, 6 neighbors
 - **Octaves**: Only O6 + O15 (cont A/B first octaves). No shift distortion.
   - O6: amp=0.501, wavelength=2000 blocks. O15: amp=0.501, 1.8% detuned.
 - **Threshold**: O6+O15 < -0.95 (lenient, catches island cores)
@@ -91,7 +96,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **A/B control**: compile with `-DTIERED_USE_WARP_PERM=1` for the warp-register
   path, `-DTIERED_USE_PREFIX_LUT=0` for the no-prefix shared path, or add
   `-DTIERED_SHARED_PACKED_PAIRS=0` for the original byte-table path
-- **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
+- **Initialization**: CPU creates exact O6/O15 state for tiered scanning and the six essential octaves for the GPU coarse verifier; the final CPU flood remains full 24-octave.
 
 ## CPU Pipeline (hunt_tiered.py)
 
@@ -100,7 +105,9 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
   forced the GPU thread to wait after every result chunk and prevented CPU work
   from overlapping the next CUDA launch.
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
-- **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the connected low-cell component touching the three GPU points. It uses the full shifted continentalness field and the real mushroom threshold; only connected estimates ≥4M reach flood fill.
+- **GPU coarse estimate**: a separate six-octave R=2 hex screen at 1x spacing filters small hits before host download.
+- **GPU coarse gate**: defaults to `6_000_000`; override with `HUNT_GPU_COARSE_MIN_AREA`. Components touching the R=2 boundary are retained.
+- **CPU estimate** (`estimate_triple_area`): a cached 0.5x hex lookup at 125-block spacing samples the connected low-cell component touching the three GPU points; only connected estimates ≥6M reach flood fill.
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS gate before the full flood
 - **Tier 2 flood** (`cont_flood_fill`): full 24-octave, only if tier 1 ≥ 3M
 - **Dedup**: by (seed, area) to avoid logging the same island from overlapping triples
@@ -134,7 +141,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 ```powershell
 # GPU DLL
 cd gpu
-nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
+nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu coarse_verify_kernel.cu prefilter_kernel.cu ../engine/continentalness.c -I../engine -lcudart
 
 # Engine DLL (if continentalness.c changes)
 cd engine

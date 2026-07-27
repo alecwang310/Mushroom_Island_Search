@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from hunt_tiered import (
     CHUNK,
     INITIAL_HIT_CAP,
+    GPU_COARSE_MIN_AREA,
     ESTIMATE_TARGET_AREA,
     PREF_BATCH,
     PREF_SURVIVOR_CAP,
@@ -26,8 +27,8 @@ from hunt_tiered import (
 )
 
 
-STEP_05X = int(os.environ.get('HUNT_STEP_05X', '75'))
-STEP_2X = int(os.environ.get('HUNT_STEP_2X', '300'))
+STEP_05X = int(os.environ.get('HUNT_STEP_05X', '125'))
+STEP_2X = int(os.environ.get('HUNT_STEP_2X', '500'))
 GRID_SIZE = int(os.environ.get('HUNT_GRID_SIZE', '512'))
 THRESHOLD = float(os.environ.get('HUNT_THRESHOLD', '-0.95'))
 BENCH_PREF_BATCH = int(os.environ.get('HUNT_PREF_BATCH', str(PREF_BATCH)))
@@ -38,7 +39,7 @@ MAX_PENDING = CPU_WORKERS * 2
 CPU_HIT_LIMIT = int(os.environ.get('HUNT_CPU_HIT_LIMIT', '0'))
 TIER_TIMING_NAMES = (
     'total', 'init', 'h2d', 'memset', 'kernel',
-    'count_d2h', 'hits_d2h', 'pack',
+    'count_d2h', 'hits_d2h', 'pack', 'coarse_kernel',
 )
 
 
@@ -288,19 +289,20 @@ def main():
     print(
         f'Tiered config: G={GRID_SIZE}, step_2x={STEP_2X}, '
         f'step_05x={STEP_05X}, threshold={THRESHOLD}')
+    print(f'GPU coarse gate: >= {GPU_COARSE_MIN_AREA:,} estimated blocks^2')
     print(f'Prefilter band: [{PREFT_LO:.5f}, {PREFT_HI:.5f}]')
     print(
         f'Prefilter: {survivor_count:,} survivors in {prefilter_seconds:.3f}s '
         f'({survivor_ratio:.3%} pass, {(1.0 - survivor_ratio):.3%} rejected)')
     print(
-        f'GPU tiered: {scan_count:,}/{survivor_count:,} survivors -> '
-        f'{len(hits):,} hits in {scan_seconds:.3f}s '
+        f'GPU tiered+coarse: {scan_count:,}/{survivor_count:,} survivors -> '
+        f'{len(hits):,} candidates in {scan_seconds:.3f}s '
         f'({scan_count / scan_seconds if scan_seconds else 0:,.0f} survivors/s, '
         f'{len(hits) / scan_count if scan_count else 0:.3%} hits/survivor)')
     print(
         f'Tiered DLL calls: {call_seconds:.3f}s '
         f'({scan_count / call_seconds if call_seconds else 0:,.0f} survivors/s, '
-        f'{gpu_hit_rate:,.0f} hits/s); Python decode {decode_seconds:.3f}s')
+        f'{gpu_hit_rate:,.0f} coarse candidates/s); Python decode {decode_seconds:.3f}s')
     print(
         'Tiered DLL breakdown: '
         + ', '.join(

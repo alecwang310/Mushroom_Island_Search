@@ -28,6 +28,19 @@ prefix and no-prefix builds.
 The old warp-register result is retained below as a historical control, not as
 the production baseline. Build it with `-DTIERED_USE_WARP_PERM=1`.
 
+## R=2 Coarse Verifier Experiment
+
+The unbenchmarked coarse-screen branch changes the hunt defaults to
+`step_2x=500`, `step_1x=250`, and CPU `step_05x=125`. The existing tiered
+kernel remains the O6+O15 hit generator. A separate `coarse_verify_kernel.cu`
+launch then evaluates a fixed R=2 hex neighborhood around each triplet using
+the six essential octaves (O6, O7, O8, O15, O16, and O17). It counts the
+connected cells touching the three roots and retains components estimated at
+least `6_000_000` blocks² or components touching the R=2 boundary. The device
+gate can be overridden with `HUNT_GPU_COARSE_MIN_AREA`.
+
+The CUDA implementation has not yet been compiled or benchmarked on Windows.
+
 ## Perlin Prefix LUT
 
 Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair
