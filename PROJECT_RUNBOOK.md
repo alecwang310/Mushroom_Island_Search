@@ -175,8 +175,8 @@ python gpu\hunt_tiered.py
 ```
 
 The no-prefix kernel measures `240.7-241.1K survivors/s` at `G=512`. The
-selected prefix-LUT build measures `265.5-265.6K/s` with a three-block launch
-bound, approximately `10.2%` faster. An exact consecutive-seed comparison
+selected prefix-LUT build measures `263.9-265.6K/s` after clock warm-up with a
+three-block launch bound, approximately `10%` faster. An exact consecutive-seed comparison
 returned the same `2,274` sorted hit records. Use
 `-DTIERED_USE_PREFIX_LUT=0` for the control. The
 24-worker CPU sample processed `4,096` hits at `55.2K hits/s`, with peak queue
@@ -223,7 +223,8 @@ Nsight Compute 2025.4.1, and `sm_120`.
   approximately 50.9% shared load wavefront expansion at an average 2-way
   conflict.
 - The prefix LUT reduces pair-load instructions by 32.1% and measures
-  `265.5-265.6K survivors/s`, approximately 10.2% above the no-prefix kernel.
+  `263.9-265.6K survivors/s` after warm-up, approximately 10% above the
+  no-prefix kernel.
   The selected three-block build uses 80 registers/thread and a 4-byte spill.
 - Shared conflicts remain measurable, but the packed path is faster than the
   warp-register control. The logical traffic is about `3.53 TB/s` for packed

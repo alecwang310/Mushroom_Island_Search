@@ -18,9 +18,9 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
 ```
 
 At `G=512`, `step_2x=300`, and threshold `-0.95`, the current full-tile prefix
-LUT measures `265.5-265.6K survivors/s` in the pure kernel and
-`226.4-226.8K/s` through the complete DLL stages. The no-prefix control measures
-`240.7-241.1K/s`, so the kernel gain is approximately `10.2%`. An exact
+LUT measures `263.9-265.6K survivors/s` in warmed pure-kernel runs and
+`225.3-226.8K/s` through the complete DLL stages. The no-prefix control measures
+`240.7-241.1K/s`, so the kernel gain is approximately `10%`. An exact
 consecutive-seed comparison returned the same `2,274` sorted hit records.
 Disable the prefix with `-DTIERED_USE_PREFIX_LUT=0`. A 24-worker CPU estimate
 sample processed `55.2K hits/s`; no sampled estimate reached 4M, so positive
@@ -112,7 +112,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
 4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016` pair
    loads per `G=512` seed. The full-tile prefix path performs `2,490,368`, a
-   `32.1%` reduction, and measures approximately `10.2%` faster. The gain is
+   `32.1%` reduction, and measures approximately `10%` faster. The gain is
    larger than the memory-only estimate because the prefix also shortens the
    serial hash dependency chain. Nsight reports about `50.9%` shared-load
    wavefront expansion on the no-prefix capture.

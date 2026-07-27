@@ -14,14 +14,16 @@ Repeated Windows benchmarks measured:
 - No-prefix control: `240.7-241.1k survivors/s` pure kernel and
   `208.3-208.5k/s` including the DLL stages.
 - Prefix, four-block launch bound: `260.6-261.5k/s` pure kernel.
-- Prefix, three-block launch bound: `265.5-265.6k/s` pure kernel and
-  `226.4-226.8k/s` including the DLL stages.
+- Prefix, three-block launch bound: `263.9-265.6k/s` pure kernel and
+  `225.3-226.8k/s` including the DLL stages after clock warm-up.
 - Prefix, two-block launch bound: `249.5-249.8k/s` pure kernel.
 
-The selected three-block prefix build is approximately `10.2%` faster than the
-no-prefix kernel and approximately `8.7%` faster through the full DLL path.
-An exact consecutive-seed comparison returned the same `2,274` sorted seed,
-coordinate, and geometry records for the prefix and no-prefix builds.
+The selected three-block prefix build is approximately `10%` faster than the
+no-prefix kernel and approximately `8-9%` faster through the full DLL path.
+The first post-build run started at P8/442 MHz and measured `252.1k/s`; it is
+excluded from the warmed comparison. An exact consecutive-seed comparison
+returned the same `2,274` sorted seed, coordinate, and geometry records for the
+prefix and no-prefix builds.
 
 The old warp-register result is retained below as a historical control, not as
 the production baseline. Build it with `-DTIERED_USE_WARP_PERM=1`.
@@ -164,7 +166,7 @@ with no register or scheduling penalty, its estimated throughput is:
 ```
 
 That simple memory-only model predicts only `2.2%`, while the measured
-three-block prefix gain is approximately `10.2%`. The extra gain indicates that
+three-block prefix gain is approximately `10%`. The extra gain indicates that
 removing the first three lookups also shortens the serial hash dependency chain
 and improves scheduling; packed-versus-byte timing did not isolate those
 effects. Separately, if eliminating bank conflicts could halve the entire

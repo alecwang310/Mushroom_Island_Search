@@ -4,13 +4,15 @@ Configuration: G=512, step_2x=300, threshold=-0.95, RTX 5080 / sm_120
 Repeated 262,144-survivor results:
 No-prefix, 4-block bound: 240.7-241.1K/s pure kernel; 208.3-208.5K/s DLL
 Prefix LUT, 4-block bound: 260.6-261.5K/s pure kernel
-Prefix LUT, 3-block bound: 265.5-265.6K/s pure kernel; 226.4-226.8K/s DLL
+Prefix LUT, 3-block bound: 263.9-265.6K/s pure kernel; 225.3-226.8K/s DLL
 Prefix LUT, 2-block bound: 249.5-249.8K/s pure kernel
 
 Selected production build: prefix LUT, 3-block launch bound
 Resources: 80 registers/thread, 2,180 B shared memory, 4-byte spill load/store
-Kernel speedup over no-prefix: approximately 10.2%
-Full DLL-stage speedup over no-prefix: approximately 8.7%
+Kernel speedup over no-prefix: approximately 10%
+Full DLL-stage speedup over no-prefix: approximately 8-9%
+The first post-build run began at P8/442 MHz and measured 252.1K/s; warmed P1
+runs are used for the comparison.
 
 Correctness: prefix and no-prefix builds returned the same 2,274 sorted seed,
 coordinate, and geometry records on 262,144 consecutive fixed seeds.
