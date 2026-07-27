@@ -116,10 +116,12 @@ cd /d D:\Code\Seeds\gpu
 nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_engine.dll hunt_engine.cu tiered_kernel.cu prefilter_kernel.cu ..\engine\continentalness.c -I..\engine -lcudart
 ```
 
-For the shared-memory permutation baseline, add
-`-DTIERED_USE_WARP_PERM=0`. If the warp-register build reports spills or high
-local memory, compare `-DTIERED_MIN_BLOCKS_PER_SM=3` before imposing a register
-limit. Preserve ptxas register/spill/local-memory output with the result.
+The default build uses packed shared permutation pairs. For the warp-register
+A/B control, add `-DTIERED_USE_WARP_PERM=1`; for the original byte-table shared
+control, also add `-DTIERED_SHARED_PACKED_PAIRS=0`. If the warp-register build
+reports spills or high local memory, compare `-DTIERED_MIN_BLOCKS_PER_SM=3`
+before imposing a register limit. Preserve ptxas register/spill/local-memory
+output with the result.
 `C4819` code-page warnings have occurred and are not fatal when the DLL builds;
 missing DLLs, unresolved symbols, `nvcc` errors, and Python load errors are
 fatal and must be fixed first.

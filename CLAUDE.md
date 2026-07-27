@@ -17,10 +17,14 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → log results ≥4M to islands_4m.jsonl
 ```
 
-The July 27, 2026 RTX 5080 baseline at `G=512`, `step_2x=300`, and threshold
-`-0.95` is ~157K survivors/s in the pure kernel and ~142K survivors/s including
-compact CPU initialization and transfers. With a 2,048-task verification queue,
-the live GPU/CPU pipeline sustains ~133K survivors/s on the deterministic test.
+The pre-change July 27, 2026 RTX 5080 warp-register baseline at `G=512`,
+`step_2x=300`, and threshold `-0.95` was ~158K survivors/s in the pure kernel
+and ~143K survivors/s including compact CPU initialization and transfers. The
+current packed shared default measures about 234-241K pure-kernel survivors/s
+under the same settings, with identical hit records on a fixed survivor list.
+With a 2,048-task verification queue, the live GPU/CPU pipeline previously
+sustained ~133K survivors/s on the deterministic test; remeasure the live
+pipeline after changing the GPU stage.
 
 ## File Structure
 
@@ -74,13 +78,15 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **Threshold**: O6+O15 < -0.95 (lenient, catches island cores)
 - **Threads**: 256 per block; launch bounds default to 4 blocks/SM
 - **Tiling**: 32×32 cells per tile, processed as four converged one-cell waves
-- **Perm storage**: each warp distributes each 256-byte table across 32 lanes
-  (two packed uint32 registers per lane per octave)
-- **Perm lookup**: seven adjacent-pair stages per Perlin call; each pair uses three
-  `shfl.sync.idx.b32` instructions plus `prmt.b32`, with no shared-memory lookup
+- **Perm storage**: the default keeps each 256-entry table in packed shared
+  memory, storing `P[index] | (P[index + 1] << 8)` in one uint32 per index
+- **Perm lookup**: seven adjacent-pair stages per Perlin call; the default uses
+  one shared load per pair, while the warp-register control uses three
+  `shfl.sync.idx.b32` instructions plus `prmt.b32`
 - **Gradient lookup**: branchless hash arithmetic replaces divergent constant-table reads
 - **Detection**: 32 shared row bitmasks replace the float grid; a hit requires the center plus at least two true hex neighbors. The two selected neighbor bits and row parity are returned as a geometry code, so line, triangle, and V-shaped triples are represented without rescanning the GPU grid.
-- **Fallback**: compile with `-DTIERED_USE_WARP_PERM=0` for the shared-memory reference
+- **A/B control**: compile with `-DTIERED_USE_WARP_PERM=1` for the warp-register
+  path, or add `-DTIERED_SHARED_PACKED_PAIRS=0` for the original byte-table path
 - **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
 
 ## CPU Pipeline (hunt_tiered.py)
@@ -101,13 +107,14 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
 4. **Previous GPU bottleneck**: 14 serial shared-memory loads in the hash chain
-   produced 43-54% bank conflicts. The warp-register path reduces the measured
-   conflicts to 30 total per profiled launch, with no shared atomic conflicts.
+   produced 43-54% bank conflicts. Packing each adjacent pair cuts the shared
+   load count in half and is faster than the warp-register path despite about
+   50.9% remaining shared-load wavefront expansion.
 5. **CPU bottleneck**: flood fill (37-134ms). The triple filter and ≥2-of-all-neighbors verification threshold are intentionally stricter to reduce this workload while preserving clustered islands.
-6. Nsight Compute measures 86.3% SM issue utilization, 64 registers/thread,
-   65.8% achieved occupancy, 0.21% DRAM throughput, and zero spills. The remaining
-   kernel bottleneck is math/shuffle execution in `perm_pair_warp` and `grad_dot`,
-   especially the seven-stage paired permutation hash chain.
+6. The pre-change warp Nsight capture measured 86.3% SM issue utilization,
+   64 registers/thread, 65.8% achieved occupancy, 0.21% DRAM throughput, and
+   zero spills. The packed shared path is also spill-free; its remaining
+   limitation is random-index shared wavefront expansion rather than DRAM.
 7. Keep `G` divisible by 32. Partial edge tiles execute a full 32x32 tile and use
    the slower validity/atomic path; for example, `G=449` measured ~181K/s while
    `G=448` measured ~207K/s.
@@ -124,9 +131,10 @@ cd engine
 gcc -O3 -shared -o continentalness.dll continentalness.c -lm
 ```
 
-For the shared-memory A/B baseline, add `-DTIERED_USE_WARP_PERM=0`. If ptxas
-reports spills in the warp path, benchmark `-DTIERED_MIN_BLOCKS_PER_SM=3` rather
-than forcing `--maxrregcount`; the launch-bounds setting is intentionally exposed.
+The default build uses packed shared permutation pairs. For the warp-register
+A/B control, add `-DTIERED_USE_WARP_PERM=1`. If ptxas reports spills in the warp
+path, benchmark `-DTIERED_MIN_BLOCKS_PER_SM=3` rather than forcing
+`--maxrregcount`; the launch-bounds setting is intentionally exposed.
 
 ## Run
 
