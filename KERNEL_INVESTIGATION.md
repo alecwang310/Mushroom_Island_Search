@@ -63,9 +63,15 @@ For seed `-14701565609432224` (known full area `7,613,792` at
 translation positions across approximately ±30M world blocks. Using the full
 beat and half-beat produced only the original `4M+`/`6M+` island; no translated
 position produced another large island. The sweep ran at approximately `50K`
-full-flood start points per second. This is evidence against blindly expanding
-every triplet by all translation positions, but not a replacement for a local
-triplet scan around each beat position.
+full-flood start points per second. It did find many smaller translated
+islands: `875` nonzero starts, `618` at least `100K`, and `31` at least `1M`;
+the largest translated non-origin result was `2,362,432`. The O6+O15 value at
+the origin was `-0.993756874`, but only `27/303,601` translated points were
+within `0.01`, `155` were within `0.05`, and `403` were within `0.10` of that
+value. Thus the beat is not preserving the O6+O15 value at translated points;
+it is only an approximate envelope relationship. This argues against treating
+all translations as equivalent, while still leaving a possible benefit from a
+translated triplet screen with local value/geometry checks.
 
 ## Perlin Prefix LUT
 
