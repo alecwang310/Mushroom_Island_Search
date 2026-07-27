@@ -8,12 +8,17 @@ Nsight profiling.
 ## Current State
 
 - Branch: `gpt`.
-- Current commit: `442b300`, `Add 0.5x perimeter area estimator before flood fill`.
+- Profiling baseline: `ade3e2b`, `Add live tiered pipeline timing`.
 - Original branch: `main` / `origin/main` at `b7fcd38`, `refine prefilter`.
 - Historical dataset: `2b1c2f2:islands_3m.jsonl`; `b7fcd38` deleted it while refining the prefilter, so keep the materialized file out of `gpt` commits.
 - `continentalness_pipeline.py` is verified and is the correctness reference.
-- The current 0.5x estimator is not trusted: one 4,096-hit benchmark passed 3,419 hits to six-octave flood, but only one final result was actually >=4M.
-- Next investigation: diagnose the estimator and measure aggressive triple-filter retention against the historical dataset.
+- Current hunt defaults: `step_05x=75`, `step_2x=300`, `G=512`, GPU threshold
+  `-0.95`, 24 CPU workers, and prefilter band `[0.0432, 0.0434]`.
+- The 0.5x connected estimator and six-octave/full-flood gates are active; only
+  final full-flood areas >=4M are valid results.
+- July 27 profiling found the kernel compute-bound and the live pipeline limited
+  by an undersized verification queue. A 2,048-task bounded queue restores GPU/CPU
+  overlap without returning to the old unbounded-Future memory growth.
 
 ## Required Change Workflow
 
@@ -138,6 +143,38 @@ The benchmark reports prefilter survivors, GPU hits and throughput, CPU wall
 time, aggregate estimator time, six-octave flood time, full-flood time,
 pending-queue pressure, estimator passes, and actual >=4M results.
 
+Use this deterministic raw-stage benchmark when comparing kernel parameters:
+
+```bat
+set HUNT_START_SEED=0x123456789ABCDEF0
+set HUNT_PREF_BATCH=100000000
+set HUNT_SCAN_LIMIT=262144
+set HUNT_SKIP_CPU=1
+set HUNT_STEP_05X=75
+set HUNT_STEP_2X=300
+set HUNT_GRID_SIZE=512
+set HUNT_THRESHOLD=-0.95
+python gpu\benchmark_tiered.py
+```
+
+Use this bounded live-pipeline profile to measure GPU/CPU overlap:
+
+```bat
+set HUNT_MAX_PREFILTER_BATCHES=1
+set HUNT_PROFILE_STAGES=1
+set HUNT_CPU_WORKERS=24
+set HUNT_MAX_PENDING=2048
+python gpu\hunt_tiered.py
+```
+
+The deterministic July 27 result for 262,144 survivors was:
+
+- 1.83 seconds in DLL scans across 32 chunks.
+- 0.13 seconds in Python decode/submission with a 2,048-task queue.
+- 0.01 seconds waiting for queue capacity, with no blocked submissions.
+- About 133K live survivors/s, versus 105K/s with the old 48-task queue.
+- About 157K survivors/s in the pure CUDA kernel and 142K/s for the full DLL call.
+
 Run the continuous hunt with:
 
 ```bat
@@ -153,18 +190,41 @@ and the best result is written to `best_4m.jsonl`.
 
 1. Optional GPU prefilter: a 100M consecutive-seed range is scored with the variance LUT and compacted into survivor seeds. It enriches the search but does not prove an island.
 2. CPU compact initialization: only O6 and O15 state is created for each survivor and uploaded once per GPU scan chunk.
-3. GPU tiered scan: `tiered_kernel.cu` evaluates a 2x hex grid, with 280-block spacing and `G=512`. A hit is a center plus two connected mushroom points, encoded as line, triangle, or V geometry.
-4. CPU estimate: the cached 0.5x lookup samples at 70-block spacing and counts only the connected low-cell component touching the triple. It no longer extrapolates a perimeter shell.
+3. GPU tiered scan: `tiered_kernel.cu` evaluates a 2x hex grid, with 300-block spacing and `G=512`. A hit is a center plus two connected mushroom points, encoded as line, triangle, or V geometry.
+4. CPU estimate: the cached 0.5x lookup samples at 75-block spacing and counts only the connected low-cell component touching the triple. It no longer extrapolates a perimeter shell.
 5. Tier-1 flood: six-octave C flood is a cheap gate; only areas >=3M reach the full 24-octave flood.
 6. Final output: only a full 24-octave area >=4M is a valid large mushroom island.
 
-Key units are `step_05x=70`, `step_1x=140`, `step_2x=280`, `G=512`, target
-`4_000_000`, and the tier-1 gate `3_000_000`. The GPU O6+O15 threshold near
-`-1.00` is intentionally lenient; the CPU flood remains the authority.
+Key units are `step_05x=75`, `step_1x=150`, `step_2x=300`, `G=512`, target
+`4_000_000`, and the tier-1 gate `3_000_000`. The GPU O6+O15 threshold
+`-0.95` is intentionally lenient; the CPU flood remains the authority.
 
-The runtime hunt uses 16 flood workers. `benchmark_tiered.py` defaults to 24
-workers and should be explicitly run with `HUNT_CPU_WORKERS=24` for pressure
-measurements.
+The runtime hunt and `benchmark_tiered.py` use 24 workers by default. The live
+hunt bounds pending verification tasks at 2,048 by default; override with
+`HUNT_MAX_PENDING` only for controlled queue-depth benchmarks.
+
+## Nsight Findings
+
+The July 27, 2026 RTX 5080 capture used CUDA 13.2, Nsight Systems 2025.6.3,
+Nsight Compute 2025.4.1, and `sm_120`.
+
+- Nsight Systems: `tiered_scan` was 99.8% of GPU kernel time. H2D averaged
+  about 0.26 ms/chunk and D2H was negligible.
+- Nsight Compute: 86.3% compute/SM throughput, 64 registers/thread, 65.8%
+  achieved occupancy, zero spills, 0.21% DRAM throughput, and 92.4% L1 hit rate.
+- Shared-memory conflicts are no longer material: 30 total conflicts in the
+  representative launch and no shared atomic conflicts.
+- The primary not-issued stall is math-pipe throttle. Source correlation points
+  to `perm_pair_warp` lane selection/shuffles and `grad_dot` sign/gradient work.
+- Global coalescing is not a practical issue: source counters found only 18
+  excessive sectors in the 1,024-seed line-mapped capture.
+- `G` must stay divisible by 32. Partial edge tiles still run all Perlin samples
+  and use the slower validity/atomic path. Measured examples were `449 -> 448`:
+  ~181K/s -> ~207K/s, and `417 -> 416`: ~208K/s -> ~240K/s.
+
+For line-correlated Nsight Compute output, rebuild with `-lineinfo` added to the
+normal `nvcc` command. Keep `.ncu-rep`, `.nsys-rep`, `.sqlite`, and exported CSV
+files untracked.
 
 ## Historical Retention Test
 

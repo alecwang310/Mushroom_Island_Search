@@ -17,8 +17,10 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → log results ≥4M to islands_4m.jsonl
 ```
 
-The previous baseline was ~20,000 tiered seeds/s at G=512 and step_2x=280.
-The compact initialization/transfer path must be benchmarked on the CUDA host after rebuilding.
+The July 27, 2026 RTX 5080 baseline at `G=512`, `step_2x=300`, and threshold
+`-0.95` is ~157K survivors/s in the pure kernel and ~142K survivors/s including
+compact CPU initialization and transfers. With a 2,048-task verification queue,
+the live GPU/CPU pipeline sustains ~133K survivors/s on the deterministic test.
 
 ## File Structure
 
@@ -66,10 +68,10 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 ## GPU Kernel (tiered_kernel.cu)
 
-- **Grid**: Hex lattice (staggered rows), D=280-block spacing, 6 neighbors
+- **Grid**: Hex lattice (staggered rows), D=300-block spacing, 6 neighbors
 - **Octaves**: Only O6 + O15 (cont A/B first octaves). No shift distortion.
   - O6: amp=0.501, wavelength=2000 blocks. O15: amp=0.501, 1.8% detuned.
-- **Threshold**: O6+O15 < -1.00 (lenient, catches island cores)
+- **Threshold**: O6+O15 < -0.95 (lenient, catches island cores)
 - **Threads**: 256 per block; launch bounds default to 4 blocks/SM
 - **Tiling**: 32×32 cells per tile, processed as four converged one-cell waves
 - **Perm storage**: each warp distributes each 256-byte table across 32 lanes
@@ -83,7 +85,10 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 ## CPU Pipeline (hunt_tiered.py)
 
-- **16 workers** (ThreadPoolExecutor)
+- **24 workers** (ThreadPoolExecutor)
+- **Bounded queue**: 2,048 verification tasks by default. The old 48-task queue
+  forced the GPU thread to wait after every result chunk and prevented CPU work
+  from overlapping the next CUDA launch.
 - **GPU thread**: continuously submits batches, non-blocking verify+flood
 - **Estimate** (`estimate_triple_area`): a cached 0.5x hex lookup samples the connected low-cell component touching the three GPU points. It uses the full shifted continentalness field and the real mushroom threshold; only connected estimates ≥4M reach flood fill.
 - **Tier 1 flood** (`cont_flood_fill_6oct`): 6 essential octaves, C BFS, 37ms (3.6× faster than full)
@@ -96,10 +101,16 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
 4. **Previous GPU bottleneck**: 14 serial shared-memory loads in the hash chain
-   produced 43-54% bank conflicts. The default kernel now uses warp-register
-   permutation storage; it still needs Nsight benchmarking on the CUDA host.
+   produced 43-54% bank conflicts. The warp-register path reduces the measured
+   conflicts to 30 total per profiled launch, with no shared atomic conflicts.
 5. **CPU bottleneck**: flood fill (37-134ms). The triple filter and ≥2-of-all-neighbors verification threshold are intentionally stricter to reduce this workload while preserving clustered islands.
-6. The remaining serial dependency is the seven-stage paired permutation hash chain.
+6. Nsight Compute measures 86.3% SM issue utilization, 64 registers/thread,
+   65.8% achieved occupancy, 0.21% DRAM throughput, and zero spills. The remaining
+   kernel bottleneck is math/shuffle execution in `perm_pair_warp` and `grad_dot`,
+   especially the seven-stage paired permutation hash chain.
+7. Keep `G` divisible by 32. Partial edge tiles execute a full 32x32 tile and use
+   the slower validity/atomic path; for example, `G=449` measured ~181K/s while
+   `G=448` measured ~207K/s.
 
 ## Build
 

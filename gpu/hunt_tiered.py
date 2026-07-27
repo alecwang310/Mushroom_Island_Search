@@ -215,7 +215,7 @@ if __name__ == '__main__':
     THRESHOLD = _env_float('HUNT_THRESHOLD', -0.95)
     FF_WORKERS = _env_int('HUNT_CPU_WORKERS', 24)
     MAX_PENDING_VERIFICATIONS = _env_int(
-        'HUNT_MAX_PENDING', FF_WORKERS * 2)
+        'HUNT_MAX_PENDING', max(2048, FF_WORKERS * 2))
     pref_batch = _env_int('HUNT_PREF_BATCH', PREF_BATCH)
     survivor_capacity = _env_int(
         'HUNT_SURVIVOR_CAP', PREF_SURVIVOR_CAP)
