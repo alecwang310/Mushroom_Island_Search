@@ -289,7 +289,7 @@ __device__ __forceinline__ float perlin_shared_prefix(
     int lane,
     uint32_t prefix,
     float offset_x, float offset_z,
-    uint32_t cached_d2, float cached_t2,
+    float cached_d2, float cached_t2,
     float x, float z)
 {
     float dx = x + offset_x;
