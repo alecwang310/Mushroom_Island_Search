@@ -41,6 +41,32 @@ gate can be overridden with `HUNT_GPU_COARSE_MIN_AREA`.
 
 The CUDA implementation has not yet been compiled or benchmarked on Windows.
 
+## Translation Beat Correction
+
+The original `continentalness_pipeline.py` initializes normal-world
+continentalness with `lacunarity=1/512` for the first A octave and multiplies
+the first B octave by `337/331`. Therefore the frequency-difference beat is
+
+```text
+1 / ((337/331 - 1) / 512) = 28,245.333 pipeline coordinates
+```
+
+The Python sampler coordinates are at 1:4 scale, so this is `112,981.333`
+Minecraft world blocks. The `109K` value in older notes was a rough estimate;
+it is about 3.5% too small. A half-beat is `56,490.667` world blocks. Neither
+value is an exact map repeat: the first two permutation-backed Perlin fields
+share an exact period of `43,384,832` pipeline coordinates, and the full
+sampler additionally includes shift distortion and the remaining octaves.
+
+For seed `-14701565609432224` (known full area `7,613,792` at
+`(-30450,-18445)`), a CPU full-flood sweep tested all `303,601` rounded
+translation positions across approximately ±30M world blocks. Using the full
+beat and half-beat produced only the original `4M+`/`6M+` island; no translated
+position produced another large island. The sweep ran at approximately `50K`
+full-flood start points per second. This is evidence against blindly expanding
+every triplet by all translation positions, but not a replacement for a local
+triplet scan around each beat position.
+
 ## Perlin Prefix LUT
 
 Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair

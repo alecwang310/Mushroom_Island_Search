@@ -116,7 +116,13 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 
 1. **Octaves 6+15 contribute 80%** of island signal at center. Always negative for islands.
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
-3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
+3. **O6+O15 frequency beat**: the original Python pipeline uses
+   `f_A=1/512` and `f_B=(337/331)/512` at 1:4 coordinates. The beat is
+   `331*512/6 = 28,245.333` pipeline coordinates, or `112,981.333` world
+   blocks; the half-beat is `56,490.667` world blocks. These are envelope
+   beats, not exact map repeats. The exact common permutation period of the
+   two first octaves is `43,384,832` pipeline coordinates (`173,539,328`
+   world blocks), and the full pipeline also includes shift and other octaves.
 4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016`
    logical pair-load calls per `G=512` seed. The full-tile prefix path performs
    `2,490,368`, a `32.1%` reduction in algorithmic lookup calls and logical
