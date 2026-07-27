@@ -167,6 +167,32 @@ uses 16 KiB and caps the alias at approximately 4-way. The implementation is
 compile-time disabled by default while the 16- and 8-replica variants are
 benchmarked against the ordinary packed path.
 
+The fixed-survivor Windows benchmark used the same `262,144` survivor buffer
+for every build and returned the same `36,175` sorted hit records:
+
+| Build | Kernel time | Throughput | ptxas result |
+| --- | ---: | ---: | --- |
+| Ordinary packed shared | `1.0888 s` | `240.8k/s` | `64` registers, no spills |
+| Transposed, 16 replicas, launch bound 4 | `1.1116 s` | `235.8k/s` | `64` registers, 4-byte spill |
+| Transposed, 16 replicas, launch bound 3 | `1.1168 s` | `234.7k/s` | `80` registers, no spills |
+| Transposed, 8 replicas, launch bound 4 | `1.0890 s` | `240.7k/s` | `64` registers, 4-byte spill |
+| Transposed, 8 replicas, launch bound 3 | `1.1191 s` | `234.2k/s` | `80` registers, no spills |
+
+The partial transpose therefore does not beat the ordinary packed table on
+this GPU. The 16-replica version spends more shared memory without recovering
+enough scheduler time, and reducing launch bounds to remove the tiny spill
+increases register pressure and loses throughput. Keep the ordinary packed
+default; retain the replica count only as a future architecture-specific A/B
+switch.
+
+A concurrent 24-worker CPU sample processed `4,096` GPU hits at `55.2k hits/s`
+with a peak queue of `48` and no blocked submissions, while the GPU produced
+about `28.7k hits/s` in the same benchmark. No sampled estimate exceeded 4M,
+so this result measures the estimate path rather than flood-fill service. It
+still confirms that adding CPU registers alone is unlikely to fix the current
+GPU-limited run; a positive-heavy flood benchmark is needed before changing
+the allocator or flood data structures.
+
 ## Test Discipline
 
 Use the same deterministic survivor range, `G`, threshold, and scan limit for
