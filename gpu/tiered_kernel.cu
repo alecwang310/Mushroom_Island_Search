@@ -13,6 +13,9 @@
  * Build with -DTIERED_USE_WARP_PERM=1 for the warp-register reference path.
  * The shared path stores each adjacent permutation pair in one 32-bit word,
  * so each permutation-pair lookup needs one shared load instead of two.
+ * The default prefix path precomputes the three x-only pair stages once per
+ * lane per full tile and reuses the resulting two packed second-level pairs
+ * across the four waves; build with -DTIERED_USE_PREFIX_LUT=0 to disable it.
  * Build with -DTIERED_SHARED_PACKED_PAIRS=0 to restore the byte-table path.
  * Build with -DTIERED_USE_TRANSPOSED_SHARED_PERM=1 to use replicated lane
  * slots; TIERED_SHARED_REPLICAS=16 caps lookup conflicts at roughly 2-way while
@@ -42,6 +45,10 @@
 
 #ifndef TIERED_SHARED_PACKED_PAIRS
 #define TIERED_SHARED_PACKED_PAIRS 1
+#endif
+
+#ifndef TIERED_USE_PREFIX_LUT
+#define TIERED_USE_PREFIX_LUT 1
 #endif
 
 #ifndef TIERED_SHARED_REPLICAS
@@ -202,6 +209,21 @@ __device__ __forceinline__ uint32_t perm_pair_shared(
 #endif
 }
 
+#if TIERED_USE_PREFIX_LUT
+
+__device__ __forceinline__ uint32_t build_shared_prefix(
+    const uint32_t *perm, int lane, uint32_t h1, uint32_t cached_h2)
+{
+    uint32_t pair0 = perm_pair_shared(perm, lane, h1);
+    uint32_t va = (pair0 & 0xFFu) + cached_h2;
+    uint32_t vb = (pair0 >> 8) + cached_h2;
+    uint32_t pair1 = perm_pair_shared(perm, lane, va);
+    uint32_t pair2 = perm_pair_shared(perm, lane, vb);
+    return (pair1 & 0xFFFFu) | ((pair2 & 0xFFFFu) << 16);
+}
+
+#endif
+
 __device__ __forceinline__ float perlin_shared(
     const uint32_t *perm,
     int lane,
@@ -259,6 +281,66 @@ __device__ __forceinline__ float perlin_shared(
     l5 = fmaf(cached_t2, l7 - l5, l5);
     return fmaf(tz, l5 - l1, l1);
 }
+
+#if TIERED_USE_PREFIX_LUT
+
+__device__ __forceinline__ float perlin_shared_prefix(
+    const uint32_t *perm,
+    int lane,
+    uint32_t prefix,
+    float offset_x, float offset_z,
+    uint32_t cached_d2, float cached_t2,
+    float x, float z)
+{
+    float dx = x + offset_x;
+    float dz = z + offset_z;
+    int cell_x = __float2int_rd(dx);
+    int cell_z = __float2int_rd(dz);
+    dx -= (float)cell_x;
+    dz -= (float)cell_z;
+    uint32_t h3 = (uint32_t)cell_z & 0xFFu;
+    float tx = fade(dx);
+    float tz = fade(dz);
+
+    uint32_t pair1 = prefix & 0xFFFFu;
+    uint32_t pair2 = prefix >> 16;
+    uint32_t v2a = (pair1 & 0xFFu) + h3;
+    uint32_t v2b = (pair1 >> 8) + h3;
+    uint32_t v3a = (pair2 & 0xFFu) + h3;
+    uint32_t v3b = (pair2 >> 8) + h3;
+
+    uint32_t pair = perm_pair_shared(perm, lane, v2a);
+    uint32_t v4a = pair & 0xFFu;
+    uint32_t v4b = pair >> 8;
+    pair = perm_pair_shared(perm, lane, v2b);
+    uint32_t v5a = pair & 0xFFu;
+    uint32_t v5b = pair >> 8;
+    pair = perm_pair_shared(perm, lane, v3a);
+    uint32_t v6a = pair & 0xFFu;
+    uint32_t v6b = pair >> 8;
+    pair = perm_pair_shared(perm, lane, v3b);
+    uint32_t v7a = pair & 0xFFu;
+    uint32_t v7b = pair >> 8;
+
+    float l1 = grad_dot(v4a, dx, cached_d2, dz);
+    float l5 = grad_dot(v4b, dx, cached_d2, dz - 1.0f);
+    float l2 = grad_dot(v6a, dx - 1.0f, cached_d2, dz);
+    float l6 = grad_dot(v6b, dx - 1.0f, cached_d2, dz - 1.0f);
+    float l3 = grad_dot(v5a, dx, cached_d2 - 1.0f, dz);
+    float l7 = grad_dot(v5b, dx, cached_d2 - 1.0f, dz - 1.0f);
+    float l4 = grad_dot(v7a, dx - 1.0f, cached_d2 - 1.0f, dz);
+    float l8 = grad_dot(v7b, dx - 1.0f, cached_d2 - 1.0f, dz - 1.0f);
+
+    l1 = fmaf(tx, l2 - l1, l1);
+    l3 = fmaf(tx, l4 - l3, l3);
+    l5 = fmaf(tx, l6 - l5, l5);
+    l7 = fmaf(tx, l8 - l7, l7);
+    l1 = fmaf(cached_t2, l3 - l1, l1);
+    l5 = fmaf(cached_t2, l7 - l5, l5);
+    return fmaf(tz, l5 - l1, l1);
+}
+
+#endif
 
 #endif
 
@@ -401,6 +483,25 @@ __global__ void tiered_scan(
                 __syncthreads();
             }
 
+#if !TIERED_USE_WARP_PERM && TIERED_USE_PREFIX_LUT
+            uint32_t prefix6 = 0u;
+            uint32_t prefix15 = 0u;
+            if (full_tile) {
+                int prefix_cell_z = warp;
+                float prefix_sample_x = tile_origin_x
+                    + lane * spacing_x
+                    + (prefix_cell_z & 1) * half_spacing_x;
+                uint32_t prefix_h16 = (uint32_t)__float2int_rd(
+                    prefix_sample_x * lac6 + oa6);
+                uint32_t prefix_h115 = (uint32_t)__float2int_rd(
+                    prefix_sample_x * lac15 * frequency_ratio + oa15);
+                prefix6 = build_shared_prefix(
+                    shared_perm6, lane, prefix_h16, h26);
+                prefix15 = build_shared_prefix(
+                    shared_perm15, lane, prefix_h115, h215);
+            }
+#endif
+
             #pragma unroll
             for (int wave = 0; wave < WAVES; wave++) {
                 int cell_index = tid + wave * THREADS;
@@ -435,6 +536,26 @@ __global__ void tiered_scan(
                     sample_x * lac15 * frequency_ratio,
                     sample_z * lac15 * frequency_ratio);
 #else
+#if TIERED_USE_PREFIX_LUT
+                float continentalness;
+                if (full_tile) {
+                    continentalness = amp6 * perlin_shared_prefix(
+                        shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
+                        sample_x * lac6, sample_z * lac6);
+                    continentalness += amp15 * perlin_shared_prefix(
+                        shared_perm15, lane, prefix15, oa15, oc15, d215, t215,
+                        sample_x * lac15 * frequency_ratio,
+                        sample_z * lac15 * frequency_ratio);
+                } else {
+                    continentalness = amp6 * perlin_shared(
+                        shared_perm6, lane, oa6, oc6, h26, d26, t26,
+                        sample_x * lac6, sample_z * lac6);
+                    continentalness += amp15 * perlin_shared(
+                        shared_perm15, lane, oa15, oc15, h215, d215, t215,
+                        sample_x * lac15 * frequency_ratio,
+                        sample_z * lac15 * frequency_ratio);
+                }
+#else
                 float continentalness = amp6 * perlin_shared(
                     shared_perm6, lane, oa6, oc6, h26, d26, t26,
                     sample_x * lac6, sample_z * lac6);
@@ -442,6 +563,7 @@ __global__ void tiered_scan(
                     shared_perm15, lane, oa15, oc15, h215, d215, t215,
                     sample_x * lac15 * frequency_ratio,
                     sample_z * lac15 * frequency_ratio);
+#endif
 #endif
 
                 bool low = valid && continentalness * ct_amp < threshold;

@@ -4,13 +4,16 @@ Date: July 27, 2026
 
 ## Baseline
 
-The current production path is `gpu/tiered_kernel.cu` with ordinary packed
-shared permutation pairs, `G=512`, `step_2x=300`, threshold `-0.95`, and the
-O6+O15 two-octave scan. Measurements use the RTX 5080 / `sm_120` Windows host
-with one materialized deterministic survivor buffer so that every A/B build
-sees the same seeds and produces comparable work.
+The current production implementation is `gpu/tiered_kernel.cu` with packed
+shared permutation pairs and the prefix LUT enabled for full tiles. Settings
+are `G=512`, `step_2x=300`, threshold `-0.95`, and the O6+O15 two-octave scan.
+The fixed-buffer measurements below were captured before the prefix LUT was
+added; build with `-DTIERED_USE_PREFIX_LUT=0` to reproduce them exactly.
+Measurements use the RTX 5080 / `sm_120` Windows host with one materialized
+deterministic survivor buffer so that every A/B build sees the same seeds and
+produces comparable work.
 
-The current fixed-buffer baseline measured:
+The pre-prefix fixed-buffer baseline measured:
 
 - Pure CUDA kernel: `1.0888 s` for `262,144` survivors, or `240.8k/s`.
 - Hit output: exactly `36,175` sorted records across the compared builds.
@@ -20,7 +23,7 @@ The current fixed-buffer baseline measured:
 The old warp-register result is retained below as a historical control, not as
 the production baseline. Build it with `-DTIERED_USE_WARP_PERM=1`.
 
-## Perlin Prefix LUT Option
+## Perlin Prefix LUT
 
 Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair
 lookups. The first three are independent of z:
@@ -34,17 +37,29 @@ path. The remaining four pair lookups add the z-cell hash and therefore depend
 on z.
 
 For a full 32x32 tile, `cell_z = warp + wave * 8`, so row parity is constant
-for all four waves of a warp. A register prefix LUT could therefore compute the
-first three pairs once per warp per tile and reuse them across four waves. The
-stored prefix would be four packed bytes per octave, or four additional
-32-bit registers for both octaves. This option remains set aside because it
-increases register pressure and the packed shared path is already faster than
-the warp-shuffle reference.
+for all four waves of a warp. The current prefix path uses that fact to compute
+the first three pairs once per lane per tile. It retains only the two second-
+level pairs needed by the remaining four lookups, packed into one 32-bit
+register per octave. The first pair is used only while building the prefix.
+
+The normal path performs `14` pair loads per cell. A full tile has `1,024`
+cells and `256` lanes, so prefix construction performs
+`2 octaves x 256 lanes x 3 loads = 1,536` pair loads per tile; the remaining
+four stages perform `2 octaves x 1,024 cells x 4 loads = 8,192` loads. The
+total is `9,728` loads instead of `14,336`, a theoretical `32.1%` reduction in
+packed permutation-load instructions for full tiles. The prefix adds two
+persistent 32-bit values per thread, plus its short-lived construction
+temporaries; ptxas register and spill output must be measured on Windows.
+
+Partial edge tiles retain the original `perlin_shared` path because their
+lane-to-cell mapping changes across waves. Disable the experiment with
+`-DTIERED_USE_PREFIX_LUT=0` for an exact A/B comparison.
 
 Seed-wide LUT storage is not promising: each seed executes one block, x-cell
 coordinates change across tiles, and a full-seed table would consume much more
-storage without cross-seed reuse. A shared tile prefix would save duplicate
-prefix work but would add shared loads for every cell.
+storage without cross-seed reuse. A shared tile prefix would also add a shared
+load for every cell, so the current lane-local register prefix avoids that
+extra lookup.
 
 ## Warp Versus Shared A/B
 
@@ -52,7 +67,7 @@ The fixed-buffer comparison at `G=512` is:
 
 | Path | Pure CUDA kernel | ptxas registers/shared memory |
 | --- | ---: | ---: |
-| Ordinary packed shared | `240.8k/s` | `64` / `2,180 B` |
+| Ordinary packed shared, no prefix | `240.8k/s` | `64` / `2,180 B` |
 | Shared byte-table control | `225.9k/s` | `64` / `2,180 B` |
 | Warp-register historical control | approximately `158k/s` | `64` / `132 B` |
 
@@ -69,7 +84,7 @@ At `G=512` and the historical `158,638 survivors/s`, the warp path issued:
 - `54.6 billion` warp shuffle instructions per second.
 - `18.2 billion` `PRMT` instructions per second.
 
-The current packed shared path issues approximately `229,376` shared-load
+The pre-prefix packed shared path issues approximately `229,376` shared-load
 instructions per seed, or `55.2 billion` shared-load instructions per second
 at `240,759/s`, before conflict wavefront expansion. These are aggregate issue
 rates, not isolated instruction latencies, but they show that the shared path
@@ -111,31 +126,44 @@ double throughput.
 
 ## Logical Memory Traffic Ceiling
 
-This is a calculation of the work performed by the current kernel, not a claim
-about DRAM bandwidth. The permutation tables and row masks reside in shared
-memory; Nsight reports negligible DRAM traffic. At `G=512`, one seed evaluates
+This is a calculation of the work performed by the kernel, not a claim about
+DRAM bandwidth. The permutation tables and row masks reside in shared memory;
+Nsight reports negligible DRAM traffic. At `G=512`, one seed evaluates
 `512 x 512 = 262,144` cells. Each cell evaluates two octaves, and each Perlin
-call performs seven packed adjacent-pair lookups:
+call performs seven packed adjacent-pair lookups without the prefix LUT. The
+new full-tile prefix path performs three pair loads once per lane per tile and
+four pair loads per cell afterward:
 
-| Operation | Bytes per seed | Rate at `240,759 survivors/s` |
-| --- | ---: | ---: |
-| Packed permutation reads (`14 x 4 B/cell`) | `14,680,064 B` (`14.0 MiB`) | `3.53 TB/s` |
-| Row-mask logical reads | `3,080,192 B` (`2.94 MiB`) | `0.742 TB/s` |
-| Row-mask writes | `32,768 B` (`32 KiB`) | `7.89 GB/s` |
-| Permutation-table initialization writes | `2,048 B` | `0.493 GB/s` |
+| Operation | No-prefix bytes/seed | Prefix bytes/seed | Prefix rate at `240,759/s` |
+| --- | ---: | ---: | ---: |
+| Packed permutation reads | `14,680,064 B` (`14.0 MiB`) | `9,961,472 B` (`9.50 MiB`) | `2.40 TB/s` |
+| Row-mask logical reads | `3,080,192 B` (`2.94 MiB`) | unchanged | `0.742 TB/s` |
+| Row-mask writes | `32,768 B` (`32 KiB`) | unchanged | `7.89 GB/s` |
+| Permutation-table initialization writes | `2,048 B` | unchanged | `0.493 GB/s` |
 
-The dominant logical traffic is therefore about `4.28 TB/s` of shared-memory
-reads, overwhelmingly from the packed permutation table. Row-mask reads are
-mostly warp broadcasts, and the writes are negligible compared with the pair
-loads. These figures are logical request rates after multiplying by the
-measured seed throughput; they are not a usable DRAM-bandwidth target.
+The no-prefix baseline is `3,670,016` pair loads per seed. The prefix path is
+`2,490,368` pair loads per seed, a theoretical `32.1%` reduction. At the old
+throughput, projected prefix reads plus row-mask reads are about `3.14 TB/s`.
+Row-mask reads are mostly warp broadcasts, and the writes are negligible
+compared with pair loads. These are logical request rates after multiplying by
+the measured seed throughput; they are not a usable DRAM-bandwidth target.
 
 The closest measured isolation of shared lookup cost is the packed-versus-byte
-control. Their kernel times were `1.088822 s` and `1.160628 s` for the same
+control. Their no-prefix kernel times were `1.088822 s` and `1.160628 s` for the same
 `262,144` survivors. Treating the removed second byte-table load as the only
 changed component assigns `0.071806 s`, or `6.595%` of packed runtime, to one
-packed lookup-load component. If eliminating conflicts could halve that entire
-component, the upper estimate is:
+packed lookup-load component. If the prefix removes `32.1%` of that component
+with no register or scheduling penalty, its estimated throughput is:
+
+```text
+240,759 / (1 - 0.32143 x 0.06595) = approximately 245,973 survivors/s
+```
+
+That is only about `2.2%` above the measured no-prefix result, so the actual
+benefit depends on whether the saved shared loads outweigh the two persistent
+prefix registers and the extra precompute loads. Separately, if eliminating
+bank conflicts could halve the entire packed lookup component, the no-prefix
+upper estimate is:
 
 ```text
 240,759 / (1 - 0.5 x 0.06595) = approximately 248,969 survivors/s

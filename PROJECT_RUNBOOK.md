@@ -8,8 +8,9 @@ Nsight profiling.
 ## Current State
 
 - Branch: `gpt`.
-- Current kernel baseline: ordinary packed shared permutation pairs; see
-  `KERNEL_INVESTIGATION.md` for fixed-survivor A/B timings and memory ceilings.
+- Current kernel: packed shared permutation pairs with the full-tile prefix LUT
+  enabled; see `KERNEL_INVESTIGATION.md` for the pre-prefix fixed-survivor A/B
+  timings and projected memory ceiling.
 - Original branch: `main` / `origin/main` at `b7fcd38`, `refine prefilter`.
 - Historical dataset: `2b1c2f2:islands_3m.jsonl`; `b7fcd38` deleted it while refining the prefilter, so keep the materialized file out of `gpt` commits.
 - `continentalness_pipeline.py` is verified and is the correctness reference.
@@ -120,10 +121,11 @@ nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_e
 
 The default build uses packed shared permutation pairs. For the warp-register
 A/B control, add `-DTIERED_USE_WARP_PERM=1`; for the original byte-table shared
-control, also add `-DTIERED_SHARED_PACKED_PAIRS=0`. If the warp-register build
-reports spills or high local memory, compare `-DTIERED_MIN_BLOCKS_PER_SM=3`
-before imposing a register limit. Preserve ptxas register/spill/local-memory
-output with the result.
+control, also add `-DTIERED_SHARED_PACKED_PAIRS=0`. The prefix-LUT path is on by
+default; add `-DTIERED_USE_PREFIX_LUT=0` for its control build. If the
+warp-register or prefix build reports spills or high local memory, compare
+`-DTIERED_MIN_BLOCKS_PER_SM=3` before imposing a register limit. Preserve ptxas
+register/spill/local-memory output with the result.
 `C4819` code-page warnings have occurred and are not fatal when the DLL builds;
 missing DLLs, unresolved symbols, `nvcc` errors, and Python load errors are
 fatal and must be fixed first.
@@ -171,9 +173,11 @@ set HUNT_MAX_PENDING=2048
 python gpu\hunt_tiered.py
 ```
 
-The current fixed-survivor kernel baseline is `240.8K survivors/s` pure CUDA
-throughput at `G=512`, with `36,175` identical hit records from `262,144`
-survivors. The ordinary packed shared path is the production default. The
+The last measured no-prefix fixed-survivor kernel baseline is `240.8K
+survivors/s` pure CUDA throughput at `G=512`, with `36,175` identical hit
+records from `262,144` survivors. The prefix-LUT path is now the production
+default for full tiles; use `-DTIERED_USE_PREFIX_LUT=0` to reproduce the
+measurement. The
 24-worker CPU sample processed `4,096` hits at `55.2K hits/s`, with peak queue
 depth `48` and no blocked submissions; no estimate crossed 4M, so this does
 not measure positive flood-fill service.
@@ -213,9 +217,10 @@ Nsight Compute 2025.4.1, and `sm_120`.
 
 - Nsight Systems: `tiered_scan` was 99.8% of GPU kernel time. H2D averaged
   about 0.26 ms/chunk and D2H was negligible.
-- Nsight Compute on the packed shared path: 64 registers/thread, 2,180 B shared
-  memory, zero spills, negligible DRAM traffic, and approximately 50.9% shared
-  load wavefront expansion at an average 2-way conflict.
+- Nsight Compute on the no-prefix packed shared path: 64 registers/thread,
+  2,180 B shared memory, zero spills, negligible DRAM traffic, and
+  approximately 50.9% shared load wavefront expansion at an average 2-way
+  conflict.
 - Shared conflicts remain measurable, but the packed path is faster than the
   warp-register control. The logical traffic is about `3.53 TB/s` for packed
   permutation reads and `4.28 TB/s` including row-mask reads. A fixed-buffer

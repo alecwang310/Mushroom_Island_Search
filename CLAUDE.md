@@ -17,13 +17,16 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → log results ≥4M to islands_4m.jsonl
 ```
 
-The current packed shared default at `G=512`, `step_2x=300`, and threshold
-`-0.95` measures `240.8K survivors/s` in the pure kernel on a fixed survivor
-buffer, with identical hit records across the packed, byte-table, and warp
-controls. Full DLL-call throughput varies around `203-208K survivors/s` because
-CPU initialization and clock state are included. A 24-worker CPU estimate
-sample processed `55.2K hits/s`; no sampled estimate reached 4M, so positive
-flood-fill throughput still requires a separate benchmark.
+The last measured no-prefix packed shared baseline at `G=512`, `step_2x=300`,
+and threshold `-0.95` was `240.8K survivors/s` in the pure kernel on a fixed
+survivor buffer, with identical hit records across the packed, byte-table, and
+warp controls. The prefix LUT is now enabled by default for full tiles and
+needs a Windows A/B benchmark; disable it with `-DTIERED_USE_PREFIX_LUT=0` to
+reproduce the recorded baseline. Full DLL-call throughput previously varied
+around `203-208K survivors/s` because CPU initialization and clock state were
+included. A 24-worker CPU estimate sample processed `55.2K hits/s`; no sampled
+estimate reached 4M, so positive flood-fill throughput still requires a
+separate benchmark.
 
 ## File Structure
 
@@ -82,10 +85,14 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **Perm lookup**: seven adjacent-pair stages per Perlin call; the default uses
   one shared load per pair, while the warp-register control uses three
   `shfl.sync.idx.b32` instructions plus `prmt.b32`
+- **Prefix LUT**: full tiles precompute the first three x-only pair stages once
+  per lane and reuse two packed second-level pairs across four waves; partial
+  edge tiles use the original path
 - **Gradient lookup**: branchless hash arithmetic replaces divergent constant-table reads
 - **Detection**: 32 shared row bitmasks replace the float grid; a hit requires the center plus at least two true hex neighbors. The two selected neighbor bits and row parity are returned as a geometry code, so line, triangle, and V-shaped triples are represented without rescanning the GPU grid.
 - **A/B control**: compile with `-DTIERED_USE_WARP_PERM=1` for the warp-register
-  path, or add `-DTIERED_SHARED_PACKED_PAIRS=0` for the original byte-table path
+  path, `-DTIERED_USE_PREFIX_LUT=0` for the no-prefix shared path, or add
+  `-DTIERED_SHARED_PACKED_PAIRS=0` for the original byte-table path
 - **Initialization**: CPU creates only the exact O6/O15 state instead of all 24 octaves.
 
 ## CPU Pipeline (hunt_tiered.py)
@@ -105,20 +112,20 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 1. **Octaves 6+15 contribute 80%** of island signal at center. Always negative for islands.
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
-4. **GPU memory behavior**: each cell performs 14 packed permutation-pair
-   loads, or `3,670,016` pair loads per `G=512` seed. At `240,759 survivors/s`
-   that is `3.53 TB/s` of logical pair reads and `4.28 TB/s` including row-mask
-   reads; these are shared-memory request rates, not DRAM traffic. Nsight still
-   reports about `50.9%` shared-load wavefront expansion. The measured
-   no-conflict ceiling is only about `246-249K survivors/s` because the kernel
-   is not purely shared-memory bound.
+4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016` pair
+   loads per `G=512` seed. The new full-tile prefix path projects `2,490,368`
+   loads, a `32.1%` instruction reduction, but only about `2.2%` theoretical
+   end-to-end speedup if shared lookup cost scales linearly. These are
+   shared-memory request rates, not DRAM traffic. Nsight still reports about
+   `50.9%` shared-load wavefront expansion on the no-prefix capture.
 5. **CPU behavior**: the estimate path is scalar FP64 Perlin work; flood fill
    adds allocation, hash-table, branch, and cache pressure. More CPU registers
    alone are unlikely to create a large speedup; higher clocks and cores help
    until the memory system or allocator saturates.
-6. The packed shared build uses 64 registers/thread, 2,180 B shared memory,
-   zero spills, and negligible DRAM traffic. Its main remaining limiter is
-   random-index shared wavefront expansion plus the Perlin arithmetic chain.
+6. The no-prefix packed shared build uses 64 registers/thread, 2,180 B shared
+   memory, zero spills, and negligible DRAM traffic. The prefix path adds two
+   persistent prefix registers per thread in source and requires a Windows
+   ptxas/throughput comparison for its actual benefit and spill risk.
 7. Keep `G` divisible by 32. Partial edge tiles execute a full 32x32 tile and use
    the slower validity/atomic path; for example, `G=449` measured ~181K/s while
    `G=448` measured ~207K/s.
@@ -159,9 +166,11 @@ SSH/VPN procedure, safe branch synchronization, exact Visual Studio/CUDA build
 commands, benchmark commands, pipeline interpretation, and historical-filter
 test protocol.
 
-Current handoff state on July 27, 2026: branch `gpt` uses the ordinary packed
-shared permutation default and the 16/8-replica transpose switches are retained
-only for architecture-specific A/B tests. `main` / `origin/main` remains at
+Current handoff state on July 27, 2026: branch `gpt` uses ordinary packed
+shared permutation pairs with the full-tile prefix LUT enabled; the 16/8-replica
+transpose switches remain only for architecture-specific A/B tests. Use
+`-DTIERED_USE_PREFIX_LUT=0` to reproduce the last measured baseline.
+`main` / `origin/main` remains at
 `b7fcd38` (`refine prefilter`); the historical `islands_3m.jsonl` file remains
 available at `2b1c2f2:islands_3m.jsonl` and must stay out of `gpt` commits.
 Only final full-flood results >=4M are valid evidence; estimator passes are
