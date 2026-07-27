@@ -73,6 +73,22 @@ it is only an approximate envelope relationship. This argues against treating
 all translations as equivalent, while still leaving a possible benefit from a
 translated triplet screen with local value/geometry checks.
 
+## O6-Only Exact Translation Test
+
+The first A octave, O6, has an exact period of `512*256 = 131,072` pipeline
+coordinates, or `524,288` real blocks. A full ±30M-world sweep therefore has
+`115*115 = 13,225` translated positions per hit. For the same seed, O6 matched
+at every position to within `3.3e-13`, while O15 varied as expected.
+
+Full 24-octave floods at those positions found `731` nonzero islands, `47`
+areas >=1M, and `3` areas >=4M (including the original). The two translated
+large islands were `5,970,944` at translation `(0,-55)` and `4,250,720` at
+translation `(55,0)`. The sweep took `4.14s` on the Mac CPU (`3,195` start
+points/s); the lower rate than the broad beat sweep is caused by more translated
+points reaching expensive flood fills. This makes the O6-period lattice a
+credible translation candidate generator, with O15/triplet checks still
+required before full flood.
+
 ## Perlin Prefix LUT
 
 Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair
