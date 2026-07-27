@@ -40,6 +40,14 @@ _hunt.tiered_scan_mem.argtypes = [
 ]
 _hunt.tiered_scan_mem.restype = ctypes.c_int
 
+_hunt.tiered_scan_mem_profiled.argtypes = [
+    ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_float, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int64),
+    ctypes.POINTER(ctypes.c_double), ctypes.c_int,
+]
+_hunt.tiered_scan_mem_profiled.restype = ctypes.c_int
+
 _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
