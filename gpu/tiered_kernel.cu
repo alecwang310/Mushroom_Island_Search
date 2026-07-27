@@ -332,8 +332,10 @@ __global__ void tiered_scan(
     uint2 perm15 = perm15_words[lane];
 #else
 #if TIERED_USE_TRANSPOSED_SHARED_PERM
-    __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE * 32];
-    __shared__ uint32_t shared_perm15[CONT_TIERED_PERM_SIZE * 32];
+    __shared__ uint32_t shared_perm6[
+        CONT_TIERED_PERM_SIZE * TIERED_SHARED_REPLICAS];
+    __shared__ uint32_t shared_perm15[
+        CONT_TIERED_PERM_SIZE * TIERED_SHARED_REPLICAS];
     if (tid < CONT_TIERED_PERM_SIZE) {
         uint32_t perm6_value = (uint32_t)seed_params->perm[0][tid];
         uint32_t perm15_value = (uint32_t)seed_params->perm[1][tid];
