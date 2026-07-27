@@ -9,7 +9,7 @@ Find Minecraft seeds with mushroom islands ≥ 4 million blocks², **speed over 
 ```
 Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → compact survivor seeds in RAM (no 800MB host seed array or disk round trip)
-     → cont_batch_init_tiered + cont_batch_init_6oct (CPU) → one compact upload
+     → cont_batch_init_tiered + cont_batch_init_6oct (CPU) → two compact uploads
      → tiered_scan GPU kernel (2 octaves, hex grid, ~9M cycles/seed)
      → separate GPU R=2 1x coarse estimate
      → download only coarse survivors
