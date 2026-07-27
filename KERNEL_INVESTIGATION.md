@@ -5,20 +5,23 @@ Date: July 27, 2026
 ## Baseline
 
 The current production implementation is `gpu/tiered_kernel.cu` with packed
-shared permutation pairs and the prefix LUT enabled for full tiles. Settings
-are `G=512`, `step_2x=300`, threshold `-0.95`, and the O6+O15 two-octave scan.
-The fixed-buffer measurements below were captured before the prefix LUT was
-added; build with `-DTIERED_USE_PREFIX_LUT=0` to reproduce them exactly.
-Measurements use the RTX 5080 / `sm_120` Windows host with one materialized
-deterministic survivor buffer so that every A/B build sees the same seeds and
-produces comparable work.
+shared permutation pairs, the full-tile prefix LUT, and a three-block launch
+bound. Settings are `G=512`, `step_2x=300`, threshold `-0.95`, and the O6+O15
+two-octave scan. Measurements use the RTX 5080 / `sm_120` Windows host.
 
-The pre-prefix fixed-buffer baseline measured:
+Repeated Windows benchmarks measured:
 
-- Pure CUDA kernel: `1.0888 s` for `262,144` survivors, or `240.8k/s`.
-- Hit output: exactly `36,175` sorted records across the compared builds.
-- Full DLL-call throughput: approximately `203-208k survivors/s`, including
-  compact CPU initialization and host timing overhead.
+- No-prefix control: `240.7-241.1k survivors/s` pure kernel and
+  `208.3-208.5k/s` including the DLL stages.
+- Prefix, four-block launch bound: `260.6-261.5k/s` pure kernel.
+- Prefix, three-block launch bound: `265.5-265.6k/s` pure kernel and
+  `226.4-226.8k/s` including the DLL stages.
+- Prefix, two-block launch bound: `249.5-249.8k/s` pure kernel.
+
+The selected three-block prefix build is approximately `10.2%` faster than the
+no-prefix kernel and approximately `8.7%` faster through the full DLL path.
+An exact consecutive-seed comparison returned the same `2,274` sorted seed,
+coordinate, and geometry records for the prefix and no-prefix builds.
 
 The old warp-register result is retained below as a historical control, not as
 the production baseline. Build it with `-DTIERED_USE_WARP_PERM=1`.
@@ -46,10 +49,11 @@ The normal path performs `14` pair loads per cell. A full tile has `1,024`
 cells and `256` lanes, so prefix construction performs
 `2 octaves x 256 lanes x 3 loads = 1,536` pair loads per tile; the remaining
 four stages perform `2 octaves x 1,024 cells x 4 loads = 8,192` loads. The
-total is `9,728` loads instead of `14,336`, a theoretical `32.1%` reduction in
-packed permutation-load instructions for full tiles. The prefix adds two
-persistent 32-bit values per thread, plus its short-lived construction
-temporaries; ptxas register and spill output must be measured on Windows.
+total is `9,728` loads instead of `14,336`, a `32.1%` reduction in packed
+permutation-load instructions for full tiles. The selected three-block build
+uses `80` registers/thread, `2,180 B` shared memory, and one `4`-byte spill load
+and store per thread. Four blocks use `64` registers with the same tiny spill;
+two blocks use `128` registers without spills but lose too much occupancy.
 
 Partial edge tiles retain the original `perlin_shared` path because their
 lane-to-cell mapping changes across waves. Disable the experiment with
@@ -91,10 +95,10 @@ rates, not isolated instruction latencies, but they show that the shared path
 replaces a larger dependent instruction sequence with an LSU workload that
 still has measurable headroom.
 
-The current `50.9%` conflict percentage is therefore an optimization warning, not
-proof that shared memory is the bottleneck. The shared path can be faster while
-having more conflicts because it removes the shuffle/`PRMT` dependency chain and
-lets the compiler schedule ordinary loads more effectively.
+The recorded no-prefix `50.9%` conflict percentage is therefore an optimization
+warning, not proof that shared memory is the bottleneck. The shared path can be
+faster while having more conflicts because it removes the shuffle/`PRMT`
+dependency chain and lets the compiler schedule ordinary loads more effectively.
 
 The fixed-buffer A/B builds all returned the same `36,175` sorted hit records,
 including seed, coordinates, and geometry code. This removes the earlier
@@ -159,17 +163,18 @@ with no register or scheduling penalty, its estimated throughput is:
 240,759 / (1 - 0.32143 x 0.06595) = approximately 245,973 survivors/s
 ```
 
-That is only about `2.2%` above the measured no-prefix result, so the actual
-benefit depends on whether the saved shared loads outweigh the two persistent
-prefix registers and the extra precompute loads. Separately, if eliminating
-bank conflicts could halve the entire packed lookup component, the no-prefix
-upper estimate is:
+That simple memory-only model predicts only `2.2%`, while the measured
+three-block prefix gain is approximately `10.2%`. The extra gain indicates that
+removing the first three lookups also shortens the serial hash dependency chain
+and improves scheduling; packed-versus-byte timing did not isolate those
+effects. Separately, if eliminating bank conflicts could halve the entire
+packed lookup component, the no-prefix upper estimate is:
 
 ```text
 240,759 / (1 - 0.5 x 0.06595) = approximately 248,969 survivors/s
 ```
 
-That is only about `3.4%` above the current result. If the `50.9%` Nsight
+That is only about `3.4%` above the no-prefix result. If the `50.9%` Nsight
 wavefront expansion is interpreted literally as `1.509x` serialized load work,
 the corresponding estimate is approximately `246,237 survivors/s`; the
 reasonable no-conflict range is therefore about `246-249K survivors/s`.

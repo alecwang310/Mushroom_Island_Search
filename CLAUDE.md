@@ -17,16 +17,14 @@ Seed range → [optional: prefilter_kernel GPU — LUT variance filter]
      → log results ≥4M to islands_4m.jsonl
 ```
 
-The last measured no-prefix packed shared baseline at `G=512`, `step_2x=300`,
-and threshold `-0.95` was `240.8K survivors/s` in the pure kernel on a fixed
-survivor buffer, with identical hit records across the packed, byte-table, and
-warp controls. The prefix LUT is now enabled by default for full tiles and
-needs a Windows A/B benchmark; disable it with `-DTIERED_USE_PREFIX_LUT=0` to
-reproduce the recorded baseline. Full DLL-call throughput previously varied
-around `203-208K survivors/s` because CPU initialization and clock state were
-included. A 24-worker CPU estimate sample processed `55.2K hits/s`; no sampled
-estimate reached 4M, so positive flood-fill throughput still requires a
-separate benchmark.
+At `G=512`, `step_2x=300`, and threshold `-0.95`, the current full-tile prefix
+LUT measures `265.5-265.6K survivors/s` in the pure kernel and
+`226.4-226.8K/s` through the complete DLL stages. The no-prefix control measures
+`240.7-241.1K/s`, so the kernel gain is approximately `10.2%`. An exact
+consecutive-seed comparison returned the same `2,274` sorted hit records.
+Disable the prefix with `-DTIERED_USE_PREFIX_LUT=0`. A 24-worker CPU estimate
+sample processed `55.2K hits/s`; no sampled estimate reached 4M, so positive
+flood-fill throughput still requires a separate benchmark.
 
 ## File Structure
 
@@ -78,7 +76,7 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 - **Octaves**: Only O6 + O15 (cont A/B first octaves). No shift distortion.
   - O6: amp=0.501, wavelength=2000 blocks. O15: amp=0.501, 1.8% detuned.
 - **Threshold**: O6+O15 < -0.95 (lenient, catches island cores)
-- **Threads**: 256 per block; launch bounds default to 4 blocks/SM
+- **Threads**: 256 per block; launch bounds default to 3 blocks/SM
 - **Tiling**: 32×32 cells per tile, processed as four converged one-cell waves
 - **Perm storage**: the default keeps each 256-entry table in packed shared
   memory, storing `P[index] | (P[index + 1] << 8)` in one uint32 per index
@@ -113,19 +111,19 @@ islands_4m.jsonl               # Output: seed, area, center coordinates
 2. **Shift octaves (0-5) contribute 0%** to island area — purely cosmetic.
 3. **O6+O15 beat period: 109K blocks** — islands repeat every ~55K blocks.
 4. **GPU memory behavior**: the no-prefix baseline performs `3,670,016` pair
-   loads per `G=512` seed. The new full-tile prefix path projects `2,490,368`
-   loads, a `32.1%` instruction reduction, but only about `2.2%` theoretical
-   end-to-end speedup if shared lookup cost scales linearly. These are
-   shared-memory request rates, not DRAM traffic. Nsight still reports about
-   `50.9%` shared-load wavefront expansion on the no-prefix capture.
+   loads per `G=512` seed. The full-tile prefix path performs `2,490,368`, a
+   `32.1%` reduction, and measures approximately `10.2%` faster. The gain is
+   larger than the memory-only estimate because the prefix also shortens the
+   serial hash dependency chain. Nsight reports about `50.9%` shared-load
+   wavefront expansion on the no-prefix capture.
 5. **CPU behavior**: the estimate path is scalar FP64 Perlin work; flood fill
    adds allocation, hash-table, branch, and cache pressure. More CPU registers
    alone are unlikely to create a large speedup; higher clocks and cores help
    until the memory system or allocator saturates.
-6. The no-prefix packed shared build uses 64 registers/thread, 2,180 B shared
-   memory, zero spills, and negligible DRAM traffic. The prefix path adds two
-   persistent prefix registers per thread in source and requires a Windows
-   ptxas/throughput comparison for its actual benefit and spill risk.
+6. The selected three-block prefix build uses 80 registers/thread, 2,180 B
+   shared memory, and a 4-byte spill load/store. The spill-free two-block build
+   is slower because occupancy falls; four blocks are also slower despite using
+   64 registers.
 7. Keep `G` divisible by 32. Partial edge tiles execute a full 32x32 tile and use
    the slower validity/atomic path; for example, `G=449` measured ~181K/s while
    `G=448` measured ~207K/s.
@@ -143,9 +141,9 @@ gcc -O3 -shared -o continentalness.dll continentalness.c -lm
 ```
 
 The default build uses packed shared permutation pairs. For the warp-register
-A/B control, add `-DTIERED_USE_WARP_PERM=1`. If ptxas reports spills in the warp
-path, benchmark `-DTIERED_MIN_BLOCKS_PER_SM=3` rather than forcing
-`--maxrregcount`; the launch-bounds setting is intentionally exposed.
+A/B control, add `-DTIERED_USE_WARP_PERM=1`; for the no-prefix control, add
+`-DTIERED_USE_PREFIX_LUT=0`. The default three-block prefix build intentionally
+keeps a 4-byte spill because the spill-free two-block build is slower.
 
 ## Run
 
@@ -169,7 +167,7 @@ test protocol.
 Current handoff state on July 27, 2026: branch `gpt` uses ordinary packed
 shared permutation pairs with the full-tile prefix LUT enabled; the 16/8-replica
 transpose switches remain only for architecture-specific A/B tests. Use
-`-DTIERED_USE_PREFIX_LUT=0` to reproduce the last measured baseline.
+`-DTIERED_USE_PREFIX_LUT=0` to reproduce the no-prefix control.
 `main` / `origin/main` remains at
 `b7fcd38` (`refine prefilter`); the historical `islands_3m.jsonl` file remains
 available at `2b1c2f2:islands_3m.jsonl` and must stay out of `gpt` commits.

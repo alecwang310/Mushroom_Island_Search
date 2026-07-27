@@ -56,7 +56,7 @@
 #endif
 
 #ifndef TIERED_MIN_BLOCKS_PER_SM
-#define TIERED_MIN_BLOCKS_PER_SM 4
+#define TIERED_MIN_BLOCKS_PER_SM 3
 #endif
 
 static_assert(THREADS % 32 == 0, "tiered_scan requires whole warps");

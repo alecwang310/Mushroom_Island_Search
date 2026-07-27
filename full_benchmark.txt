@@ -1,22 +1,28 @@
-Tiered benchmark snapshot: July 27, 2026 (pre-prefix control)
-Measured control: packed shared permutation pairs, G=512, step_2x=300,
-threshold=-0.95, 64 registers, 2,180 B shared memory, zero spills
+Tiered benchmark snapshot: July 27, 2026
+Configuration: G=512, step_2x=300, threshold=-0.95, RTX 5080 / sm_120
 
-Fixed survivor A/B buffer: 262,144 survivors, 36,175 identical sorted hits
-Ordinary packed shared: 1.0888 s pure kernel, 240.8K survivors/s
-Shared byte-table control: 1.1606 s pure kernel, 225.9K survivors/s
-Warp-register control: approximately 158K survivors/s from the prior control run
-Partial transpose controls: 16 replicas 235.8K/s; 8 replicas 240.7K/s
+Repeated 262,144-survivor results:
+No-prefix, 4-block bound: 240.7-241.1K/s pure kernel; 208.3-208.5K/s DLL
+Prefix LUT, 4-block bound: 260.6-261.5K/s pure kernel
+Prefix LUT, 3-block bound: 265.5-265.6K/s pure kernel; 226.4-226.8K/s DLL
+Prefix LUT, 2-block bound: 249.5-249.8K/s pure kernel
 
-Logical shared traffic at 240,759 survivors/s: 3.53 TB/s packed permutation
-reads, 0.742 TB/s row-mask reads, 7.89 GB/s row-mask writes, and 0.493 GB/s
-permutation initialization writes. Prefix projection: 2,490,368 pair loads
-per seed instead of 3,670,016 (32.1% fewer); approximately 245.97K/s if the
-shared-load component scales linearly and register pressure is free. Practical
-no-conflict estimate for the no-prefix control: 246-249K/s; unrealistic removal
-of all measured shared-load time: approximately 257.8K/s.
+Selected production build: prefix LUT, 3-block launch bound
+Resources: 80 registers/thread, 2,180 B shared memory, 4-byte spill load/store
+Kernel speedup over no-prefix: approximately 10.2%
+Full DLL-stage speedup over no-prefix: approximately 8.7%
+
+Correctness: prefix and no-prefix builds returned the same 2,274 sorted seed,
+coordinate, and geometry records on 262,144 consecutive fixed seeds.
+
+Logical pair loads per G=512 seed:
+No-prefix: 3,670,016 loads, 14,680,064 B
+Prefix LUT: 2,490,368 loads, 9,961,472 B (32.1% fewer)
+
+The earlier memory-only model predicted approximately 246.0K/s for the prefix.
+The measured 265.6K/s result shows that removing the three x-only stages also
+shortens the serial permutation dependency chain and improves scheduling.
 
 24-worker CPU sample: 4,096/36,171 sampled hits in 0.074 s (55.2K hits/s)
 CPU service: 1.192 s estimate-only; 0 flood-positive estimates; peak queue 48
-This fixed-buffer sample is GPU-stage limited; it does not measure positive
-flood-fill service or full-search throughput.
+This sample does not measure positive flood-fill service or full-search speed.

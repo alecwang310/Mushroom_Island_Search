@@ -9,8 +9,8 @@ Nsight profiling.
 
 - Branch: `gpt`.
 - Current kernel: packed shared permutation pairs with the full-tile prefix LUT
-  enabled; see `KERNEL_INVESTIGATION.md` for the pre-prefix fixed-survivor A/B
-  timings and projected memory ceiling.
+  and a three-block launch bound; see `KERNEL_INVESTIGATION.md` for measured
+  A/B timings and the memory analysis.
 - Original branch: `main` / `origin/main` at `b7fcd38`, `refine prefilter`.
 - Historical dataset: `2b1c2f2:islands_3m.jsonl`; `b7fcd38` deleted it while refining the prefilter, so keep the materialized file out of `gpt` commits.
 - `continentalness_pipeline.py` is verified and is the correctness reference.
@@ -122,10 +122,11 @@ nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o hunt_e
 The default build uses packed shared permutation pairs. For the warp-register
 A/B control, add `-DTIERED_USE_WARP_PERM=1`; for the original byte-table shared
 control, also add `-DTIERED_SHARED_PACKED_PAIRS=0`. The prefix-LUT path is on by
-default; add `-DTIERED_USE_PREFIX_LUT=0` for its control build. If the
-warp-register or prefix build reports spills or high local memory, compare
-`-DTIERED_MIN_BLOCKS_PER_SM=3` before imposing a register limit. Preserve ptxas
-register/spill/local-memory output with the result.
+default with `TIERED_MIN_BLOCKS_PER_SM=3`; add `-DTIERED_USE_PREFIX_LUT=0` for
+its control build. The selected prefix build intentionally retains a 4-byte
+spill because the spill-free two-block build is slower. Preserve ptxas
+register/spill/local-memory output with every result instead of optimizing for
+spill count alone.
 `C4819` code-page warnings have occurred and are not fatal when the DLL builds;
 missing DLLs, unresolved symbols, `nvcc` errors, and Python load errors are
 fatal and must be fixed first.
@@ -173,11 +174,11 @@ set HUNT_MAX_PENDING=2048
 python gpu\hunt_tiered.py
 ```
 
-The last measured no-prefix fixed-survivor kernel baseline is `240.8K
-survivors/s` pure CUDA throughput at `G=512`, with `36,175` identical hit
-records from `262,144` survivors. The prefix-LUT path is now the production
-default for full tiles; use `-DTIERED_USE_PREFIX_LUT=0` to reproduce the
-measurement. The
+The no-prefix kernel measures `240.7-241.1K survivors/s` at `G=512`. The
+selected prefix-LUT build measures `265.5-265.6K/s` with a three-block launch
+bound, approximately `10.2%` faster. An exact consecutive-seed comparison
+returned the same `2,274` sorted hit records. Use
+`-DTIERED_USE_PREFIX_LUT=0` for the control. The
 24-worker CPU sample processed `4,096` hits at `55.2K hits/s`, with peak queue
 depth `48` and no blocked submissions; no estimate crossed 4M, so this does
 not measure positive flood-fill service.
@@ -221,6 +222,9 @@ Nsight Compute 2025.4.1, and `sm_120`.
   2,180 B shared memory, zero spills, negligible DRAM traffic, and
   approximately 50.9% shared load wavefront expansion at an average 2-way
   conflict.
+- The prefix LUT reduces pair-load instructions by 32.1% and measures
+  `265.5-265.6K survivors/s`, approximately 10.2% above the no-prefix kernel.
+  The selected three-block build uses 80 registers/thread and a 4-byte spill.
 - Shared conflicts remain measurable, but the packed path is faster than the
   warp-register control. The logical traffic is about `3.53 TB/s` for packed
   permutation reads and `4.28 TB/s` including row-mask reads. A fixed-buffer
