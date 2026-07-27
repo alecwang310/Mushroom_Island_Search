@@ -138,15 +138,34 @@ conflict-prone load instructions by half. The kernel remains spill-free and
 DRAM-light, so further work should target instruction scheduling or a smaller
 lookup representation rather than attempting a 64 KiB transposed table.
 
+## CPU Register and Clock Assessment
+
+The CPU verification path calls the C implementation through a 24-worker
+thread pool, so the Python GIL is not the inner-loop limiter. The estimate path
+initializes one exact `ContEngine`, samples a connected 0.5x lattice, and runs
+scalar double-precision Perlin evaluations. The flood paths add dynamic queue
+and open-addressing hash-set allocations, pointer-chasing probes, branch-heavy
+neighbor tests, and repeated `cont_sample` calls.
+
+Consequently, extra CPU architectural registers are unlikely to produce a
+large standalone speedup. The compiler already keeps the short-lived Perlin
+values in registers; the flood fill is primarily latency/cache/branch and
+allocator bound. Higher clocks and more physical cores can improve throughput
+until the worker pool reaches memory-system or allocation limits, but they do
+not change the GPU lookup bottleneck. CPU-specific compilation such as `-O3`
+with the target's native ISA should be measured separately from algorithmic
+changes, while the CPU verification result must remain the FP32/FP64 reference.
+
 ## Current Upgrade
 
 The first implementation experiment is a transposed shared permutation table.
-It stores entries as `perm[index * 32 + lane]`, so every lane accesses its own
-bank regardless of the permutation index. With packed pairs it uses 64 KiB for
-the two tables; with byte entries it uses the same 64 KiB footprint. It keeps
-the shared-load code visible to the compiler and avoids the current
-random-index bank conflicts. It is compile-time disabled by default while it
-is benchmarked against both existing paths.
+It stores entries as `perm[index * replicas + (lane & (replicas - 1))]`.
+With `replicas=32`, every lane accesses its own bank and the two packed tables
+use 64 KiB. With `replicas=16`, the two tables use 32 KiB plus row-mask state
+and each lookup has at most approximately a 2-way lane alias; `replicas=8`
+uses 16 KiB and caps the alias at approximately 4-way. The implementation is
+compile-time disabled by default while the 16- and 8-replica variants are
+benchmarked against the ordinary packed path.
 
 ## Test Discipline
 

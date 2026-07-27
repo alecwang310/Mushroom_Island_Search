@@ -14,6 +14,9 @@
  * The shared path stores each adjacent permutation pair in one 32-bit word,
  * so each permutation-pair lookup needs one shared load instead of two.
  * Build with -DTIERED_SHARED_PACKED_PAIRS=0 to restore the byte-table path.
+ * Build with -DTIERED_USE_TRANSPOSED_SHARED_PERM=1 to use replicated lane
+ * slots; TIERED_SHARED_REPLICAS=16 caps lookup conflicts at roughly 2-way while
+ * fitting under the target GPU's per-block shared-memory limit.
  * If the warp-register control is enabled and ptxas reports spills, benchmark
  * TIERED_MIN_BLOCKS_PER_SM=3 before raising register limits manually; the four
  * permutation words are used every wave and should remain resident rather than
@@ -41,6 +44,10 @@
 #define TIERED_SHARED_PACKED_PAIRS 1
 #endif
 
+#ifndef TIERED_SHARED_REPLICAS
+#define TIERED_SHARED_REPLICAS 16
+#endif
+
 #ifndef TIERED_MIN_BLOCKS_PER_SM
 #define TIERED_MIN_BLOCKS_PER_SM 4
 #endif
@@ -48,6 +55,13 @@
 static_assert(THREADS % 32 == 0, "tiered_scan requires whole warps");
 static_assert(THREADS * WAVES == TILE * TILE,
               "thread waves must cover one complete tile");
+#if TIERED_USE_TRANSPOSED_SHARED_PERM
+static_assert(TIERED_SHARED_REPLICAS >= 1
+              && TIERED_SHARED_REPLICAS <= 32
+              && (TIERED_SHARED_REPLICAS
+                  & (TIERED_SHARED_REPLICAS - 1)) == 0,
+              "shared replicas must be a power of two from 1 to 32");
+#endif
 
 __device__ __forceinline__ float fade(float value) {
     return value * value * value
@@ -169,12 +183,15 @@ __device__ __forceinline__ uint32_t perm_pair_shared(
 {
     uint32_t wrapped = index & 0xFFu;
 #if TIERED_USE_TRANSPOSED_SHARED_PERM
+    uint32_t replica = (uint32_t)lane
+        & (TIERED_SHARED_REPLICAS - 1u);
 #if TIERED_SHARED_PACKED_PAIRS
-    return perm[wrapped * 32u + (uint32_t)lane];
+    return perm[wrapped * TIERED_SHARED_REPLICAS + replica];
 #else
-    uint32_t first = perm[wrapped * 32u + (uint32_t)lane] & 0xFFu;
-    uint32_t second = perm[((wrapped + 1u) & 0xFFu) * 32u
-        + (uint32_t)lane] & 0xFFu;
+    uint32_t first = perm[wrapped * TIERED_SHARED_REPLICAS + replica]
+        & 0xFFu;
+    uint32_t second = perm[((wrapped + 1u) & 0xFFu)
+        * TIERED_SHARED_REPLICAS + replica] & 0xFFu;
     return first | (second << 8);
 #endif
 #elif TIERED_SHARED_PACKED_PAIRS
@@ -327,10 +344,14 @@ __global__ void tiered_scan(
             [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8;
 #endif
         #pragma unroll
-        for (int copy_lane = 0; copy_lane < 32; copy_lane++) {
-            int destination_lane = (lane + copy_lane) & 31;
-            shared_perm6[tid * 32 + destination_lane] = perm6_value;
-            shared_perm15[tid * 32 + destination_lane] = perm15_value;
+        for (int copy_lane = 0;
+             copy_lane < TIERED_SHARED_REPLICAS; copy_lane++) {
+            int destination_replica = (lane + copy_lane)
+                & (TIERED_SHARED_REPLICAS - 1);
+            shared_perm6[tid * TIERED_SHARED_REPLICAS
+                + destination_replica] = perm6_value;
+            shared_perm15[tid * TIERED_SHARED_REPLICAS
+                + destination_replica] = perm15_value;
         }
     }
 #else
