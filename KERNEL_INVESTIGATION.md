@@ -4,10 +4,12 @@ Date: July 27, 2026
 
 ## Baseline
 
-The current production path is `gpu/tiered_kernel.cu` with warp-register
+The pre-change production path was `gpu/tiered_kernel.cu` with warp-register
 permutation tables, `G=512`, `step_2x=300`, threshold `-0.95`, and the O6+O15
 two-octave scan. Measurements use the RTX 5080 / `sm_120` Windows host with
-identical deterministic survivor seeds.
+identical deterministic survivor seeds. The packed shared path is now the
+default after the correctness and throughput checks recorded below; pass
+`-DTIERED_USE_WARP_PERM=1` to build the warp-register control.
 
 The latest production warp path measured:
 
@@ -91,9 +93,9 @@ proof that shared memory is the bottleneck. The shared path can be faster while
 having more conflicts because it removes the shuffle/`PRMT` dependency chain and
 lets the compiler schedule ordinary loads more effectively.
 
-The two A/B runs differed by 15 GPU hits at `G=512` (`36,156` versus `36,171`),
-so a direct hit-coordinate comparison is required before changing the default
-permutation representation.
+The two early A/B runs differed by 15 GPU hits at `G=512` (`36,156` versus
+`36,171`), so a direct hit-coordinate comparison was required before changing
+the default permutation representation.
 
 ## Low-Complexity Shared-Memory Upgrade
 
@@ -109,6 +111,32 @@ This packed layout is the first optimization to benchmark because it avoids
 the register pressure and dependent shuffle/`PRMT` chain of the warp path while
 also reducing the shared-memory traffic. Its remaining risk is random-index
 bank conflicts, which should affect one load instruction rather than two.
+
+The Windows A/B result on `442ddff` at `G=512` was:
+
+| Path | Pure CUDA kernel | ptxas registers/shared memory |
+| --- | ---: | ---: |
+| Warp-register control | `158.4k survivors/s` | `64` / `132 B` |
+| Shared byte-table control | `226.1k survivors/s` | `64` / `2,180 B` |
+| Shared packed-pair path | `241.0k survivors/s` | `64` / `2,180 B` |
+
+All three builds reported zero register spills and zero local-memory spills.
+Using one materialized list of `262,144` survivors, the packed path and both
+controls each returned exactly `36,175` sorted hit records, including seed,
+coordinates, and geometry code. This resolves the earlier apparent A/B count
+difference: each benchmark had regenerated the survivor prefix, and the
+prefilter's atomic append order is nondeterministic.
+
+The transposed shared experiment was also compiled. It requires `65,668`
+bytes of static shared memory, while this RTX 5080 reports a `49,152`-byte
+per-block limit, so that design cannot launch on the target and is rejected.
+
+Nsight Compute on the packed path still reports approximately `50.9%` shared
+load wavefront expansion at an average `2.0-way` conflict. This is expected
+for random permutation indices, but the packed table reduces the number of
+conflict-prone load instructions by half. The kernel remains spill-free and
+DRAM-light, so further work should target instruction scheduling or a smaller
+lookup representation rather than attempting a 64 KiB transposed table.
 
 ## Current Upgrade
 

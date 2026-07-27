@@ -2,22 +2,22 @@
  * tiered_kernel.cu — Hex-grid O6+O15 mushroom triple prefilter.
  *
  * Default path:
- *   - Each warp keeps both 256-byte permutation tables in packed registers.
- *   - One lane owns eight consecutive bytes (two uint32 registers) per table.
- *   - Adjacent permutation lookups use three PTX shuffles per pair instead of
- *     fourteen conflict-prone shared-memory loads per Perlin evaluation.
+ *   - Each block keeps both permutation tables in packed shared memory.
+ *   - Each adjacent permutation pair is stored in one uint32 entry, reducing
+ *     the shared-memory lookup count without changing the Perlin sequence.
  *   - One cell is evaluated per thread wave to keep register pressure bounded.
  *   - Detection uses one 32-bit mask per row instead of a float shared grid.
  *     A hit is the center plus two true hex neighbors; the two directions
  *     and coarse-row parity are packed into the returned geometry code.
  *
- * Build with -DTIERED_USE_WARP_PERM=0 for the shared-memory reference path.
+ * Build with -DTIERED_USE_WARP_PERM=1 for the warp-register reference path.
  * The shared path stores each adjacent permutation pair in one 32-bit word,
  * so each permutation-pair lookup needs one shared load instead of two.
  * Build with -DTIERED_SHARED_PACKED_PAIRS=0 to restore the byte-table path.
- * If ptxas reports spills, benchmark TIERED_MIN_BLOCKS_PER_SM=3 before raising
- * register limits manually; the four permutation words are used every wave and
- * should remain resident rather than being spilled to local/L2 memory.
+ * If the warp-register control is enabled and ptxas reports spills, benchmark
+ * TIERED_MIN_BLOCKS_PER_SM=3 before raising register limits manually; the four
+ * permutation words are used every wave and should remain resident rather than
+ * being spilled to local/L2 memory.
  */
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -30,7 +30,7 @@
 #define FULL_MASK 0xFFFFFFFFu
 
 #ifndef TIERED_USE_WARP_PERM
-#define TIERED_USE_WARP_PERM 1
+#define TIERED_USE_WARP_PERM 0
 #endif
 
 #ifndef TIERED_USE_TRANSPOSED_SHARED_PERM
