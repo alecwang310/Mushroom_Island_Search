@@ -9,7 +9,7 @@
 #define VERIFY_GRID_RADIUS 4
 #define VERIFY_GRID_SIDE (VERIFY_GRID_RADIUS * 2 + 1)
 #define VERIFY_GRID_CELLS (VERIFY_GRID_SIDE * VERIFY_GRID_SIDE)
-#define VERIFY_GROUPED_MAX_THREADS 256
+#define VERIFY_GROUPED_MAX_THREADS 512
 #define VERIFY_GROUPED_MAX_WARPS (VERIFY_GROUPED_MAX_THREADS / 32)
 #define VERIFY_OCTAVE_FREQUENCY_RATIO 1.0181268882172204f
 #define VERIFY_THRESHOLD -1.05f
@@ -579,6 +579,7 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
     __shared__ unsigned long long boundary_mask;
     __shared__ unsigned int warp_clipped[VERIFY_GROUPED_MAX_WARPS];
     __shared__ unsigned int warp_max_connected[VERIFY_GROUPED_MAX_WARPS];
+    __shared__ unsigned int warp_fallback_calls[VERIFY_GROUPED_MAX_WARPS];
 
     for (int perm_index = thread_id;
          perm_index < CONT_TIERED_PERM_SIZE;
@@ -715,6 +716,7 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
 
     unsigned int local_clipped = 0;
     unsigned int local_max_connected = 0;
+    unsigned int local_fallback_calls = 0;
     for (int translation_index = warp;
          translation_index < translation_count;
          translation_index += warp_count) {
@@ -726,6 +728,7 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
             + (min_dz + dz_index) * translation_period);
 
         bool first_low = false;
+        bool first_fallback = false;
         if (first_slot < region_count) {
             int axial_x = first_cell / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
             int row_delta = first_cell % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
@@ -741,8 +744,9 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                 (float)sample_x * o15_scale,
                 (float)sample_z * o15_scale);
             float value = (first_o6 + o15) * continentalness_scale;
-            if (fabsf(value - threshold)
-                    < VERIFY_PERIODIC_O6_FALLBACK_BAND) {
+            first_fallback = fabsf(value - threshold)
+                < VERIFY_PERIODIC_O6_FALLBACK_BAND;
+            if (first_fallback) {
                 float exact_o6 = seed_params->amplitude[0] * verify_perlin(
                     shared_perm[0], seed_params->offset_a[0],
                     seed_params->offset_c[0], seed_params->cached_h2[0],
@@ -753,9 +757,16 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
             }
             first_low = value < threshold;
         }
+        if (debug_stats) {
+            uint32_t fallback_mask = __ballot_sync(
+                0xFFFFFFFFu, first_fallback);
+            if (lane == 0)
+                local_fallback_calls += __popc(fallback_mask);
+        }
         uint32_t first_mask = __ballot_sync(0xFFFFFFFFu, first_low);
 
         bool second_low = false;
+        bool second_fallback = false;
         if (second_slot < region_count) {
             int axial_x = second_cell / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
             int row_delta = second_cell % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
@@ -771,8 +782,9 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                 (float)sample_x * o15_scale,
                 (float)sample_z * o15_scale);
             float value = (second_o6 + o15) * continentalness_scale;
-            if (fabsf(value - threshold)
-                    < VERIFY_PERIODIC_O6_FALLBACK_BAND) {
+            second_fallback = fabsf(value - threshold)
+                < VERIFY_PERIODIC_O6_FALLBACK_BAND;
+            if (second_fallback) {
                 float exact_o6 = seed_params->amplitude[0] * verify_perlin(
                     shared_perm[0], seed_params->offset_a[0],
                     seed_params->offset_c[0], seed_params->cached_h2[0],
@@ -782,6 +794,12 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                 value = (exact_o6 + o15) * continentalness_scale;
             }
             second_low = value < threshold;
+        }
+        if (debug_stats) {
+            uint32_t fallback_mask = __ballot_sync(
+                0xFFFFFFFFu, second_fallback);
+            if (lane == 0)
+                local_fallback_calls += __popc(fallback_mask);
         }
         uint32_t second_mask = __ballot_sync(0xFFFFFFFFu, second_low);
         unsigned long long low_mask = (unsigned long long)first_mask
@@ -827,6 +845,7 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
     if (lane == 0) {
         warp_clipped[warp] = local_clipped;
         warp_max_connected[warp] = local_max_connected;
+        warp_fallback_calls[warp] = local_fallback_calls;
     }
     __syncthreads();
 
@@ -843,5 +862,10 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                   (unsigned long long)translation_count * region_count);
         atomicAdd(debug_stats + 2, (unsigned long long)clipped_count);
         atomicMax(debug_stats + 3, (unsigned long long)max_connected);
+        atomicAdd(debug_stats + 4, (unsigned long long)region_count);
+        unsigned int fallback_calls = 0;
+        for (int warp_index = 0; warp_index < warp_count; warp_index++)
+            fallback_calls += warp_fallback_calls[warp_index];
+        atomicAdd(debug_stats + 5, (unsigned long long)fallback_calls);
     }
 }

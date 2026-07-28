@@ -143,7 +143,9 @@ static int translation_grouped() {
 static int translation_grouped_threads() {
     const char *value = getenv("HUNT_TRANSLATION_GROUPED_THREADS");
     int threads = value && *value ? atoi(value) : TRANSLATION_GROUPED_THREADS;
-    return threads <= 128 ? 128 : 256;
+    if (threads <= 128) return 128;
+    if (threads <= 256) return 256;
+    return 512;
 }
 
 static int cap_o6_grid_size(int grid_size, int step_2x,
@@ -433,7 +435,7 @@ static int tiered_translation_chunk(
         cudaMalloc(&g_tier.d_hit_count, sizeof(int));
     if (debug_stats && !g_tier.d_translation_stats)
         cudaMalloc(&g_tier.d_translation_stats,
-                   4 * sizeof(unsigned long long));
+                   6 * sizeof(unsigned long long));
     if (debug_stats)
         ensure_timing_events();
 
@@ -475,13 +477,15 @@ static int tiered_translation_chunk(
     int64_t max_estimated_area = 0;
     int64_t region_points = 0;
     int translated_count = 0;
+    unsigned long long base_o6_calls = 0;
+    unsigned long long fallback_o6_calls = 0;
 
     if (grouped) {
         stage_started = TierClock::now();
         cudaMemset(g_tier.d_hit_count, 0, sizeof(int));
         if (debug_stats)
             cudaMemset(g_tier.d_translation_stats, 0,
-                       4 * sizeof(unsigned long long));
+                       6 * sizeof(unsigned long long));
         estimate_setup_ms = elapsed_ms(stage_started, TierClock::now());
         if (debug_stats)
             cudaEventRecord(g_tier.phase_start);
@@ -504,7 +508,7 @@ static int tiered_translation_chunk(
                    cudaMemcpyDeviceToHost);
         result_count_d2h_ms = elapsed_ms(stage_started, TierClock::now());
         if (debug_stats) {
-            unsigned long long stats[4] = {};
+            unsigned long long stats[6] = {};
             cudaMemcpy(stats, g_tier.d_translation_stats, sizeof(stats),
                        cudaMemcpyDeviceToHost);
             translated_count = stats[0] > 0x7FFFFFFFULL
@@ -514,6 +518,8 @@ static int tiered_translation_chunk(
             clipped_count = stats[2] > 0x7FFFFFFFULL
                 ? 0x7FFFFFFF : (int)stats[2];
             max_estimated_area = (int64_t)(stats[3] * cell_area);
+            base_o6_calls = stats[4];
+            fallback_o6_calls = stats[5];
         }
         if (output_count > hit_capacity)
             return -output_count;
@@ -645,20 +651,27 @@ static int tiered_translation_chunk(
         double estimate_seconds = estimate_kernel_ms / 1000.0;
         double point_rate = estimate_seconds > 0.0
             ? region_points / estimate_seconds : 0.0;
-        double perlin_rate = point_rate * CONT_TIERED_OCTAVES;
+        if (!grouped)
+            base_o6_calls = (unsigned long long)region_points;
+        unsigned long long o15_calls = region_points;
+        double physical_perlin_calls = (double)base_o6_calls
+            + (double)o15_calls + (double)fallback_o6_calls;
+        double perlin_rate = estimate_seconds > 0.0
+            ? physical_perlin_calls / estimate_seconds : 0.0;
         double total_ms = elapsed_ms(total_started, TierClock::now());
         fprintf(stderr,
                 "translation_stats mode=%s threads=%d threshold=%.3f "
                 "raw=%d expanded=%d clipped=%d area_pass=%d "
                 "min_cells=%d max_area=%lld region_points=%lld "
-                "scan_ms=%.3f estimate_ms=%.3f points_s=%.3e "
-                "perlin_s=%.3e\n",
+                "scan_ms=%.3f estimate_ms=%.3f logical_points_s=%.3e "
+                "physical_perlin_s=%.3e fallback_o6=%llu\n",
                 grouped ? "grouped" : "expanded",
                 grouped ? grouped_threads : VERIFY_THREADS,
                 estimate_threshold, raw_count, translated_count,
                 clipped_count, output_count, minimum_connected_cells,
                 (long long)max_estimated_area, (long long)region_points,
-                scan_kernel_ms, estimate_kernel_ms, point_rate, perlin_rate);
+                scan_kernel_ms, estimate_kernel_ms, point_rate, perlin_rate,
+                fallback_o6_calls);
         fprintf(stderr,
                 "translation_phases total_ms=%.3f init_ms=%.3f "
                 "params_h2d_ms=%.3f scan_setup_ms=%.3f "
