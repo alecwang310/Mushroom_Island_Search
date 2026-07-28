@@ -166,6 +166,23 @@ set HUNT_THRESHOLD=-0.95
 python gpu\benchmark_tiered.py
 ```
 
+The compressed full-scale LUT experiment is a standalone synthetic A/B and
+does not modify `tiered_kernel.cu`. It packs the eight final gradient hashes
+for each `(h1,h3)` key into one `uint32` per octave, so the two tables occupy
+`512 KiB` in global memory. Build and run it on Windows with:
+
+```bat
+cd /d D:\Code\Seeds\gpu
+nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o full_lut_benchmark.dll full_lut_benchmark.cu -lcudart
+cd /d D:\Code\Seeds
+python gpu\benchmark_full_lut.py --blocks 256 --grid 512 --repeats 10
+```
+
+The harness reports one-seed LUT construction time, extraction-only time,
+LUT extraction plus interpolation, and a synthetic shared-permutation-chain
+control. The LUT is intentionally random and global-memory resident; use the
+result to estimate lookup/scheduling potential, not to validate seed output.
+
 Use this bounded live-pipeline profile to measure GPU/CPU overlap:
 
 ```bat
