@@ -179,6 +179,13 @@ int64_t cont_flood_fill(uint64_t seed, int cx, int cz, int max_cells);
  */
 int64_t cont_flood_fill_6oct(uint64_t seed, int cx, int cz, int max_cells);
 
+/**
+ * Flood fill using only O6 and O15 with a configurable continentalness
+ * threshold. Intended for calibrating cheap GPU area screens.
+ */
+int64_t cont_flood_fill_2oct(uint64_t seed, int cx, int cz,
+                             double threshold, int max_cells);
+
 #ifdef __cplusplus
 }
 #endif

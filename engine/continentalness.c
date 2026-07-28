@@ -1017,3 +1017,51 @@ int64_t cont_flood_fill_6oct(uint64_t seed, int cx, int cz, int max_cells) {
     free(vs.entries);
     return cells * 16;
 }
+
+int64_t cont_flood_fill_2oct(uint64_t seed, int cx, int cz,
+                             double threshold, int max_cells) {
+    ContEngine e;
+    cont_engine_init(&e, seed, 0);
+    cont_engine_disable_shift(&e);
+    e.cont_octA_count = 1;
+    e.cont_octB_count = 1;
+
+    if (cont_sample(&e, cx, cz) >= threshold)
+        return 0;
+
+    size_t init_q = 4096;
+    size_t init_vis = 8192;
+    Queue q;
+    VisSet vs;
+    if (!q_init(&q, init_q)) return -1;
+    if (!vis_init(&vs, init_vis)) { q_free(&q); return -1; }
+
+    q_push(&q, cx, cz);
+    vis_insert(&vs, cx, cz);
+    int64_t cells = 0;
+
+    while (!q_empty(&q) && cells < max_cells) {
+        if ((q.tail + 1) % q.cap == q.head) {
+            if (!q_grow(&q)) break;
+        }
+        int x, z;
+        q_pop(&q, &x, &z);
+        cells++;
+        struct { int dx, dz; } dirs[4] = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dirs[d].dx;
+            int nz = z + dirs[d].dz;
+            if (vis_contains(&vs, nx, nz)) continue;
+            if (cont_sample(&e, nx, nz) < threshold) {
+                vis_insert(&vs, nx, nz);
+                q_push(&q, nx, nz);
+            } else {
+                vis_insert(&vs, nx, nz);
+            }
+        }
+    }
+
+    q_free(&q);
+    free(vs.entries);
+    return cells * 16;
+}

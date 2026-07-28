@@ -348,11 +348,16 @@ static int tiered_translation_chunk(
 {
     if (n <= 0) return 0;
     if (hit_capacity <= 0) return -1;
+    const int debug_stats = debug_translation_stats();
+    float scan_kernel_ms = 0.0f;
+    float estimate_kernel_ms = 0.0f;
     G = cap_o6_grid_size(G, scan_step_2x, translation_period);
     ensure_seed_capacity(n);
     ensure_hit_capacity(hit_capacity);
     if (!g_tier.d_hit_count)
         cudaMalloc(&g_tier.d_hit_count, sizeof(int));
+    if (debug_stats)
+        ensure_timing_events();
 
     cont_batch_init_tiered(seeds, n, 0, g_tier.h_params);
     cont_batch_init_6oct(seeds, n, 0, g_tier.h_verify_params);
@@ -362,9 +367,17 @@ static int tiered_translation_chunk(
                (size_t)n * sizeof(ContVerifyParams), cudaMemcpyHostToDevice);
 
     cudaMemset(g_tier.d_hit_count, 0, sizeof(int));
+    if (debug_stats)
+        cudaEventRecord(g_tier.phase_start);
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, scan_step_2x, o6_threshold,
         1, hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
+    if (debug_stats) {
+        cudaEventRecord(g_tier.kernel_done);
+        cudaEventSynchronize(g_tier.kernel_done);
+        cudaEventElapsedTime(
+            &scan_kernel_ms, g_tier.phase_start, g_tier.kernel_done);
+    }
 
     int raw_count = 0;
     cudaMemcpy(&raw_count, g_tier.d_hit_count, sizeof(int),
@@ -415,9 +428,17 @@ static int tiered_translation_chunk(
     ensure_hit_capacity(translated_count);
     cudaMemcpy(g_tier.d_hits, translated.data(),
                translated.size() * sizeof(int4), cudaMemcpyHostToDevice);
+    if (debug_stats)
+        cudaEventRecord(g_tier.phase_start);
     coarse_verify_r2<<<translated_count, VERIFY_THREADS>>>(
         g_tier.d_verify_params, g_tier.d_hits, translated_count,
         estimate_step_1x, estimate_step_2x, g_tier.d_coarse_results);
+    if (debug_stats) {
+        cudaEventRecord(g_tier.coarse_done);
+        cudaEventSynchronize(g_tier.coarse_done);
+        cudaEventElapsedTime(
+            &estimate_kernel_ms, g_tier.phase_start, g_tier.coarse_done);
+    }
     cudaMemcpy(g_tier.h_coarse_results, g_tier.d_coarse_results,
                translated.size() * sizeof(int4), cudaMemcpyDeviceToHost);
 
@@ -426,9 +447,11 @@ static int tiered_translation_chunk(
     int output_count = 0;
     int clipped_count = 0;
     int64_t max_estimated_area = 0;
+    int64_t region_points = 0;
     for (int i = 0; i < translated_count; i++) {
         const int4 estimate = g_tier.h_coarse_results[i];
         int64_t estimated_area = (int64_t)(estimate.y * cell_area);
+        region_points += estimate.w;
         if (estimate.z != 0)
             clipped_count++;
         if (estimated_area > max_estimated_area)
@@ -437,12 +460,20 @@ static int tiered_translation_chunk(
             continue;
         output_count++;
     }
-    if (debug_translation_stats()) {
+    if (debug_stats) {
+        double estimate_seconds = estimate_kernel_ms / 1000.0;
+        double point_rate = estimate_seconds > 0.0
+            ? region_points / estimate_seconds : 0.0;
+        double perlin_rate = point_rate * CONT_VERIFY_OCTAVES;
         fprintf(stderr,
                 "translation_stats raw=%d expanded=%d clipped=%d "
-                "area_pass=%d max_area=%lld\n",
+                "area_pass=%d max_area=%lld region_points=%lld "
+                "scan_ms=%.3f estimate_ms=%.3f points_s=%.3e "
+                "perlin_s=%.3e\n",
                 raw_count, translated_count, clipped_count, output_count,
-                (long long)max_estimated_area);
+                (long long)max_estimated_area, (long long)region_points,
+                scan_kernel_ms, estimate_kernel_ms,
+                point_rate, perlin_rate);
         fflush(stderr);
     }
     if (output_count > hit_capacity)
