@@ -1,8 +1,12 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -10,8 +14,14 @@
 
 struct IslandRecord {
     int64_t seed;
+    int area;
     int cx;
     int cz;
+};
+
+struct StepResult {
+    int step;
+    std::vector<double> required;
 };
 
 static int64_t read_integer(const std::string& line, const char* key) {
@@ -42,6 +52,7 @@ static std::vector<IslandRecord> load_records(const char* path) {
             continue;
         records.push_back({
             read_integer(line, "seed"),
+            static_cast<int>(read_integer(line, "area")),
             static_cast<int>(read_integer(line, "cx")),
             static_cast<int>(read_integer(line, "cz")),
         });
@@ -49,8 +60,8 @@ static std::vector<IslandRecord> load_records(const char* path) {
     return records;
 }
 
-static bool has_triple(const ContEngine& engine, int cx, int cz,
-                       int step, int radius, double threshold) {
+static double required_threshold(const ContEngine& engine, int cx, int cz,
+                                 int step, int radius) {
     constexpr int grid_size = 512;
     const double spacing_z = step * 0.86602540378443864676;
     const double half_spacing_x = step * 0.5;
@@ -64,7 +75,6 @@ static bool has_triple(const ContEngine& engine, int cx, int cz,
         (cx - origin_x - center_parity * half_spacing_x) / step + 0.5));
     const int width = radius * 2 + 1;
     std::vector<double> values(width * width);
-    std::vector<uint8_t> low(width * width);
 
     for (int row = -radius; row <= radius; ++row) {
         int global_row = center_row + row;
@@ -77,18 +87,16 @@ static bool has_triple(const ContEngine& engine, int cx, int cz,
                 + static_cast<int>(parity * half_spacing_x);
             int index = (row + radius) * width + col + radius;
             values[index] = cont_sample(&engine, x, z);
-            low[index] = values[index] < threshold;
         }
     }
 
+    double best = std::numeric_limits<double>::infinity();
     for (int row = -radius + 1; row < radius; ++row) {
         int parity = (center_row + row) & 1;
         for (int col = -radius + 1; col < radius; ++col) {
             int index = (row + radius) * width + col + radius;
-            if (!low[index])
-                continue;
-
-            int neighbor_count = 0;
+            double lowest = std::numeric_limits<double>::infinity();
+            double second_lowest = std::numeric_limits<double>::infinity();
             const int directions[6][2] = {
                 {0, -1}, {0, 1}, {-1, 0}, {-1, parity ? 1 : -1},
                 {1, 0}, {1, parity ? 1 : -1},
@@ -98,34 +106,192 @@ static bool has_triple(const ContEngine& engine, int cx, int cz,
                 int neighbor_col = col + direction[1];
                 int neighbor_index = (neighbor_row + radius) * width
                     + neighbor_col + radius;
-                neighbor_count += low[neighbor_index] != 0;
+                double value = values[neighbor_index];
+                if (value < lowest) {
+                    second_lowest = lowest;
+                    lowest = value;
+                } else if (value < second_lowest) {
+                    second_lowest = value;
+                }
             }
-            if (neighbor_count >= 2)
-                return true;
+            double candidate = std::max(
+                values[index], std::max(lowest, second_lowest));
+            best = std::min(best, candidate);
         }
     }
-    return false;
+    return best;
+}
+
+static std::vector<double> make_thresholds() {
+    std::vector<double> thresholds;
+    for (int i = 0; i <= 90; ++i)
+        thresholds.push_back(-1.0 + i * 0.01);
+    return thresholds;
+}
+
+static std::vector<int> make_area_minima() {
+    return {4'000'000, 4'500'000, 5'000'000, 5'500'000,
+            6'000'000, 6'500'000, 7'000'000, 7'500'000};
+}
+
+static int count_area(const std::vector<IslandRecord>& records, int area_min) {
+    int count = 0;
+    for (const auto& record : records)
+        count += record.area >= area_min;
+    return count;
+}
+
+static int count_kept(const std::vector<IslandRecord>& records,
+                      const std::vector<double>& required,
+                      int area_min, double threshold) {
+    int count = 0;
+    for (size_t i = 0; i < records.size(); ++i)
+        count += records[i].area >= area_min && required[i] < threshold;
+    return count;
+}
+
+static double retention(const std::vector<IslandRecord>& records,
+                        const std::vector<double>& required,
+                        int area_min, double threshold) {
+    int total = count_area(records, area_min);
+    if (total == 0)
+        return 0.0;
+    return 100.0 * count_kept(records, required, area_min, threshold)
+        / total;
+}
+
+static std::string format_area(int area) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(1)
+           << static_cast<double>(area) / 1'000'000.0 << "M+";
+    return output.str();
+}
+
+static void write_csv(const char* path, const std::vector<IslandRecord>& records,
+                      const std::vector<StepResult>& results,
+                      const std::vector<double>& thresholds,
+                      const std::vector<int>& area_minima) {
+    std::ofstream output(path);
+    if (!output)
+        throw std::runtime_error(std::string("cannot write ") + path);
+    output << "step,threshold,area_min,total,kept,retention_percent\n";
+    output << std::fixed << std::setprecision(6);
+    for (const auto& result : results) {
+        for (double threshold : thresholds) {
+            for (int area_min : area_minima) {
+                int total = count_area(records, area_min);
+                int kept = count_kept(records, result.required,
+                                      area_min, threshold);
+                double percent = total == 0 ? 0.0
+                    : 100.0 * kept / total;
+                output << result.step << ',' << threshold << ',' << area_min
+                       << ',' << total << ',' << kept << ',' << percent
+                       << '\n';
+            }
+        }
+    }
+}
+
+static void write_svg(const char* path, const std::vector<IslandRecord>& records,
+                      const std::vector<StepResult>& results,
+                      const std::vector<double>& thresholds,
+                      const std::vector<int>& area_minima) {
+    constexpr int panel_width = 380;
+    constexpr int panel_height = 280;
+    constexpr int columns = 2;
+    const int rows = static_cast<int>((area_minima.size() + columns - 1)
+                                      / columns);
+    const int width = columns * panel_width;
+    const int height = rows * panel_height + 35;
+    const int plot_x = 48;
+    const int plot_y = 35;
+    const int plot_width = 300;
+    const int plot_height = 190;
+    const char* colors[] = {"#2563eb", "#16a34a", "#dc2626"};
+
+    std::ofstream output(path);
+    if (!output)
+        throw std::runtime_error(std::string("cannot write ") + path);
+    output << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""
+           << width << "\" height=\"" << height
+           << "\" viewBox=\"0 0 " << width << ' ' << height << "\">\n";
+    output << "<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n";
+    output << "<text x=\"20\" y=\"22\" font-family=\"sans-serif\" "
+              "font-size=\"16\" font-weight=\"bold\">O6 triple retention "
+              "by island area</text>\n";
+
+    for (size_t area_index = 0; area_index < area_minima.size(); ++area_index) {
+        int panel_origin_x = static_cast<int>(area_index % columns)
+            * panel_width;
+        int panel_origin_y = static_cast<int>(area_index / columns)
+            * panel_height + 35;
+        int total = count_area(records, area_minima[area_index]);
+        output << "<text x=\"" << panel_origin_x + plot_x
+               << "\" y=\"" << panel_origin_y + 20
+               << "\" font-family=\"sans-serif\" font-size=\"13\">"
+               << format_area(area_minima[area_index]) << " (n=" << total
+               << ")</text>\n";
+        output << "<rect x=\"" << panel_origin_x + plot_x
+               << "\" y=\"" << panel_origin_y + plot_y
+               << "\" width=\"" << plot_width << "\" height=\""
+               << plot_height << "\" fill=\"none\" stroke=\"#888\"/>\n";
+        output << "<text x=\"" << panel_origin_x + plot_x - 30
+               << "\" y=\"" << panel_origin_y + plot_y + 5
+               << "\" font-family=\"sans-serif\" font-size=\"10\">100</text>\n";
+        output << "<text x=\"" << panel_origin_x + plot_x - 20
+               << "\" y=\"" << panel_origin_y + plot_y + plot_height / 2 + 4
+               << "\" font-family=\"sans-serif\" font-size=\"10\">50</text>\n";
+        output << "<text x=\"" << panel_origin_x + plot_x - 14
+               << "\" y=\"" << panel_origin_y + plot_y + plot_height + 4
+               << "\" font-family=\"sans-serif\" font-size=\"10\">0</text>\n";
+
+        for (size_t result_index = 0; result_index < results.size();
+             ++result_index) {
+            const auto& result = results[result_index];
+            output << "<polyline fill=\"none\" stroke=\""
+                   << colors[result_index] << "\" stroke-width=\"2\" points=\"";
+            for (double threshold : thresholds) {
+                double x_fraction = (threshold + 1.0) / 0.9;
+                double y_fraction = retention(
+                    records, result.required, area_minima[area_index],
+                    threshold) / 100.0;
+                double x = panel_origin_x + plot_x + x_fraction * plot_width;
+                double y = panel_origin_y + plot_y
+                    + (1.0 - y_fraction) * plot_height;
+                output << x << ',' << y << ' ';
+            }
+            output << "\"/>\n";
+        }
+    }
+
+    output << "<text x=\"20\" y=\"" << height - 8
+           << "\" font-family=\"sans-serif\" font-size=\"11\">"
+              "Threshold (O6 &lt; x): -1.0 to -0.1</text>\n";
+    output << "<text x=\"760\" y=\"22\" font-family=\"sans-serif\" "
+              "font-size=\"11\" fill=\"#2563eb\">step 500</text>\n";
+    output << "<text x=\"835\" y=\"22\" font-family=\"sans-serif\" "
+              "font-size=\"11\" fill=\"#16a34a\">step 410</text>\n";
+    output << "<text x=\"910\" y=\"22\" font-family=\"sans-serif\" "
+              "font-size=\"11\" fill=\"#dc2626\">step 320</text>\n";
+    output << "</svg>\n";
 }
 
 int main(int argc, char** argv) {
     const char* input_path = argc > 1 ? argv[1] : "gpu/islands_4m.jsonl";
     const int radius = argc > 2 ? std::stoi(argv[2]) : 6;
+    const char* csv_path = argc > 3 ? argv[3] : "gpu/o6_retention.csv";
+    const char* svg_path = argc > 4 ? argv[4] : "gpu/o6_retention.svg";
     const std::vector<int> steps = {500, 410, 320};
-    const std::vector<double> thresholds = {
-        -0.55, -0.50, -0.45, -0.40, -0.35, -0.30, -0.28,
-        -0.26, -0.24, -0.22, -0.20, -0.15, -0.10,
-        -0.60, -0.65, -0.70, -0.75, -0.80, -0.85,
-        -0.90, -0.95, -1.00,
-    };
+    const std::vector<double> thresholds = make_thresholds();
+    const std::vector<int> area_minima = make_area_minima();
 
     try {
         const auto records = load_records(input_path);
-        std::cout << "records=" << records.size()
-                  << " radius_cells=" << radius << "\n";
-
+        std::vector<StepResult> results;
+        results.reserve(steps.size());
         for (int step : steps) {
-            std::vector<std::vector<int>> kept(
-                thresholds.size(), std::vector<int>(1, 0));
+            StepResult result{step, {}};
+            result.required.reserve(records.size());
             for (const auto& record : records) {
                 ContEngine engine;
                 cont_engine_init(&engine,
@@ -133,24 +299,28 @@ int main(int argc, char** argv) {
                 cont_engine_disable_shift(&engine);
                 engine.cont_octA_count = 1;
                 engine.cont_octB_count = 0;
-
-                for (size_t threshold_index = 0;
-                     threshold_index < thresholds.size();
-                     ++threshold_index) {
-                    if (has_triple(engine, record.cx, record.cz, step,
-                                   radius, thresholds[threshold_index]))
-                        ++kept[threshold_index][0];
-                }
+                result.required.push_back(required_threshold(
+                    engine, record.cx, record.cz, step, radius));
             }
+            results.push_back(std::move(result));
+        }
 
-            std::cout << "step=" << step << "\n";
-            for (size_t i = 0; i < thresholds.size(); ++i) {
-                int count = kept[i][0];
-                double percentage = records.empty()
-                    ? 0.0 : 100.0 * count / records.size();
-                std::cout << "  threshold=" << thresholds[i]
-                          << " kept=" << count << "/" << records.size()
-                          << " (" << percentage << "%)\n";
+        write_csv(csv_path, records, results, thresholds, area_minima);
+        write_svg(svg_path, records, results, thresholds, area_minima);
+        std::cout << "records=" << records.size()
+                  << " radius_cells=" << radius << "\n";
+        std::cout << "csv=" << csv_path << "\nsvg=" << svg_path << "\n";
+        for (const auto& result : results) {
+            std::cout << "step=" << result.step << "\n";
+            for (double threshold : {-0.60, -0.50, -0.40, -0.30,
+                                     -0.24, -0.20}) {
+                std::cout << "  threshold=" << threshold;
+                for (int area_min : area_minima) {
+                    std::cout << " " << format_area(area_min) << "="
+                              << retention(records, result.required,
+                                           area_min, threshold) << "%";
+                }
+                std::cout << "\n";
             }
         }
     } catch (const std::exception& error) {
