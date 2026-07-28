@@ -1,0 +1,61 @@
+Mushroom Island Search — Windows launch instructions
+
+The current gpt branch is the O6 translation pipeline. The first GPU tier
+uses O6 only at step 500 and threshold -0.4. Each hit is expanded across
+O6-period translations, screened on the GPU with six octaves at 250-block
+spacing and R=2, then sent to the CPU for six-octave and full flood fill.
+
+1. Open an SSH shell or a Developer Command Prompt on Windows.
+
+2. Fetch the current branch. Run this from the repository root:
+
+    cd /d D:\Code\Seeds
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$vpn = Get-Content .\VPN.txt -Raw; Invoke-Expression $vpn; git fetch origin gpt"
+    git switch -C gpt origin/gpt
+    git reset --hard origin/gpt
+
+3. Build the GPU DLL. Use a fresh shell before calling vcvars64.bat:
+
+    cd /d D:\Code\Seeds
+    call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+    nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o gpu\hunt_engine.dll gpu\hunt_engine.cu gpu\tiered_kernel.cu gpu\coarse_verify_kernel.cu gpu\prefilter_kernel.cu engine\continentalness.c -Iengine -lcudart
+
+4. Run a bounded production test. This processes one prefilter batch and
+   writes final islands to gpu\islands_6m.jsonl:
+
+    cd /d D:\Code\Seeds
+    set HUNT_O6_THRESHOLD=-0.4
+    set HUNT_O6_STEP=500
+    set HUNT_TRANSLATION_PERIOD=131072
+    set HUNT_WORLD_BORDER_PIPELINE=7500000
+    set HUNT_TRANSLATION_ESTIMATE_STEP=250
+    set HUNT_TRANSLATION_ESTIMATE_STEP_2X=500
+    set HUNT_TRANSLATION_ESTIMATE_TARGET=6000000
+    set HUNT_CPU_6OCT_GATE=6000000
+    set HUNT_TARGET_AREA=6000000
+    set HUNT_CPU_WORKERS=28
+    set HUNT_OUTPUT_FILE=gpu\islands_6m.jsonl
+    set HUNT_BEST_FILE=gpu\best_6m.jsonl
+    set HUNT_MAX_PREFILTER_BATCHES=1
+    python gpu\hunt_tiered.py
+
+   Remove HUNT_MAX_PREFILTER_BATCHES for an indefinite search. Use
+   HUNT_START_SEED=0x123456789ABCDEF0 for a deterministic test start.
+   Add HUNT_SCAN_LIMIT to limit the number of prefilter survivors scanned.
+
+5. Inspect outputs:
+
+    type gpu\islands_6m.jsonl
+    type gpu\best_6m.jsonl
+
+6. Build and run the standalone CPU translation sweep. This is separate
+   from the new GPU O6-only production pipeline. It logs each translated
+   island >=5M immediately, including the original island area:
+
+    cd /d D:\Code\Seeds
+    cl /O2 /EHsc /std:c++17 gpu\o6_translation.cpp engine\continentalness.c /Fe:gpu\o6_translation.exe
+    gpu\o6_translation.exe gpu\islands_4m.jsonl gpu\o6_translation_larger_5m_checkpoint.csv 28 -0.95 5000000
+
+   The sweep output is checkpointed after each completed source record.
+   Stop it with Ctrl+C; the existing CSV remains usable. Re-running the
+   command starts a fresh CSV rather than resuming the previous run.
