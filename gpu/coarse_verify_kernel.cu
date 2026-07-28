@@ -13,6 +13,7 @@
 #define VERIFY_GROUPED_MAX_WARPS (VERIFY_GROUPED_MAX_THREADS / 32)
 #define VERIFY_OCTAVE_FREQUENCY_RATIO 1.0181268882172204f
 #define VERIFY_THRESHOLD -1.05f
+#define VERIFY_PERIODIC_O6_FALLBACK_BAND 0.01f
 
 static_assert(VERIFY_ROOT_RADIUS + VERIFY_RADIUS <= VERIFY_GRID_RADIUS,
               "R=2 verifier grid is too small for the root spacing");
@@ -739,7 +740,18 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                 seed_params->cached_d2[1], seed_params->cached_t2[1],
                 (float)sample_x * o15_scale,
                 (float)sample_z * o15_scale);
-            first_low = (first_o6 + o15) * continentalness_scale < threshold;
+            float value = (first_o6 + o15) * continentalness_scale;
+            if (fabsf(value - threshold)
+                    < VERIFY_PERIODIC_O6_FALLBACK_BAND) {
+                float exact_o6 = seed_params->amplitude[0] * verify_perlin(
+                    shared_perm[0], seed_params->offset_a[0],
+                    seed_params->offset_c[0], seed_params->cached_h2[0],
+                    seed_params->cached_d2[0], seed_params->cached_t2[0],
+                    (float)sample_x * seed_params->lacunarity[0],
+                    (float)sample_z * seed_params->lacunarity[0]);
+                value = (exact_o6 + o15) * continentalness_scale;
+            }
+            first_low = value < threshold;
         }
         uint32_t first_mask = __ballot_sync(0xFFFFFFFFu, first_low);
 
@@ -758,7 +770,18 @@ extern "C" __global__ void coarse_verify_r2_2oct_grouped(
                 seed_params->cached_d2[1], seed_params->cached_t2[1],
                 (float)sample_x * o15_scale,
                 (float)sample_z * o15_scale);
-            second_low = (second_o6 + o15) * continentalness_scale < threshold;
+            float value = (second_o6 + o15) * continentalness_scale;
+            if (fabsf(value - threshold)
+                    < VERIFY_PERIODIC_O6_FALLBACK_BAND) {
+                float exact_o6 = seed_params->amplitude[0] * verify_perlin(
+                    shared_perm[0], seed_params->offset_a[0],
+                    seed_params->offset_c[0], seed_params->cached_h2[0],
+                    seed_params->cached_d2[0], seed_params->cached_t2[0],
+                    (float)sample_x * seed_params->lacunarity[0],
+                    (float)sample_z * seed_params->lacunarity[0]);
+                value = (exact_o6 + o15) * continentalness_scale;
+            }
+            second_low = value < threshold;
         }
         uint32_t second_mask = __ballot_sync(0xFFFFFFFFu, second_low);
         unsigned long long low_mask = (unsigned long long)first_mask
