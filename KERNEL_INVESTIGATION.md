@@ -89,6 +89,42 @@ points reaching expensive flood fills. This makes the O6-period lattice a
 credible translation candidate generator, with O15/triplet checks still
 required before full flood.
 
+## Additional Random O6-Period Sweeps
+
+Two additional records were selected reproducibly from `gpu/islands_4m.jsonl`,
+avoiding the largest entries. Each sweep tested all `13,225` O6-period
+translations in the approximately ±30M world range and used the full
+24-octave CPU flood for every nonzero start.
+
+Record A:
+
+- Seed `8670691892054993376`, original area `4,239,760`, logged coordinate
+  `(16800,60276)`.
+- Runtime `59.105s`, or approximately `224` flood starts/s.
+- O6 matched at all positions; maximum absolute difference was `9.781e-14`.
+- Results: `5,176` nonzero, `4,970` >=100K, `1,875` >=1M, `1` >=4M, and
+  `0` >=6M. The only >=4M result was the original island.
+- Largest translated non-origin areas were `3,940,928` at `(30,-18)`,
+  `3,903,536` at `(-55,0)`, and `3,708,400` at `(35,50)`.
+
+Record B:
+
+- Seed `-1599453841358767739`, original area `4,495,680`, logged coordinate
+  `(-69450,-44426)`.
+- Runtime `15.404s`, or approximately `859` flood starts/s.
+- O6 matched at all positions; maximum absolute difference was `4.614e-13`.
+- Results: `1,515` nonzero, `1,442` >=100K, `367` >=1M, `1` >=4M, and
+  `0` >=6M. The only >=4M result was the original island.
+- Largest translated non-origin areas were `3,607,232` at `(0,55)`,
+  `3,539,552` at `(55,55)`, and `3,044,992` at `(31,-5)`.
+
+The large difference in throughput is caused by the number and geometry of
+nonzero components reaching the expensive flood path, not by a change in the
+translation lattice. The two mid-range records produced no additional 4M+
+translated islands, but both produced many 1M--3.9M candidates. This supports
+an O15/triplet screen before full flooding rather than flooding every exact-O6
+translation.
+
 ## Perlin Prefix LUT
 
 Each `perlin_shared` or `perlin_warp` evaluation has seven permutation-pair
