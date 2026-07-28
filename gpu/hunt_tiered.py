@@ -1,6 +1,8 @@
 """hunt_tiered.py — O6 translation hunt with GPU area screening.
 
 The first GPU tier scans a 2x hex grid at 500-block spacing using O6 only.
+Its requested grid size is capped to one open O6 repetition period so the
+same O6 pattern is not rescanned before translation expansion.
 Each triple hit is expanded in native code to all O6-period translations
 inside the configured world border. A second GPU pass evaluates the six
 essential octaves on a 1x R=2 grid at 250-block spacing and sends only
@@ -109,6 +111,16 @@ def _env_flag(name, default=False):
     if value is None:
         return default
     return value.lower() not in ('0', 'false', 'no', 'off')
+
+
+def cap_o6_grid_size(grid_size, step_2x, o6_period):
+    """Cap the sampled span to one open O6 period without duplicate edges."""
+    if grid_size <= 0:
+        raise ValueError('HUNT_GRID_SIZE must be positive')
+    if step_2x <= 0 or o6_period <= 0:
+        return grid_size
+    max_grid = ((o6_period - 1) // step_2x) + 1
+    return min(grid_size, max_grid)
 
 
 def hunt_batch_tiered(start_seed, n, step_2x, G, threshold=-1.0):
@@ -271,7 +283,8 @@ if __name__ == '__main__':
         'HUNT_TRANSLATION_ESTIMATE_TARGET', GPU_ESTIMATE_TARGET_AREA)
     cpu_6oct_gate = _env_int(
         'HUNT_CPU_6OCT_GATE', CPU_6OCT_GATE_AREA)
-    G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
+    requested_G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
+    G = cap_o6_grid_size(requested_G, scan_step_2x, translation_period)
     batch = _env_int('HUNT_BATCH_SIZE', 8192)
     FF_WORKERS = _env_int('HUNT_CPU_WORKERS', CPU_WORKERS)
     MAX_PENDING_VERIFICATIONS = _env_int(
@@ -294,6 +307,10 @@ if __name__ == '__main__':
     print(f'Target: >= {TARGET:,} blocks^2 (final flood)')
     print(f'O6 scan: step={scan_step_2x} threshold<{o6_threshold}')
     print(f'Translations: period={translation_period:,} border={world_border:,}')
+    if G != requested_G:
+        print(f'O6 grid cap: requested G={requested_G}, using G={G} '
+              f'(span={(G - 1) * scan_step_2x:,} < '
+              f'{translation_period:,})')
     print(f'GPU estimate: step={estimate_step_1x} R={GPU_ESTIMATE_RADIUS} '
           f'target>={estimate_target:,}')
     print(f'First-tier grid: {(G-1)*scan_step_2x:,}x'

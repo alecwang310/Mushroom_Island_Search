@@ -97,6 +97,18 @@ static int debug_translation_stats() {
     return value && *value && atoi(value) != 0;
 }
 
+static int cap_o6_grid_size(int grid_size, int step_2x,
+                            int o6_period)
+{
+    if (grid_size <= 0) return 1;
+    if (step_2x <= 0 || o6_period <= 0) return grid_size;
+
+    /* Keep the sampled span strictly inside one open O6 period. */
+    int max_grid = ((o6_period - 1) / step_2x) + 1;
+    if (max_grid < 1) max_grid = 1;
+    return grid_size < max_grid ? grid_size : max_grid;
+}
+
 static void ensure_timing_events() {
     if (g_tier.timing_events_ready) return;
     cudaEventCreate(&g_tier.phase_start);
@@ -336,6 +348,7 @@ static int tiered_translation_chunk(
 {
     if (n <= 0) return 0;
     if (hit_capacity <= 0) return -1;
+    G = cap_o6_grid_size(G, scan_step_2x, translation_period);
     ensure_seed_capacity(n);
     ensure_hit_capacity(hit_capacity);
     if (!g_tier.d_hit_count)
