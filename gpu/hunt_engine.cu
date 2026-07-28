@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <vector>
 
 extern "C" {
 #include "../engine/continentalness.h"
@@ -26,7 +27,7 @@ extern "C" {
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_2x, float threshold,
+    int G, int step_2x, float threshold, int o6_only,
     int hit_capacity, int *hit_count,
     int4 *hits);
 
@@ -159,6 +160,28 @@ static void ensure_prefilter_capacity(int capacity) {
     g_prefilter.survivor_cap = capacity;
 }
 
+static int64_t floor_division(int64_t numerator, int64_t denominator) {
+    int64_t quotient = numerator / denominator;
+    int64_t remainder = numerator % denominator;
+    if (remainder != 0 && ((remainder < 0) != (denominator < 0)))
+        --quotient;
+    return quotient;
+}
+
+static int64_t ceiling_division(int64_t numerator, int64_t denominator) {
+    return -floor_division(-numerator, denominator);
+}
+
+static int translation_min_index(int coordinate, int period, int border) {
+    return (int)ceiling_division(
+        -static_cast<int64_t>(border) - coordinate, period);
+}
+
+static int translation_max_index(int coordinate, int period, int border) {
+    return (int)floor_division(
+        static_cast<int64_t>(border) - coordinate, period);
+}
+
 extern "C" __declspec(dllexport) int prefilter_range(
     uint64_t start_seed, int n, float lo, float hi,
     uint64_t *h_survivors, int survivor_capacity)
@@ -221,6 +244,7 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
 
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, step_2x, threshold,
+        0,
         hit_capacity, g_tier.d_hit_count,
         g_tier.d_hits);
     if (timings) {
@@ -299,6 +323,116 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
     return output_count;
 }
 
+static int tiered_translation_chunk(
+    const uint64_t *seeds, int n, int scan_step_2x, int G,
+    float o6_threshold, int translation_period, int world_border,
+    int estimate_step_1x, int estimate_step_2x,
+    int64_t estimate_min_area, int hit_capacity, int64_t *hit_results)
+{
+    if (n <= 0) return 0;
+    if (hit_capacity <= 0) return -1;
+    ensure_seed_capacity(n);
+    ensure_hit_capacity(hit_capacity);
+    if (!g_tier.d_hit_count)
+        cudaMalloc(&g_tier.d_hit_count, sizeof(int));
+
+    cont_batch_init_tiered(seeds, n, 0, g_tier.h_params);
+    cont_batch_init_6oct(seeds, n, 0, g_tier.h_verify_params);
+    cudaMemcpy(g_tier.d_params, g_tier.h_params,
+               (size_t)n * sizeof(ContTieredParams), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_tier.d_verify_params, g_tier.h_verify_params,
+               (size_t)n * sizeof(ContVerifyParams), cudaMemcpyHostToDevice);
+
+    cudaMemset(g_tier.d_hit_count, 0, sizeof(int));
+    tiered_scan<<<n, THREADS>>>(
+        g_tier.d_params, n, G, scan_step_2x, o6_threshold,
+        1, hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
+
+    int raw_count = 0;
+    cudaMemcpy(&raw_count, g_tier.d_hit_count, sizeof(int),
+               cudaMemcpyDeviceToHost);
+    if (raw_count > hit_capacity)
+        return -raw_count;
+    if (raw_count == 0)
+        return 0;
+
+    cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
+               (size_t)raw_count * sizeof(int4), cudaMemcpyDeviceToHost);
+
+    std::vector<int4> translated;
+    for (int i = 0; i < raw_count; i++) {
+        const int4 hit = g_tier.h_hits[i];
+        int min_dx = translation_min_index(hit.y, translation_period,
+                                           world_border);
+        int max_dx = translation_max_index(hit.y, translation_period,
+                                           world_border);
+        int min_dz = translation_min_index(hit.z, translation_period,
+                                           world_border);
+        int max_dz = translation_max_index(hit.z, translation_period,
+                                           world_border);
+        int64_t count_x = (int64_t)max_dx - min_dx + 1;
+        int64_t count_z = (int64_t)max_dz - min_dz + 1;
+        if (count_x <= 0 || count_z <= 0)
+            continue;
+        translated.reserve(translated.size()
+            + (size_t)(count_x * count_z));
+        for (int dx = min_dx; dx <= max_dx; dx++) {
+            for (int dz = min_dz; dz <= max_dz; dz++) {
+                translated.push_back(make_int4(
+                    hit.x,
+                    (int)((int64_t)hit.y
+                        + (int64_t)dx * translation_period),
+                    (int)((int64_t)hit.z
+                        + (int64_t)dz * translation_period),
+                    hit.w));
+            }
+        }
+    }
+    if (translated.empty())
+        return 0;
+    if (translated.size() > 0x7FFFFFFFu)
+        return -hit_capacity;
+
+    int translated_count = (int)translated.size();
+    ensure_hit_capacity(translated_count);
+    cudaMemcpy(g_tier.d_hits, translated.data(),
+               translated.size() * sizeof(int4), cudaMemcpyHostToDevice);
+    coarse_verify_r2<<<translated_count, VERIFY_THREADS>>>(
+        g_tier.d_verify_params, g_tier.d_hits, translated_count,
+        estimate_step_1x, estimate_step_2x, g_tier.d_coarse_results);
+    cudaMemcpy(g_tier.h_coarse_results, g_tier.d_coarse_results,
+               translated.size() * sizeof(int4), cudaMemcpyDeviceToHost);
+
+    const double cell_area = (double)estimate_step_1x * estimate_step_1x
+        * 0.8660254037844386 * 16.0;
+    int output_count = 0;
+    for (int i = 0; i < translated_count; i++) {
+        const int4 estimate = g_tier.h_coarse_results[i];
+        int64_t estimated_area = (int64_t)(estimate.y * cell_area);
+        if (estimate.z == 0 && estimated_area < estimate_min_area)
+            continue;
+        output_count++;
+    }
+    if (output_count > hit_capacity)
+        return -output_count;
+
+    output_count = 0;
+    for (int i = 0; i < translated_count; i++) {
+        const int4 estimate = g_tier.h_coarse_results[i];
+        int64_t estimated_area = (int64_t)(estimate.y * cell_area);
+        if (estimate.z == 0 && estimated_area < estimate_min_area)
+            continue;
+        const int4 hit = translated[i];
+        int seed_idx = hit.x;
+        hit_results[output_count * 4] = (int64_t)seeds[seed_idx];
+        hit_results[output_count * 4 + 1] = (int64_t)hit.y;
+        hit_results[output_count * 4 + 2] = (int64_t)hit.z;
+        hit_results[output_count * 4 + 3] = (int64_t)hit.w;
+        output_count++;
+    }
+    return output_count;
+}
+
 extern "C" __declspec(dllexport) int hunt_batch_tiered(
     uint64_t start_seed, int n, int step_2x, int G, float threshold,
     int hit_capacity, int64_t *hit_results)
@@ -318,6 +452,37 @@ extern "C" __declspec(dllexport) int tiered_scan_mem(
     if (n > TIER_CHUNK) return -1;
     return tiered_chunk(
         seeds, n, step_2x, G, threshold, hit_capacity, hit_results, nullptr);
+}
+
+extern "C" __declspec(dllexport) int tiered_scan_mem_translated(
+    const uint64_t *seeds, int n, int scan_step_2x, int G,
+    float o6_threshold, int translation_period, int world_border,
+    int estimate_step_1x, int estimate_step_2x,
+    int64_t estimate_min_area, int hit_capacity, int64_t *hit_results)
+{
+    if (n > TIER_CHUNK) return -1;
+    return tiered_translation_chunk(
+        seeds, n, scan_step_2x, G, o6_threshold,
+        translation_period, world_border,
+        estimate_step_1x, estimate_step_2x, estimate_min_area,
+        hit_capacity, hit_results);
+}
+
+extern "C" __declspec(dllexport) int hunt_batch_tiered_translated(
+    uint64_t start_seed, int n, int scan_step_2x, int G,
+    float o6_threshold, int translation_period, int world_border,
+    int estimate_step_1x, int estimate_step_2x,
+    int64_t estimate_min_area, int hit_capacity, int64_t *hit_results)
+{
+    uint64_t *seeds = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
+    for (int i = 0; i < n; i++) seeds[i] = start_seed + (uint64_t)i;
+    int total = tiered_translation_chunk(
+        seeds, n, scan_step_2x, G, o6_threshold,
+        translation_period, world_border,
+        estimate_step_1x, estimate_step_2x, estimate_min_area,
+        hit_capacity, hit_results);
+    free(seeds);
+    return total;
 }
 
 extern "C" __declspec(dllexport) int tiered_scan_mem_profiled(

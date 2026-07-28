@@ -1,17 +1,11 @@
-"""hunt_tiered.py — Hex grid GPU prefilter/coarse verify + CPU flood fill.
+"""hunt_tiered.py — O6 translation hunt with GPU area screening.
 
-GPU: hex grid (staggered rows, 500-block spacing), only O6+O15 octaves,
-     threshold -1.0, 3-connected hit detection. ~20K seeds/s.
-     Optional pre-filter: GPU LUT-variance filter generates a consecutive
-     seed range on-device and returns only compacted survivors.
-
-GPU: a separate six-octave R=2, 1x hex screen at 250-block spacing removes
-     small first-layer hits before host download.
-
-CPU: a cached 0.5x hex lookup samples the connected low-cell component
-     touching the three coarse hit points; only probable >=6M islands reach
-     the six-octave flood and then the full flood.
-     Logs >=4M block^2 islands to islands_4m.jsonl.
+The first GPU tier scans a 2x hex grid at 500-block spacing using O6 only.
+Each triple hit is expanded in native code to all O6-period translations
+inside the configured world border. A second GPU pass evaluates the six
+essential octaves on a 1x R=2 grid at 250-block spacing and sends only
+estimated >=6M candidates to the CPU. The CPU runs the six-octave flood and,
+when that gate passes, the full 24-octave flood.
 """
 import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +37,24 @@ _hunt.tiered_scan_mem.argtypes = [
 ]
 _hunt.tiered_scan_mem.restype = ctypes.c_int
 
+_hunt.tiered_scan_mem_translated.argtypes = [
+    ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_float,
+    ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+    ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+]
+_hunt.tiered_scan_mem_translated.restype = ctypes.c_int
+
+_hunt.hunt_batch_tiered_translated.argtypes = [
+    ctypes.c_uint64, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_float,
+    ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+    ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+]
+_hunt.hunt_batch_tiered_translated.restype = ctypes.c_int
+
 _hunt.tiered_scan_mem_profiled.argtypes = [
     ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int,
@@ -55,10 +67,21 @@ _hunt.hunt_cleanup.argtypes = []
 _hunt.hunt_cleanup.restype = None
 
 INITIAL_HIT_CAP = 65_536
-ESTIMATE_TARGET_AREA = int(
-    os.environ.get('HUNT_ESTIMATE_TARGET', '6000000'))
-GPU_COARSE_MIN_AREA = int(
-    os.environ.get('HUNT_GPU_COARSE_MIN_AREA', '6000000'))
+
+O6_THRESHOLD = -0.4
+O6_STEP_2X = 500
+GPU_GRID_SIZE = 512
+O6_TRANSLATION_PERIOD = 512 * 256
+WORLD_BORDER_PIPELINE = 7_500_000
+GPU_ESTIMATE_STEP_1X = 250
+GPU_ESTIMATE_STEP_2X = 500
+GPU_ESTIMATE_RADIUS = 2
+GPU_ESTIMATE_TARGET_AREA = 6_000_000
+CPU_6OCT_GATE_AREA = 6_000_000
+FINAL_TARGET_AREA = 6_000_000
+CPU_WORKERS = 28
+OUTPUT_FILE = 'islands_6m.jsonl'
+BEST_FILE = 'best_6m.jsonl'
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -104,6 +127,29 @@ def hunt_batch_tiered(start_seed, n, step_2x, G, threshold=-1.0):
             for i in range(hc)]
 
 
+def hunt_batch_tiered_translated(
+        start_seed, n, scan_step_2x, G, o6_threshold,
+        translation_period, world_border,
+        estimate_step_1x, estimate_step_2x, estimate_target_area):
+    hit_capacity = INITIAL_HIT_CAP
+    while True:
+        results = (ctypes.c_int64 * (hit_capacity * 4))()
+        hc = _hunt.hunt_batch_tiered_translated(
+            ctypes.c_uint64(start_seed), ctypes.c_int(n),
+            ctypes.c_int(scan_step_2x), ctypes.c_int(G),
+            ctypes.c_float(o6_threshold),
+            ctypes.c_int(translation_period), ctypes.c_int(world_border),
+            ctypes.c_int(estimate_step_1x), ctypes.c_int(estimate_step_2x),
+            ctypes.c_int64(estimate_target_area),
+            ctypes.c_int(hit_capacity), results)
+        if hc >= 0:
+            break
+        hit_capacity = -hc
+    return [(int(results[i * 4]), int(results[i * 4 + 1]),
+             int(results[i * 4 + 2]), int(results[i * 4 + 3]))
+            for i in range(hc)]
+
+
 def prefilter_range(start_seed, n, lo, hi, survivors):
     """Run the band-pass prefilter on a consecutive seed range."""
     return _hunt.prefilter_range(
@@ -114,10 +160,12 @@ def prefilter_range(start_seed, n, lo, hi, survivors):
 
 CHUNK = 8192
 
-def scan_survivors_stream(seeds, n, step_2x, G, threshold,
-                          submit_verification, step_05x, s2x,
-                          profile_stats=None):
-    """Scan compacted survivors in chunks and submit hits immediately."""
+def scan_survivors_stream(
+        seeds, n, scan_step_2x, G, o6_threshold,
+        translation_period, world_border,
+        estimate_step_1x, estimate_step_2x, estimate_target_area,
+        submit_verification, profile_stats=None):
+    """Scan survivors and submit GPU translation estimates immediately."""
     if n == 0:
         return 0
 
@@ -130,15 +178,23 @@ def scan_survivors_stream(seeds, n, step_2x, G, threshold,
             ctypes.byref(seeds, off * ctypes.sizeof(ctypes.c_uint64)),
             ctypes.POINTER(ctypes.c_uint64))
         call_started = time.perf_counter()
-        hc = _hunt.tiered_scan_mem(
-            ptr, sz, step_2x, G, ctypes.c_float(threshold),
-            hit_capacity, results)
+        hc = _hunt.tiered_scan_mem_translated(
+            ptr, sz, ctypes.c_int(scan_step_2x), ctypes.c_int(G),
+            ctypes.c_float(o6_threshold),
+            ctypes.c_int(translation_period), ctypes.c_int(world_border),
+            ctypes.c_int(estimate_step_1x), ctypes.c_int(estimate_step_2x),
+            ctypes.c_int64(estimate_target_area),
+            ctypes.c_int(hit_capacity), results)
         if hc < 0:
             hit_capacity = -hc
             results = (ctypes.c_int64 * (hit_capacity * 4))()
-            hc = _hunt.tiered_scan_mem(
-                ptr, sz, step_2x, G, ctypes.c_float(threshold),
-                hit_capacity, results)
+            hc = _hunt.tiered_scan_mem_translated(
+                ptr, sz, ctypes.c_int(scan_step_2x), ctypes.c_int(G),
+                ctypes.c_float(o6_threshold),
+                ctypes.c_int(translation_period), ctypes.c_int(world_border),
+                ctypes.c_int(estimate_step_1x), ctypes.c_int(estimate_step_2x),
+                ctypes.c_int64(estimate_target_area),
+                ctypes.c_int(hit_capacity), results)
         if hc < 0:
             raise RuntimeError(f'tiered scan overflow retry failed: {-hc} hits')
         if profile_stats is not None:
@@ -155,7 +211,7 @@ def scan_survivors_stream(seeds, n, step_2x, G, threshold,
             gz = int(results[hit_offset + 2])
             geometry_code = int(results[hit_offset + 3])
             if not submit_verification(
-                    seed, gx, gz, geometry_code, step_05x, s2x):
+                    seed, gx, gz, geometry_code):
                 keep_scanning = False
                 break
         if profile_stats is not None:
@@ -165,13 +221,6 @@ def scan_survivors_stream(seeds, n, step_2x, G, threshold,
         if not keep_scanning:
             return total_hits
     return total_hits
-
-
-def estimate_triple_area(seed, gx, gz, geometry_code, step_05x, step_2x):
-    return _eng._lib.cont_estimate_triple_area(
-        ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
-        ctypes.c_int(gx), ctypes.c_int(gz), ctypes.c_int(geometry_code),
-        ctypes.c_int(step_05x), ctypes.c_int(step_2x))
 
 
 def flood_fill_6oct(seed, cx, cz):
@@ -188,38 +237,43 @@ def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
     return {'seed': seed, 'area': area, 'cx': cx, 'cz': cz}
 
 
-def verify_and_flood(seed, gx, gz, geometry_code, step_05x, step_2x):
-    t0 = time.perf_counter()
-    estimated_area = estimate_triple_area(
-        seed, gx, gz, geometry_code, step_05x, step_2x)
-    t_vfy = time.perf_counter() - t0
-    if estimated_area < ESTIMATE_TARGET_AREA:
-        return (False, None, t_vfy, 0)
+def verify_and_flood(seed, gx, gz, cpu_6oct_gate):
     t0 = time.perf_counter()
     area_6 = flood_fill_6oct(seed, gx, gz)
-    if area_6 < 3_000_000: return (True, None, t_vfy, time.perf_counter() - t0)
-    t1 = time.perf_counter()
+    t_6oct = time.perf_counter() - t0
+    if area_6 < cpu_6oct_gate:
+        return (False, None, t_6oct, 0)
+    t0 = time.perf_counter()
     ff = flood_fill_full(seed, gx, gz)
-    return (True, ff, t_vfy, (t1 - t0) + (time.perf_counter() - t1))
+    return (True, ff, t_6oct, time.perf_counter() - t0)
 
 
-def verify_and_flood_profiled(submitted_at, seed, gx, gz, geometry_code,
-                              step_05x, step_2x):
+def verify_and_flood_profiled(submitted_at, seed, gx, gz, cpu_6oct_gate):
     started_at = time.perf_counter()
-    result = verify_and_flood(
-        seed, gx, gz, geometry_code, step_05x, step_2x)
+    result = verify_and_flood(seed, gx, gz, cpu_6oct_gate)
     finished_at = time.perf_counter()
     return (*result, started_at - submitted_at, finished_at - started_at)
 
 
 if __name__ == '__main__':
-    TARGET = _env_int('HUNT_TARGET_AREA', 4_000_000)
-    step_05x = _env_int('HUNT_STEP_05X', 125)
-    step_2x = _env_int('HUNT_STEP_2X', 500)
-    G = _env_int('HUNT_GRID_SIZE', 512)
+    TARGET = _env_int('HUNT_TARGET_AREA', FINAL_TARGET_AREA)
+    scan_step_2x = _env_int('HUNT_O6_STEP', O6_STEP_2X)
+    o6_threshold = _env_float('HUNT_O6_THRESHOLD', O6_THRESHOLD)
+    translation_period = _env_int(
+        'HUNT_TRANSLATION_PERIOD', O6_TRANSLATION_PERIOD)
+    world_border = _env_int(
+        'HUNT_WORLD_BORDER_PIPELINE', WORLD_BORDER_PIPELINE)
+    estimate_step_1x = _env_int(
+        'HUNT_TRANSLATION_ESTIMATE_STEP', GPU_ESTIMATE_STEP_1X)
+    estimate_step_2x = _env_int(
+        'HUNT_TRANSLATION_ESTIMATE_STEP_2X', GPU_ESTIMATE_STEP_2X)
+    estimate_target = _env_int(
+        'HUNT_TRANSLATION_ESTIMATE_TARGET', GPU_ESTIMATE_TARGET_AREA)
+    cpu_6oct_gate = _env_int(
+        'HUNT_CPU_6OCT_GATE', CPU_6OCT_GATE_AREA)
+    G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
     batch = _env_int('HUNT_BATCH_SIZE', 8192)
-    THRESHOLD = _env_float('HUNT_THRESHOLD', -0.95)
-    FF_WORKERS = _env_int('HUNT_CPU_WORKERS', 24)
+    FF_WORKERS = _env_int('HUNT_CPU_WORKERS', CPU_WORKERS)
     MAX_PENDING_VERIFICATIONS = _env_int(
         'HUNT_MAX_PENDING', max(2048, FF_WORKERS * 2))
     pref_batch = _env_int('HUNT_PREF_BATCH', PREF_BATCH)
@@ -228,20 +282,29 @@ if __name__ == '__main__':
     scan_limit = _env_int('HUNT_SCAN_LIMIT', 0)
     max_prefilter_batches = _env_int('HUNT_MAX_PREFILTER_BATCHES', 0)
     profile_stages = _env_flag('HUNT_PROFILE_STAGES')
+    output_file = os.environ.get('HUNT_OUTPUT_FILE', OUTPUT_FILE)
+    best_file = os.environ.get('HUNT_BEST_FILE', BEST_FILE)
     fixed_start_value = os.environ.get('HUNT_START_SEED')
     fixed_start = int(fixed_start_value, 0) if fixed_start_value else None
+    if GPU_ESTIMATE_RADIUS != 2:
+        raise ValueError('the current CUDA translation estimator requires R=2')
+    if estimate_step_2x != estimate_step_1x * 2:
+        raise ValueError('GPU estimate step_2x must equal 2 * step_1x')
 
     print(f'Target: >= {TARGET:,} blocks^2 (final flood)')
-    print(f'GPU coarse gate: >= {GPU_COARSE_MIN_AREA:,} estimated blocks^2')
-    print(f'step_05x={step_05x}  step_2x={step_2x}  G={G}  threshold={THRESHOLD}  batch={batch}')
-    print(f'Coarse grid: {(G-1)*step_2x:,}x{(G-1)*step_2x:,} blocks at 1:1')
+    print(f'O6 scan: step={scan_step_2x} threshold<{o6_threshold}')
+    print(f'Translations: period={translation_period:,} border={world_border:,}')
+    print(f'GPU estimate: step={estimate_step_1x} R={GPU_ESTIMATE_RADIUS} '
+          f'target>={estimate_target:,}')
+    print(f'First-tier grid: {(G-1)*scan_step_2x:,}x'
+          f'{(G-1)*scan_step_2x:,} pipeline blocks')
     if PREFT_ENABLED:
         print(f'Pre-filter: ON  band=[{PREFT_LO:.5f}, {PREFT_HI:.5f}]  '
               f'(p99.15-p99.25, {pref_batch//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print('GPU: hex grid + connected triple + R=2 coarse area screen.')
-    print('CPU: 0.5x area estimate + flood fill.')
+    print('GPU: O6 triple scan -> translated six-octave R=2 estimate.')
+    print(f'CPU: six-octave gate >= {cpu_6oct_gate:,} -> full flood.')
     print()
 
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
@@ -249,6 +312,7 @@ if __name__ == '__main__':
     scanned, tiered_scanned, hits_gpu, hits_estimated, hits_ok, hits_big = 0, 0, 0, 0, 0, 0
     t_gpu, t_vfy, t_ff = 0.0, 0.0, 0.0
     seen = set()
+    submitted = set()
     lock = threading.Lock()
     profile_lock = threading.Lock()
     pending = threading.BoundedSemaphore(MAX_PENDING_VERIFICATIONS)
@@ -302,13 +366,13 @@ if __name__ == '__main__':
             seen.add(key)
             hits_big += 1
             entry = {'seed': r['seed'], 'area': r['area'], 'cx': r['cx'], 'cz': r['cz']}
-            with open('islands_4m.jsonl', 'a') as f:
+            with open(output_file, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
             print(f'\n  BIG ({r["area"]:,}): seed {r["seed"]} at ({r["cx"]},{r["cz"]})')
             if best is None or r['area'] > best['area']:
                 best = r
                 print(f'  *** NEW BEST: {r["seed"]}, {r["area"]:,} ***')
-                with open('best_4m.jsonl', 'w') as f:
+                with open(best_file, 'w') as f:
                     json.dump(entry, f)
 
     def on_done_releasing(future):
@@ -317,7 +381,13 @@ if __name__ == '__main__':
         finally:
             pending.release()
 
-    def submit_verification(seed, gx, gz, geometry_code, step05x, step2x):
+    def submit_verification(seed, gx, gz, geometry_code):
+        del geometry_code
+        with lock:
+            key = (seed, gx, gz)
+            if key in submitted:
+                return True
+            submitted.add(key)
         wait_started = time.perf_counter()
         acquired = pending.acquire(blocking=False)
         if not acquired:
@@ -337,11 +407,11 @@ if __name__ == '__main__':
             if profile_stages:
                 future = pool.submit(
                     verify_and_flood_profiled, submitted_at,
-                    seed, gx, gz, geometry_code, step05x, step2x)
+                    seed, gx, gz, cpu_6oct_gate)
             else:
                 future = pool.submit(
                     verify_and_flood,
-                    seed, gx, gz, geometry_code, step05x, step2x)
+                    seed, gx, gz, cpu_6oct_gate)
             future.add_done_callback(on_done_releasing)
             if profile_stages:
                 stage_profile['pool_submit_seconds'] += (
@@ -390,8 +460,10 @@ if __name__ == '__main__':
 
                 n_scan = min(n_pass, scan_limit) if scan_limit else n_pass
                 hc = scan_survivors_stream(
-                    survivors, n_scan, step_2x, G, THRESHOLD,
-                    submit_verification, step_05x, step_2x, stage_profile)
+                    survivors, n_scan, scan_step_2x, G, o6_threshold,
+                    translation_period, world_border,
+                    estimate_step_1x, estimate_step_2x, estimate_target,
+                    submit_verification, stage_profile)
                 t_end = time.perf_counter()
                 with lock:
                     hits_gpu += hc
@@ -401,18 +473,23 @@ if __name__ == '__main__':
                 t_scan_time = t_end - t_pref
                 print(f'\n  batch {batch_num}: prefilter {pref_batch//1_000_000}M -> {n_pass:,} survivors '
                       f'({t_total:.1f}s: pref {t_pref-t1:.2f}s)')
-                print(f'    tiered+coarse: {n_scan:,} seeds in {t_scan_time:.1f}s = {n_scan/t_scan_time:,.0f} seeds/s, {hc} coarse candidates')
+                print(f'    tiered+translation GPU: {n_scan:,} seeds in '
+                      f'{t_scan_time:.1f}s = '
+                      f'{n_scan/t_scan_time:,.0f} seeds/s, '
+                      f'{hc} GPU estimates')
                 if max_prefilter_batches and batch_num >= max_prefilter_batches:
                     running = False
             else:
-                hits = hunt_batch_tiered(start, batch, step_2x, G, THRESHOLD)
+                hits = hunt_batch_tiered_translated(
+                    start, batch, scan_step_2x, G, o6_threshold,
+                    translation_period, world_border,
+                    estimate_step_1x, estimate_step_2x, estimate_target)
                 with lock:
                     scanned += batch
                     tiered_scanned += batch
                     hits_gpu += len(hits)
                 for seed, gx, gz, geometry_code in hits:
-                    submit_verification(
-                        seed, gx, gz, geometry_code, step_05x, step_2x)
+                    submit_verification(seed, gx, gz, geometry_code)
 
     gpu_t = threading.Thread(target=gpu_thread, daemon=True)
     gpu_t.start()
@@ -470,6 +547,8 @@ if __name__ == '__main__':
 
     elapsed = time.perf_counter() - t0
     print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
-    print(f'{hits_gpu} GPU coarse candidates -> {hits_estimated} CPU estimates passed -> {hits_big} big (>= {TARGET:,})')
+    print(f'{hits_gpu} GPU translation estimates -> '
+          f'{hits_estimated} six-octave gates passed -> '
+          f'{hits_big} final islands (>= {TARGET:,})')
     if best:
         print(f'BEST: seed {best["seed"]}, {best["area"]:,} at ({best["cx"]},{best["cz"]})')
