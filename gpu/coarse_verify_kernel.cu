@@ -9,6 +9,8 @@
 #define VERIFY_GRID_RADIUS 4
 #define VERIFY_GRID_SIDE (VERIFY_GRID_RADIUS * 2 + 1)
 #define VERIFY_GRID_CELLS (VERIFY_GRID_SIDE * VERIFY_GRID_SIDE)
+#define VERIFY_GROUPED_MAX_THREADS 256
+#define VERIFY_GROUPED_MAX_WARPS (VERIFY_GROUPED_MAX_THREADS / 32)
 #define VERIFY_OCTAVE_FREQUENCY_RATIO 1.0181268882172204f
 #define VERIFY_THRESHOLD -1.05f
 
@@ -201,6 +203,40 @@ __device__ __forceinline__ float verify_six_octaves(
     return value * params->cont_dbl_amp;
 }
 
+__device__ __forceinline__ float verify_two_octaves(
+    const ContTieredParams *params,
+    const uint32_t shared_perm[CONT_TIERED_OCTAVES][CONT_TIERED_PERM_SIZE],
+    float sample_x, float sample_z)
+{
+    float value = params->amplitude[0] * verify_perlin(
+        shared_perm[0], params->offset_a[0], params->offset_c[0],
+        params->cached_h2[0], params->cached_d2[0], params->cached_t2[0],
+        sample_x * params->lacunarity[0],
+        sample_z * params->lacunarity[0]);
+    value += params->amplitude[1] * verify_perlin(
+        shared_perm[1], params->offset_a[1], params->offset_c[1],
+        params->cached_h2[1], params->cached_d2[1], params->cached_t2[1],
+        sample_x * params->lacunarity[1] * VERIFY_OCTAVE_FREQUENCY_RATIO,
+        sample_z * params->lacunarity[1] * VERIFY_OCTAVE_FREQUENCY_RATIO);
+    return value * params->cont_dbl_amp;
+}
+
+__device__ __forceinline__ long long verify_floor_division(
+    long long numerator, long long denominator)
+{
+    long long quotient = numerator / denominator;
+    long long remainder = numerator % denominator;
+    if (remainder != 0 && ((remainder < 0) != (denominator < 0)))
+        quotient--;
+    return quotient;
+}
+
+__device__ __forceinline__ long long verify_ceiling_division(
+    long long numerator, long long denominator)
+{
+    return -verify_floor_division(-numerator, denominator);
+}
+
 extern "C" __global__ void coarse_verify_r2(
     const ContVerifyParams *params,
     const int4 *hits,
@@ -349,5 +385,379 @@ extern "C" __global__ void coarse_verify_r2(
 
         results[hit_index] = make_int4(
             hit.x, connected_count, clipped, region_count);
+    }
+}
+
+extern "C" __global__ void coarse_verify_r2_2oct(
+    const ContTieredParams *params,
+    const int4 *hits,
+    int hit_count,
+    int step_1x,
+    int step_2x,
+    float threshold,
+    int4 *results)
+{
+    int hit_index = blockIdx.x;
+    if (hit_index >= hit_count) return;
+
+    const int4 hit = hits[hit_index];
+    if (step_1x <= 0 || step_2x != step_1x * 2) {
+        if (threadIdx.x == 0)
+            results[hit_index] = make_int4(hit.x, 0, 1, 0);
+        return;
+    }
+    const ContTieredParams *seed_params = params + hit.x;
+    __shared__ uint32_t shared_perm[
+        CONT_TIERED_OCTAVES][CONT_TIERED_PERM_SIZE];
+    __shared__ uint8_t region[VERIFY_GRID_CELLS];
+    __shared__ uint8_t low[VERIFY_GRID_CELLS];
+    __shared__ uint8_t visited[VERIFY_GRID_CELLS];
+    __shared__ int queue[VERIFY_GRID_CELLS];
+    __shared__ int root_x[3];
+    __shared__ int root_row[3];
+    __shared__ int direction_count;
+
+    int thread_id = threadIdx.x;
+    for (int perm_index = thread_id;
+         perm_index < CONT_TIERED_PERM_SIZE;
+         perm_index += blockDim.x) {
+        for (int octave = 0; octave < CONT_TIERED_OCTAVES; octave++) {
+            uint8_t first = seed_params->perm[octave][perm_index];
+            uint8_t second = seed_params->perm[octave]
+                [(perm_index + 1) & 0xFF];
+            shared_perm[octave][perm_index] = (uint32_t)first
+                | ((uint32_t)second << 8);
+        }
+    }
+
+    if (thread_id == 0) {
+        int pair_mask = hit.w & 0x3F;
+        direction_count = 0;
+        root_x[0] = 0;
+        root_row[0] = 0;
+        for (int direction = 0; direction < 6; direction++) {
+            if ((pair_mask & (1 << direction)) == 0) continue;
+            if (direction_count >= 2) continue;
+            verify_root(direction, (hit.w >> 6) & 1,
+                        step_1x, step_2x,
+                        root_x[direction_count + 1],
+                        root_row[direction_count + 1]);
+            direction_count++;
+        }
+    }
+    __syncthreads();
+
+    if (thread_id < VERIFY_GRID_CELLS) {
+        int axial_x = thread_id / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+        int row_delta = thread_id % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+        bool in_region = false;
+        for (int root = 0; root < 3; root++) {
+            if (root < direction_count + 1
+                    && verify_hex_distance(
+                        axial_x - root_x[root],
+                        row_delta - root_row[root]) <= VERIFY_RADIUS) {
+                in_region = true;
+            }
+        }
+        region[thread_id] = in_region ? 1 : 0;
+        if (!in_region) {
+            low[thread_id] = 0;
+        } else {
+            int row_parity = (hit.w >> 6) & 1;
+            int sample_x = hit.y + verify_lattice_x(
+                step_1x, row_parity, axial_x, row_delta);
+            int sample_z = hit.z + __float2int_rz(
+                (float)row_delta * 0.8660254037844386f * step_1x);
+            float value = verify_two_octaves(
+                seed_params, shared_perm,
+                (float)sample_x, (float)sample_z);
+            low[thread_id] = value < threshold ? 1 : 0;
+        }
+        visited[thread_id] = 0;
+    }
+    __syncthreads();
+
+    if (thread_id == 0) {
+        int queue_head = 0;
+        int queue_tail = 0;
+        int connected_count = 0;
+        int region_count = 0;
+        for (int index = 0; index < VERIFY_GRID_CELLS; index++)
+            region_count += region[index] != 0;
+
+        for (int root = 0; root < 3; root++) {
+            if (root >= direction_count + 1) continue;
+            int root_index = verify_grid_index(root_x[root], root_row[root]);
+            if (!verify_in_bounds(root_x[root], root_row[root])) continue;
+            if (region[root_index] && low[root_index]
+                    && !visited[root_index]) {
+                visited[root_index] = 1;
+                queue[queue_tail++] = root_index;
+            }
+        }
+
+        const int neighbor_x[6] = {-1, 1, 0, 0, -1, 1};
+        const int neighbor_row[6] = {0, 0, -1, 1, 1, -1};
+        while (queue_head < queue_tail) {
+            int index = queue[queue_head++];
+            int axial_x = index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int row_delta = index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            connected_count++;
+            for (int direction = 0; direction < 6; direction++) {
+                int next_x = axial_x + neighbor_x[direction];
+                int next_row = row_delta + neighbor_row[direction];
+                if (!verify_in_bounds(next_x, next_row)) continue;
+                int next_index = verify_grid_index(next_x, next_row);
+                if (region[next_index] && low[next_index]
+                        && !visited[next_index]) {
+                    visited[next_index] = 1;
+                    queue[queue_tail++] = next_index;
+                }
+            }
+        }
+
+        int clipped = 0;
+        for (int index = 0; index < VERIFY_GRID_CELLS; index++) {
+            if (!visited[index]) continue;
+            int axial_x = index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int row_delta = index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int nearest_root_distance = VERIFY_GRID_RADIUS + 1;
+            for (int root = 0; root < 3; root++) {
+                if (root >= direction_count + 1) continue;
+                int distance = verify_hex_distance(
+                    axial_x - root_x[root], row_delta - root_row[root]);
+                if (distance < nearest_root_distance)
+                    nearest_root_distance = distance;
+            }
+            if (nearest_root_distance == VERIFY_RADIUS)
+                clipped = 1;
+        }
+
+        results[hit_index] = make_int4(
+            hit.x, connected_count, clipped, region_count);
+    }
+}
+
+extern "C" __global__ void coarse_verify_r2_2oct_grouped(
+    const ContTieredParams *params,
+    const int4 *raw_hits,
+    int raw_hit_count,
+    int translation_period,
+    int world_border,
+    int step_1x,
+    int step_2x,
+    float threshold,
+    int minimum_connected_cells,
+    int output_capacity,
+    int *output_count,
+    int4 *output_hits,
+    unsigned long long *debug_stats)
+{
+    int raw_hit_index = blockIdx.x;
+    if (raw_hit_index >= raw_hit_count) return;
+    if (step_1x <= 0 || step_2x != step_1x * 2) return;
+
+    const int4 hit = raw_hits[raw_hit_index];
+    const ContTieredParams *seed_params = params + hit.x;
+    int thread_id = threadIdx.x;
+    int lane = thread_id & 31;
+    int warp = thread_id >> 5;
+    int warp_count = blockDim.x >> 5;
+
+    __shared__ uint32_t shared_perm[
+        CONT_TIERED_OCTAVES][CONT_TIERED_PERM_SIZE];
+    __shared__ uint8_t region[VERIFY_GRID_CELLS];
+    __shared__ uint8_t region_cells[VERIFY_GRID_CELLS];
+    __shared__ uint8_t low[
+        VERIFY_GROUPED_MAX_WARPS][VERIFY_GRID_CELLS];
+    __shared__ uint8_t visited[
+        VERIFY_GROUPED_MAX_WARPS][VERIFY_GRID_CELLS];
+    __shared__ uint8_t queue[
+        VERIFY_GROUPED_MAX_WARPS][VERIFY_GRID_CELLS];
+    __shared__ int root_x[3];
+    __shared__ int root_row[3];
+    __shared__ int root_index[3];
+    __shared__ int direction_count;
+    __shared__ int region_count;
+    __shared__ unsigned int warp_clipped[VERIFY_GROUPED_MAX_WARPS];
+    __shared__ unsigned int warp_max_connected[VERIFY_GROUPED_MAX_WARPS];
+
+    for (int perm_index = thread_id;
+         perm_index < CONT_TIERED_PERM_SIZE;
+         perm_index += blockDim.x) {
+        for (int octave = 0; octave < CONT_TIERED_OCTAVES; octave++) {
+            uint8_t first = seed_params->perm[octave][perm_index];
+            uint8_t second = seed_params->perm[octave]
+                [(perm_index + 1) & 0xFF];
+            shared_perm[octave][perm_index] = (uint32_t)first
+                | ((uint32_t)second << 8);
+        }
+    }
+
+    if (thread_id == 0) {
+        int pair_mask = hit.w & 0x3F;
+        direction_count = 0;
+        root_x[0] = 0;
+        root_row[0] = 0;
+        for (int direction = 0; direction < 6; direction++) {
+            if ((pair_mask & (1 << direction)) == 0) continue;
+            if (direction_count >= 2) continue;
+            verify_root(direction, (hit.w >> 6) & 1,
+                        step_1x, step_2x,
+                        root_x[direction_count + 1],
+                        root_row[direction_count + 1]);
+            direction_count++;
+        }
+        region_count = 0;
+        for (int cell_index = 0;
+             cell_index < VERIFY_GRID_CELLS; cell_index++) {
+            int axial_x = cell_index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int row_delta = cell_index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            bool in_region = false;
+            for (int root = 0; root < direction_count + 1; root++) {
+                if (verify_hex_distance(
+                        axial_x - root_x[root],
+                        row_delta - root_row[root]) <= VERIFY_RADIUS) {
+                    in_region = true;
+                }
+            }
+            region[cell_index] = in_region ? 1 : 0;
+            if (in_region)
+                region_cells[region_count++] = (uint8_t)cell_index;
+        }
+        for (int root = 0; root < direction_count + 1; root++)
+            root_index[root] = verify_grid_index(root_x[root], root_row[root]);
+    }
+    __syncthreads();
+
+    long long min_dx = verify_ceiling_division(
+        -(long long)world_border - hit.y, translation_period);
+    long long max_dx = verify_floor_division(
+        (long long)world_border - hit.y, translation_period);
+    long long min_dz = verify_ceiling_division(
+        -(long long)world_border - hit.z, translation_period);
+    long long max_dz = verify_floor_division(
+        (long long)world_border - hit.z, translation_period);
+    int count_x = (int)(max_dx - min_dx + 1);
+    int count_z = (int)(max_dz - min_dz + 1);
+    int translation_count = count_x > 0 && count_z > 0
+        ? count_x * count_z : 0;
+
+    unsigned int local_clipped = 0;
+    unsigned int local_max_connected = 0;
+    for (int translation_index = warp;
+         translation_index < translation_count;
+         translation_index += warp_count) {
+        int dx_index = translation_index / count_z;
+        int dz_index = translation_index - dx_index * count_z;
+        int translated_x = (int)((long long)hit.y
+            + (min_dx + dx_index) * translation_period);
+        int translated_z = (int)((long long)hit.z
+            + (min_dz + dz_index) * translation_period);
+
+        for (int region_slot = lane;
+             region_slot < region_count; region_slot += 32) {
+            int cell_index = region_cells[region_slot];
+            int axial_x = cell_index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int row_delta = cell_index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+            int row_parity = (hit.w >> 6) & 1;
+            int sample_x = translated_x + verify_lattice_x(
+                step_1x, row_parity, axial_x, row_delta);
+            int sample_z = translated_z + __float2int_rz(
+                (float)row_delta * 0.8660254037844386f * step_1x);
+            float value = verify_two_octaves(
+                seed_params, shared_perm,
+                (float)sample_x, (float)sample_z);
+            low[warp][cell_index] = value < threshold ? 1 : 0;
+            visited[warp][cell_index] = 0;
+        }
+        __syncwarp();
+
+        if (lane == 0) {
+            int queue_head = 0;
+            int queue_tail = 0;
+            int connected_count = 0;
+            for (int root = 0; root < 3; root++) {
+                if (root >= direction_count + 1) continue;
+                if (!verify_in_bounds(root_x[root], root_row[root])) continue;
+                int index = root_index[root];
+                if (low[warp][index] && !visited[warp][index]) {
+                    visited[warp][index] = 1;
+                    queue[warp][queue_tail++] = (uint8_t)index;
+                }
+            }
+
+            const int neighbor_x[6] = {-1, 1, 0, 0, -1, 1};
+            const int neighbor_row[6] = {0, 0, -1, 1, 1, -1};
+            while (queue_head < queue_tail) {
+                int cell_index = queue[warp][queue_head++];
+                int axial_x = cell_index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+                int row_delta = cell_index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+                connected_count++;
+                for (int direction = 0; direction < 6; direction++) {
+                    int next_x = axial_x + neighbor_x[direction];
+                    int next_row = row_delta + neighbor_row[direction];
+                    if (!verify_in_bounds(next_x, next_row)) continue;
+                    int next_index = verify_grid_index(next_x, next_row);
+                    if (region[next_index] && low[warp][next_index]
+                            && !visited[warp][next_index]) {
+                        visited[warp][next_index] = 1;
+                        queue[warp][queue_tail++] = (uint8_t)next_index;
+                    }
+                }
+            }
+
+            int clipped = 0;
+            for (int region_slot = 0;
+                 region_slot < region_count; region_slot++) {
+                int cell_index = region_cells[region_slot];
+                if (!visited[warp][cell_index]) continue;
+                int axial_x = cell_index / VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+                int row_delta = cell_index % VERIFY_GRID_SIDE - VERIFY_GRID_RADIUS;
+                int nearest_root_distance = VERIFY_GRID_RADIUS + 1;
+                for (int root = 0; root < 3; root++) {
+                    if (root >= direction_count + 1) continue;
+                    int distance = verify_hex_distance(
+                        axial_x - root_x[root], row_delta - root_row[root]);
+                    if (distance < nearest_root_distance)
+                        nearest_root_distance = distance;
+                }
+                if (nearest_root_distance == VERIFY_RADIUS)
+                    clipped = 1;
+            }
+            local_clipped += clipped;
+            if ((unsigned int)connected_count > local_max_connected)
+                local_max_connected = connected_count;
+
+            if (connected_count >= minimum_connected_cells) {
+                int output_index = atomicAdd(output_count, 1);
+                if (output_index < output_capacity) {
+                    output_hits[output_index] = make_int4(
+                        hit.x, translated_x, translated_z, hit.w);
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+    if (lane == 0) {
+        warp_clipped[warp] = local_clipped;
+        warp_max_connected[warp] = local_max_connected;
+    }
+    __syncthreads();
+
+    if (thread_id == 0 && debug_stats) {
+        unsigned int clipped_count = 0;
+        unsigned int max_connected = 0;
+        for (int warp_index = 0; warp_index < warp_count; warp_index++) {
+            clipped_count += warp_clipped[warp_index];
+            if (warp_max_connected[warp_index] > max_connected)
+                max_connected = warp_max_connected[warp_index];
+        }
+        atomicAdd(debug_stats + 0, (unsigned long long)translation_count);
+        atomicAdd(debug_stats + 1,
+                  (unsigned long long)translation_count * region_count);
+        atomicAdd(debug_stats + 2, (unsigned long long)clipped_count);
+        atomicMax(debug_stats + 3, (unsigned long long)max_connected);
     }
 }

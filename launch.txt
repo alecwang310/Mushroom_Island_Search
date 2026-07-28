@@ -1,9 +1,11 @@
 Mushroom Island Search — Windows launch instructions
 
 The current gpt branch is the O6 translation pipeline. The first GPU tier
-uses O6 only at step 500 and threshold -0.4. Each hit is expanded across
-O6-period translations, screened on the GPU with six octaves at 250-block
-spacing and R=2, then sent to the CPU for six-octave and full flood fill.
+uses O6 only at step 500 and threshold -0.4. Each hit is translated across
+the world border and screened on the GPU with O6+O15 threshold -0.88 at
+250-block spacing and R=2, then sent to the CPU for six-octave and full flood
+fill. Grouped mode keeps translation enumeration on the GPU and reuses each
+seed's permutation tables across all translations.
 
 1. Open an SSH shell or a Developer Command Prompt on Windows.
 
@@ -33,7 +35,10 @@ spacing and R=2, then sent to the CPU for six-octave and full flood fill.
     set HUNT_WORLD_BORDER_PIPELINE=7500000
     set HUNT_TRANSLATION_ESTIMATE_STEP=250
     set HUNT_TRANSLATION_ESTIMATE_STEP_2X=500
+    set HUNT_TRANSLATION_ESTIMATE_THRESHOLD=-0.88
     set HUNT_TRANSLATION_ESTIMATE_TARGET=6000000
+    set HUNT_TRANSLATION_GROUPED=1
+    set HUNT_TRANSLATION_GROUPED_THREADS=256
     set HUNT_CPU_6OCT_GATE=6000000
     set HUNT_TARGET_AREA=6000000
     set HUNT_CPU_WORKERS=28
@@ -47,6 +52,19 @@ spacing and R=2, then sent to the CPU for six-octave and full flood fill.
    Remove HUNT_MAX_PREFILTER_BATCHES for an indefinite search. Use
    HUNT_START_SEED=0x123456789ABCDEF0 for a deterministic test start. Remove
    HUNT_SCAN_LIMIT after the bounded test to scan every prefilter survivor.
+
+   For a deterministic GPU-only A/B benchmark, keep the same environment and
+   run:
+
+    set HUNT_PREF_BATCH=500000000
+    set HUNT_SCAN_LIMIT=1600
+    set HUNT_DEBUG_TRANSLATION_STATS=1
+    set HUNT_TRANSLATION_GROUPED=1
+    set HUNT_TRANSLATION_GROUPED_THREADS=256
+    python gpu\benchmark_translated.py
+
+   Repeat with HUNT_TRANSLATION_GROUPED=0 for the expanded one-block-per-
+   translation baseline. The sorted SHA-256 values must match.
 
 5. Inspect outputs:
 

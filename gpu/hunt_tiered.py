@@ -3,11 +3,10 @@
 The first GPU tier scans a 2x hex grid at 500-block spacing using O6 only.
 Its requested grid size is capped to one open O6 repetition period so the
 same O6 pattern is not rescanned before translation expansion.
-Each triple hit is expanded in native code to all O6-period translations
-inside the configured world border. A second GPU pass evaluates the six
-essential octaves on a 1x R=2 grid at 250-block spacing and sends only
-estimated >=6M candidates to the CPU. The CPU runs the six-octave flood and,
-when that gate passes, the full 24-octave flood.
+Each triple hit is translated to every O6-period position inside the configured
+world border. A second GPU pass evaluates O6+O15 on a 1x R=2 grid at
+250-block spacing and sends only estimated >=6M candidates to the CPU. The CPU
+runs the six-octave flood and, when that gate passes, the full 24-octave flood.
 """
 import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
@@ -79,6 +78,7 @@ GPU_ESTIMATE_STEP_1X = 250
 GPU_ESTIMATE_STEP_2X = 500
 GPU_ESTIMATE_RADIUS = 2
 GPU_ESTIMATE_TARGET_AREA = 6_000_000
+GPU_ESTIMATE_THRESHOLD = -0.88
 CPU_6OCT_GATE_AREA = 6_000_000
 FINAL_TARGET_AREA = 6_000_000
 CPU_WORKERS = 28
@@ -281,6 +281,11 @@ if __name__ == '__main__':
         'HUNT_TRANSLATION_ESTIMATE_STEP_2X', GPU_ESTIMATE_STEP_2X)
     estimate_target = _env_int(
         'HUNT_TRANSLATION_ESTIMATE_TARGET', GPU_ESTIMATE_TARGET_AREA)
+    estimate_threshold = _env_float(
+        'HUNT_TRANSLATION_ESTIMATE_THRESHOLD', GPU_ESTIMATE_THRESHOLD)
+    translation_grouped = _env_flag('HUNT_TRANSLATION_GROUPED', True)
+    translation_grouped_threads = _env_int(
+        'HUNT_TRANSLATION_GROUPED_THREADS', 256)
     cpu_6oct_gate = _env_int(
         'HUNT_CPU_6OCT_GATE', CPU_6OCT_GATE_AREA)
     requested_G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
@@ -311,8 +316,10 @@ if __name__ == '__main__':
         print(f'O6 grid cap: requested G={requested_G}, using G={G} '
               f'(span={(G - 1) * scan_step_2x:,} < '
               f'{translation_period:,})')
-    print(f'GPU estimate: step={estimate_step_1x} R={GPU_ESTIMATE_RADIUS} '
-          f'target>={estimate_target:,}')
+    print(f'GPU estimate: O6+O15<{estimate_threshold} step={estimate_step_1x} '
+          f'R={GPU_ESTIMATE_RADIUS} target>={estimate_target:,} '
+          f'mode={"grouped" if translation_grouped else "expanded"} '
+          f'threads={translation_grouped_threads}')
     print(f'First-tier grid: {(G-1)*scan_step_2x:,}x'
           f'{(G-1)*scan_step_2x:,} pipeline blocks')
     if PREFT_ENABLED:
@@ -320,7 +327,7 @@ if __name__ == '__main__':
               f'(p99.15-p99.25, {pref_batch//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print('GPU: O6 triple scan -> translated six-octave R=2 estimate.')
+    print('GPU: O6 triple scan -> translated O6+O15 R=2 estimate.')
     print(f'CPU: six-octave gate >= {cpu_6oct_gate:,} -> full flood.')
     print()
 
