@@ -206,6 +206,65 @@ including seed, coordinates, and geometry code. This removes the earlier
 confounding effect from regenerating a nondeterministically compacted
 survivor prefix for each run.
 
+## Full Per-Thread Register-Table Proposal
+
+The proposed design would give every thread a private copy of both 256-byte
+permutation tables. In the most compact representation, four permutation
+bytes are packed into one 32-bit register, so the two tables require
+`2 * 256 / 4 = 128` registers per thread. A total near `192` registers/thread
+is plausible only after adding the current Perlin temporaries, prefix state,
+coordinates, masks, and live arithmetic values; it is not the storage cost of
+the two tables alone. Storing one 32-bit register per permutation byte would
+require `512` registers/thread and is not viable.
+
+This proposal has three independent problems:
+
+1. **A register file is not dynamically indexable.** CUDA/PTX register names
+   are compile-time operands. An expression such as `perm_words[index >> 2]`
+   cannot perform one indexed register read. The compiler must either lower the
+   array to local memory or synthesize a large predicated `select`/`switch`
+   network. The former recreates the spill/L1/L2 problem; the latter adds
+   dozens of integer comparisons and moves for each lookup. The production
+   full-tile prefix path performs `2,490,368` packed pair lookups per `G=512`
+   seed, including `393,216` prefix-build lookups, so even a modest select
+   sequence would dwarf the one shared load it replaces.
+2. **Replicating the table is expensive.** The current block initialization
+   reads `512` table bytes once per seed and stages them in shared memory. A
+   private full table would require every one of `256` threads to populate its
+   own `128` packed registers: `131,072` logical table bytes per seed, or
+   `256x` the current initialization traffic. A warp could distribute words
+   with shuffles, but that returns to the existing warp-register lookup design
+   rather than providing direct per-thread indexing.
+3. **The occupancy trade is severe.** At `256` threads/block, `192`
+   registers/thread consume `49,152` registers per block. The current
+   three-block launch bound can retain at most roughly `85` registers/thread
+   on the measured `65,536`-register SM budget; ptxas would therefore spill or
+   require a lower launch bound. Even with one block/SM and no spills, only
+   eight warps can hide the dependent Perlin and shared-mask latency, versus
+   the current three resident blocks. The existing measured two-block build
+   already reaches `128` registers/thread and is slower despite being
+   spill-free.
+
+The register-table path would therefore need an unrealistically cheap dynamic
+register-index mechanism to win. A theoretical one-cycle table read is not a
+useful comparison because the hardware cannot issue that operation from a
+runtime index. The measured warp-register control is the closest legal
+implementation: it stores only four 32-bit words per lane for both tables and
+uses three `shfl.sync.idx.b32` operations plus `prmt.b32` per pair. It reached
+approximately `158k survivors/s`, versus `240.8k/s` for packed shared memory,
+so removing shared-bank conflicts did not compensate for the dependent
+shuffle/permute chain.
+
+The viable register-only optimization remains the current narrow prefix LUT:
+keep the x-only second-level pairs in lane registers and leave the four
+z-dependent pair lookups per octave in packed shared memory. This captures the
+reuse without duplicating 512 bytes into every thread or introducing an
+indirect-register select tree. A full per-thread register-table kernel is not
+being added as an unbenchmarked production path; if a future Windows A/B test
+is desired, it should first be implemented as a deliberately isolated
+compile-time experiment with `TIERED_MIN_BLOCKS_PER_SM=1`, and ptxas local
+memory output must be rejected if any table access spills.
+
 ## Packed Shared-Memory Upgrade
 
 The shared byte-table path performs two shared loads for every adjacent
