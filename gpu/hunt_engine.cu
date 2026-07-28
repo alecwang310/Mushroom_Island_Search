@@ -390,7 +390,7 @@ static int tiered_translation_chunk(
     cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
                (size_t)raw_count * sizeof(int4), cudaMemcpyDeviceToHost);
 
-    std::vector<int4> translated;
+    size_t translated_size = 0;
     for (int i = 0; i < raw_count; i++) {
         const int4 hit = g_tier.h_hits[i];
         int min_dx = translation_min_index(hit.y, translation_period,
@@ -405,24 +405,39 @@ static int tiered_translation_chunk(
         int64_t count_z = (int64_t)max_dz - min_dz + 1;
         if (count_x <= 0 || count_z <= 0)
             continue;
-        translated.reserve(translated.size()
-            + (size_t)(count_x * count_z));
+        size_t hit_translations = (size_t)(count_x * count_z);
+        if (hit_translations > 0x7FFFFFFFu
+                || translated_size > 0x7FFFFFFFu - hit_translations)
+            return -hit_capacity;
+        translated_size += hit_translations;
+    }
+    if (translated_size == 0)
+        return 0;
+
+    std::vector<int4> translated(translated_size);
+    size_t translated_index = 0;
+    for (int i = 0; i < raw_count; i++) {
+        const int4 hit = g_tier.h_hits[i];
+        int min_dx = translation_min_index(hit.y, translation_period,
+                                           world_border);
+        int max_dx = translation_max_index(hit.y, translation_period,
+                                           world_border);
+        int min_dz = translation_min_index(hit.z, translation_period,
+                                           world_border);
+        int max_dz = translation_max_index(hit.z, translation_period,
+                                           world_border);
         for (int dx = min_dx; dx <= max_dx; dx++) {
             for (int dz = min_dz; dz <= max_dz; dz++) {
-                translated.push_back(make_int4(
+                translated[translated_index++] = make_int4(
                     hit.x,
                     (int)((int64_t)hit.y
                         + (int64_t)dx * translation_period),
                     (int)((int64_t)hit.z
                         + (int64_t)dz * translation_period),
-                    hit.w));
+                    hit.w);
             }
         }
     }
-    if (translated.empty())
-        return 0;
-    if (translated.size() > 0x7FFFFFFFu)
-        return -hit_capacity;
 
     int translated_count = (int)translated.size();
     ensure_hit_capacity(translated_count);
