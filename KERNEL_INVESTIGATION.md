@@ -160,6 +160,60 @@ Partial edge tiles retain the original `perlin_shared` path because their
 lane-to-cell mapping changes across waves. Disable the experiment with
 `-DTIERED_USE_PREFIX_LUT=0` for an exact A/B comparison.
 
+## Why the H1 Prefix Gain Is Modest
+
+The current H1 prefix is active in `gpu/tiered_kernel.cu` at the full-tile
+setup. For each tile and each lane it computes the three x-only pair stages
+once, then reuses the two second-level pairs across the four waves. The reuse
+is valid because the four rows assigned to a lane differ by eight rows, so
+their row parity and x offset are unchanged. At `G=512`, all tiles are full
+tiles, so the edge-tile fallback is not involved in the benchmark.
+
+The prefix removes three of seven pair loads per Perlin call, or six of the
+fourteen pair loads per cell across O6 and O15. It does **not** remove:
+
+- the cell-coordinate conversion, fractional `dx`/`dz`, and two `fade` calls;
+- the four z-dependent pair loads per octave;
+- eight `grad_dot` calls and seven interpolation FMAs per octave;
+- the continentalness accumulation, threshold test, ballots, row-mask reads,
+  and hit emission.
+
+It also adds a per-tile prefix build and increases register pressure. The
+measured prefix build uses `80` registers/thread at the selected three-block
+bound, compared with `64` for the no-prefix control; the two-block build is
+spill-free but slower because it loses occupancy. Thus the logical lookup
+reduction is not a direct elapsed-time reduction.
+
+The existing fixed-buffer timing gives the following decomposition for
+`262,144` survivors:
+
+| Measurement | Time | Interpretation |
+| --- | ---: | --- |
+| Packed shared, no prefix | `1.088822s` | `240.8K/s` baseline |
+| Byte-table, no prefix | `1.160628s` | adds one byte-table load per pair |
+| Difference | `0.071806s` | measured packed lookup-load component |
+| Prefix, three-block build | approximately `0.990s` | `263.9-265.6K/s` |
+
+The packed-versus-byte difference assigns approximately `6.595%` of the
+packed kernel time to the isolated shared lookup-load component; the remaining
+approximately `93.4%` is arithmetic, control, synchronization, masks, and
+other scheduling work. A memory-only model predicts that removing `32.1%` of
+that component would save only about `23ms`, or approximately `246K/s`.
+The measured prefix build saves roughly `99ms`, so most of its extra gain
+comes from shortening the serial permutation dependency chain and improving
+instruction scheduling, not from shared bandwidth alone. This explains why
+the prefix is about `10%` faster rather than `32%` faster.
+
+Nsight Compute independently classifies the kernel as compute/issue-bound:
+approximately `86.3%` SM issue utilization, negligible DRAM traffic, and
+approximately `50.9%` shared-load wavefront expansion. The conflict percentage
+is therefore a property of the lookup instructions, not a percentage of total
+kernel time. The current host profiling ABI times the whole CUDA kernel and
+DLL stages, but does not expose separate device lookup, gradient, or mask
+counters. A true sub-stage wall-time measurement requires a benchmark-only
+`clock64()` instrumented build on Windows; adding such counters to production
+would change register pressure and occupancy.
+
 Seed-wide LUT storage is not promising: each seed executes one block, x-cell
 coordinates change across tiles, and a full-seed table would consume much more
 storage without cross-seed reuse. A shared tile prefix would also add a shared
