@@ -133,6 +133,10 @@ int main(int argc, char** argv) {
                                  static_cast<uint64_t>(record.seed), 0);
                 cont_engine_disable_shift(&engine);
                 engine.cont_octA_count = 1;
+                engine.cont_octB_count = 0;
+                double o6_value = cont_sample(
+                    &engine, record.cx, record.cz);
+                engine.cont_octA_count = 0;
                 engine.cont_octB_count = 1;
                 ContEngine coarse_engine;
                 cont_engine_init_6oct(&coarse_engine,
@@ -158,8 +162,9 @@ int main(int argc, char** argv) {
                             record.cx + dx_index * o6_period);
                         int translated_cz = static_cast<int>(
                             record.cz + dz_index * o6_period);
-                        if (cont_sample(&engine, translated_cx,
-                                        translated_cz) >= threshold)
+                        double o15_value = cont_sample(
+                            &engine, translated_cx, translated_cz);
+                        if (o6_value + o15_value >= threshold)
                             continue;
                         ++local_candidates;
 
