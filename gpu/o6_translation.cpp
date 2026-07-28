@@ -134,6 +134,12 @@ int main(int argc, char** argv) {
                 cont_engine_disable_shift(&engine);
                 engine.cont_octA_count = 1;
                 engine.cont_octB_count = 1;
+                ContEngine coarse_engine;
+                cont_engine_init_6oct(&coarse_engine,
+                                      static_cast<uint64_t>(record.seed), 0);
+                ContEngine full_engine;
+                cont_engine_init(&full_engine,
+                                 static_cast<uint64_t>(record.seed), 0);
 
                 uint64_t local_positions = 0;
                 uint64_t local_candidates = 0;
@@ -157,15 +163,21 @@ int main(int argc, char** argv) {
                             continue;
                         ++local_candidates;
 
+                        if (cont_sample(&coarse_engine, translated_cx,
+                                        translated_cz) >= -1.05)
+                            continue;
+                        ++local_coarse_nonzero;
+
                         int64_t coarse_area = cont_flood_fill_6oct(
                             static_cast<uint64_t>(record.seed),
                             translated_cx, translated_cz, max_cells);
-                        if (coarse_area <= 0)
-                            continue;
-                        ++local_coarse_nonzero;
                         if (coarse_area < coarse_gate)
                             continue;
                         ++local_coarse_passed;
+
+                        if (cont_sample(&full_engine, translated_cx,
+                                        translated_cz) >= -1.05)
+                            continue;
 
                         ++local_full_floods;
                         int64_t full_area = cont_flood_fill(
