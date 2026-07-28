@@ -95,6 +95,8 @@ int main(int argc, char** argv) {
         ? argv[2] : "gpu/o6_translation_larger.csv";
     const int worker_count = argc > 3 ? std::stoi(argv[3]) : 28;
     const double threshold = argc > 4 ? std::stod(argv[4]) : -0.95;
+    const int64_t output_min_area = argc > 5
+        ? std::stoll(argv[5]) : 5'000'000;
     constexpr int64_t o6_period = 512LL * 256LL;
     constexpr int world_border = 7'500'000;
     constexpr int coarse_gate = 3'000'000;
@@ -112,6 +114,13 @@ int main(int argc, char** argv) {
         std::mutex result_mutex;
         std::mutex progress_mutex;
         std::vector<LargerResult> larger;
+        std::ofstream output(output_path, std::ios::trunc);
+        if (!output)
+            throw std::runtime_error(std::string("cannot write ")
+                                     + output_path);
+        output << "seed,original_area,translated_area,original_cx,original_cz,"
+                  "translated_cx,translated_cz,dx_index,dz_index\n";
+        output.flush();
 
         auto worker = [&]() {
             while (true) {
@@ -188,7 +197,7 @@ int main(int argc, char** argv) {
                         int64_t full_area = cont_flood_fill(
                             static_cast<uint64_t>(record.seed),
                             translated_cx, translated_cz, max_cells);
-                        if (full_area > record.area) {
+                        if (full_area >= output_min_area) {
                             local_larger.push_back({
                                 record.seed, record.area,
                                 static_cast<int>(full_area),
@@ -207,8 +216,16 @@ int main(int argc, char** argv) {
                 full_floods.fetch_add(local_full_floods);
                 if (!local_larger.empty()) {
                     std::lock_guard<std::mutex> lock(result_mutex);
-                    larger.insert(larger.end(), local_larger.begin(),
-                                  local_larger.end());
+                    for (const auto& result : local_larger) {
+                        output << result.seed << ',' << result.original_area
+                               << ',' << result.translated_area << ','
+                               << result.original_cx << ',' << result.original_cz
+                               << ',' << result.translated_cx << ','
+                               << result.translated_cz << ',' << result.dx_index
+                               << ',' << result.dz_index << '\n';
+                        larger.push_back(result);
+                    }
+                    output.flush();
                 }
 
                 size_t done = completed.fetch_add(1) + 1;
@@ -233,24 +250,11 @@ int main(int argc, char** argv) {
                   [](const LargerResult& left, const LargerResult& right) {
                       return left.translated_area > right.translated_area;
                   });
-        std::ofstream output(output_path);
-        if (!output)
-            throw std::runtime_error(std::string("cannot write ")
-                                     + output_path);
-        output << "seed,original_area,translated_area,original_cx,original_cz,"
-                  "translated_cx,translated_cz,dx_index,dz_index\n";
-        for (const auto& result : larger) {
-            output << result.seed << ',' << result.original_area << ','
-                   << result.translated_area << ',' << result.original_cx << ','
-                   << result.original_cz << ',' << result.translated_cx << ','
-                   << result.translated_cz << ',' << result.dx_index << ','
-                   << result.dz_index << '\n';
-        }
-
         std::cout << "records=" << records.size()
                   << " workers=" << worker_count
                   << " o6_period_pipeline_coords=" << o6_period
-                  << " threshold=" << threshold << "\n";
+                  << " threshold=" << threshold
+                  << " output_min_area=" << output_min_area << "\n";
         std::cout << "positions_tested=" << positions_tested.load()
                   << " o6o15_candidates=" << o6o15_candidates.load()
                   << " coarse_nonzero=" << coarse_nonzero.load()
