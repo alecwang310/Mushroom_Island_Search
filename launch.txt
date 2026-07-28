@@ -7,12 +7,13 @@ spacing and R=2, then sent to the CPU for six-octave and full flood fill.
 
 1. Open an SSH shell or a Developer Command Prompt on Windows.
 
-2. Fetch the current branch. Run this from the repository root:
+2. Fetch and merge the current branch. Run this from the repository root.
+   This preserves any local Windows commits:
 
     cd /d D:\Code\Seeds
     powershell -NoProfile -ExecutionPolicy Bypass -Command "$vpn = Get-Content .\VPN.txt -Raw; Invoke-Expression $vpn; git fetch origin gpt"
-    git switch -C gpt origin/gpt
-    git reset --hard origin/gpt
+    git switch gpt
+    git merge --no-edit origin/gpt
 
 3. Build the GPU DLL. Use a fresh shell before calling vcvars64.bat:
 
@@ -26,6 +27,8 @@ spacing and R=2, then sent to the CPU for six-octave and full flood fill.
     cd /d D:\Code\Seeds
     set HUNT_O6_THRESHOLD=-0.4
     set HUNT_O6_STEP=500
+    set HUNT_PREF_BATCH=100000
+    set HUNT_SCAN_LIMIT=16
     set HUNT_TRANSLATION_PERIOD=131072
     set HUNT_WORLD_BORDER_PIPELINE=7500000
     set HUNT_TRANSLATION_ESTIMATE_STEP=250
@@ -37,11 +40,13 @@ spacing and R=2, then sent to the CPU for six-octave and full flood fill.
     set HUNT_OUTPUT_FILE=gpu\islands_6m.jsonl
     set HUNT_BEST_FILE=gpu\best_6m.jsonl
     set HUNT_MAX_PREFILTER_BATCHES=1
+    set HUNT_DEBUG_TRANSLATION_STATS=1
+    set HUNT_PROFILE_STAGES=1
     python gpu\hunt_tiered.py
 
    Remove HUNT_MAX_PREFILTER_BATCHES for an indefinite search. Use
-   HUNT_START_SEED=0x123456789ABCDEF0 for a deterministic test start.
-   Add HUNT_SCAN_LIMIT to limit the number of prefilter survivors scanned.
+   HUNT_START_SEED=0x123456789ABCDEF0 for a deterministic test start. Remove
+   HUNT_SCAN_LIMIT after the bounded test to scan every prefilter survivor.
 
 5. Inspect outputs:
 

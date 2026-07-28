@@ -92,6 +92,11 @@ static int64_t coarse_min_area() {
     return (int64_t)parsed;
 }
 
+static int debug_translation_stats() {
+    const char *value = getenv("HUNT_DEBUG_TRANSLATION_STATS");
+    return value && *value && atoi(value) != 0;
+}
+
 static void ensure_timing_events() {
     if (g_tier.timing_events_ready) return;
     cudaEventCreate(&g_tier.phase_start);
@@ -406,12 +411,26 @@ static int tiered_translation_chunk(
     const double cell_area = (double)estimate_step_1x * estimate_step_1x
         * 0.8660254037844386 * 16.0;
     int output_count = 0;
+    int clipped_count = 0;
+    int64_t max_estimated_area = 0;
     for (int i = 0; i < translated_count; i++) {
         const int4 estimate = g_tier.h_coarse_results[i];
         int64_t estimated_area = (int64_t)(estimate.y * cell_area);
-        if (estimate.z == 0 && estimated_area < estimate_min_area)
+        if (estimate.z != 0)
+            clipped_count++;
+        if (estimated_area > max_estimated_area)
+            max_estimated_area = estimated_area;
+        if (estimated_area < estimate_min_area)
             continue;
         output_count++;
+    }
+    if (debug_translation_stats()) {
+        fprintf(stderr,
+                "translation_stats raw=%d expanded=%d clipped=%d "
+                "area_pass=%d max_area=%lld\n",
+                raw_count, translated_count, clipped_count, output_count,
+                (long long)max_estimated_area);
+        fflush(stderr);
     }
     if (output_count > hit_capacity)
         return -output_count;
@@ -420,7 +439,7 @@ static int tiered_translation_chunk(
     for (int i = 0; i < translated_count; i++) {
         const int4 estimate = g_tier.h_coarse_results[i];
         int64_t estimated_area = (int64_t)(estimate.y * cell_area);
-        if (estimate.z == 0 && estimated_area < estimate_min_area)
+        if (estimated_area < estimate_min_area)
             continue;
         const int4 hit = translated[i];
         int seed_idx = hit.x;
