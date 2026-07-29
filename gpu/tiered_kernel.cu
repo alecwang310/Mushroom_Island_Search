@@ -695,7 +695,8 @@ __global__ void tiered_scan(
                     + (global_z & 1) * half_spacing_x);
                 int hit_z = (int)(center_z + global_z * spacing_z);
                 uint32_t candidate_mask = __ballot_sync(FULL_MASK, emit);
-                emit_warp_hits(candidate_mask, lane, hit_x, hit_z, 0,
+                emit_warp_hits(candidate_mask, lane, hit_x, hit_z,
+                               (global_z & 1) << 6,
                                &seed_hit_count, hit_capacity, hit_count,
                                seed, hits);
             }

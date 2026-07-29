@@ -117,12 +117,12 @@ void cont_sample_grid(const ContEngine *e, float *out,
                       int x0, int z0, int cols, int rows, int step);
 
 /**
- * Estimate the connected mushroom area around a GPU triple hit.
+ * Estimate connected mushroom area around a GPU component hit.
  *
  * Samples the 0.5x hex lattice and performs the connected-component walk in
  * C so callers do not pay a Python/ctypes boundary for every sample.
- * @param geometry_code low 6 bits = two GPU neighbor directions;
- *                      bit 6 = coarse-grid row parity
+ * @param geometry_code low 6 bits = zero, one, or two GPU neighbor
+ *                      directions; bit 6 = coarse-grid row parity
  * @param step_05x      0.5x sample spacing, normally 125 blocks
  * @param step_2x       GPU coarse spacing, normally 500 blocks
  * @return estimated area in blocks^2 at 1:1 scale

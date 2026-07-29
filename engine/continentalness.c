@@ -529,6 +529,7 @@ static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
     int radius_steps;
     int directions[2];
     int direction_count = 0;
+    int root_count;
     int roots[3][2];
     int points[ESTIMATE_MAX_POINTS][2];
     int neighbors[ESTIMATE_MAX_POINTS][ESTIMATE_NEIGHBORS];
@@ -557,8 +558,9 @@ static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
             directions[direction_count++] = direction;
         }
     }
-    if (direction_count != 2)
+    if (direction_count > 2)
         return 0.0;
+    root_count = direction_count + 1;
 
     roots[0][0] = 0;
     roots[0][1] = 0;
@@ -588,7 +590,7 @@ static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
         roots[root + 1][1] = point_row;
     }
 
-    for (int root = 0; root < 3; root++) {
+    for (int root = 0; root < root_count; root++) {
         for (int local_x = -radius_steps;
              local_x <= radius_steps; local_x++) {
             for (int local_row = -radius_steps;
@@ -634,14 +636,14 @@ static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
         seeded[i] = 0;
     }
 
-    for (int root = 0; root < 3; root++) {
+    for (int root = 0; root < root_count; root++) {
         root_indices[root] = estimate_find_point(
             points, point_count, roots[root][0], roots[root][1]);
         if (root_indices[root] < 0)
             return 0.0;
     }
 
-    for (int root = 0; root < 3; root++) {
+    for (int root = 0; root < root_count; root++) {
         int root_index = root_indices[root];
         int candidates[ESTIMATE_NEIGHBORS + 1];
         candidates[0] = root_index;
