@@ -17,6 +17,7 @@ from hunt_tiered import (
     CPU_VALIDATION_STEP_1X,
     CPU_VALIDATION_STEP_2X,
     CPU_VALIDATION_TARGET_AREA,
+    CPU_VALIDATION_THRESHOLD,
     GPU_ESTIMATE_TARGET_AREA,
     PREF_BATCH,
     PREF_SURVIVOR_CAP,
@@ -40,6 +41,8 @@ VALIDATION_STEP_2X = int(os.environ.get(
     'HUNT_CPU_VALIDATION_STEP_2X', str(CPU_VALIDATION_STEP_2X)))
 VALIDATION_TARGET_AREA = int(os.environ.get(
     'HUNT_CPU_VALIDATION_TARGET', str(CPU_VALIDATION_TARGET_AREA)))
+VALIDATION_THRESHOLD = float(os.environ.get(
+    'HUNT_CPU_VALIDATION_THRESHOLD', str(CPU_VALIDATION_THRESHOLD)))
 CPU_FLOOD6_GATE = int(os.environ.get(
     'HUNT_CPU_6OCT_GATE', str(CPU_6OCT_GATE_AREA)))
 BENCH_PREF_BATCH = int(os.environ.get('HUNT_PREF_BATCH', str(PREF_BATCH)))
@@ -58,7 +61,7 @@ def benchmark_verify_and_flood(seed, grid_x, grid_z, geometry_code):
     estimate_started = time.perf_counter()
     estimated_area = estimate_triple_area_6oct(
         seed, grid_x, grid_z, geometry_code,
-        VALIDATION_STEP_1X, VALIDATION_STEP_2X)
+        VALIDATION_STEP_1X, VALIDATION_STEP_2X, VALIDATION_THRESHOLD)
     estimate_seconds = time.perf_counter() - estimate_started
     if estimated_area < VALIDATION_TARGET_AREA:
         return False, None, estimate_seconds, 0.0, 0.0, False, estimated_area

@@ -522,7 +522,8 @@ static int estimate_add_point(int points[][2], int *count,
 
 static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
                                              int geometry_code, int step,
-                                             int step_2x, int six_octaves) {
+                                             int step_2x, int six_octaves,
+                                             double threshold) {
     int row_parity = (geometry_code >> 6) & 1;
     int pair_mask = geometry_code & 0x3F;
     int radius_steps;
@@ -628,7 +629,7 @@ static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
             step, row_parity, points[i][0], points[i][1]);
         int offset_z = estimate_lattice_offset_z(step, points[i][1]);
         low[i] = cont_sample(&e, gx + offset_x, gz + offset_z)
-            < -1.05;
+            < threshold;
         connected[i] = 0;
         seeded[i] = 0;
     }
@@ -685,14 +686,14 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
                                  int geometry_code, int step_05x,
                                  int step_2x) {
     return cont_estimate_triple_area_impl(
-        seed, gx, gz, geometry_code, step_05x, step_2x, 0);
+        seed, gx, gz, geometry_code, step_05x, step_2x, 0, -1.05);
 }
 
 double cont_estimate_triple_area_6oct(uint64_t seed, int gx, int gz,
                                       int geometry_code, int step_1x,
-                                      int step_2x) {
+                                      int step_2x, double threshold) {
     return cont_estimate_triple_area_impl(
-        seed, gx, gz, geometry_code, step_1x, step_2x, 1);
+        seed, gx, gz, geometry_code, step_1x, step_2x, 1, threshold);
 }
 
 void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,

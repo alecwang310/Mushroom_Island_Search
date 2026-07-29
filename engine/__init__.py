@@ -40,7 +40,7 @@ _lib.cont_estimate_triple_area.argtypes = [
 _lib.cont_estimate_triple_area.restype = c_double
 
 _lib.cont_estimate_triple_area_6oct.argtypes = [
-    c_uint64, c_int, c_int, c_int, c_int, c_int,
+    c_uint64, c_int, c_int, c_int, c_int, c_int, c_double,
 ]
 _lib.cont_estimate_triple_area_6oct.restype = c_double
 

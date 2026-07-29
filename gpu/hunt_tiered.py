@@ -84,6 +84,7 @@ CPU_6OCT_GATE_AREA = 6_000_000
 CPU_VALIDATION_STEP_1X = 250
 CPU_VALIDATION_STEP_2X = 500
 CPU_VALIDATION_TARGET_AREA = 6_000_000
+CPU_VALIDATION_THRESHOLD = -1.0
 FINAL_TARGET_AREA = 6_000_000
 CPU_WORKERS = 28
 OUTPUT_FILE = 'islands_6m.jsonl'
@@ -167,12 +168,13 @@ def hunt_batch_tiered_translated(
 
 
 def estimate_triple_area_6oct(seed, gx, gz, geometry_code,
-                              step_1x, step_2x):
+                              step_1x, step_2x, threshold):
     """Run the native six-octave 1x connected-grid validation."""
     return _eng._lib.cont_estimate_triple_area_6oct(
         ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
         ctypes.c_int(gx), ctypes.c_int(gz), ctypes.c_int(geometry_code),
-        ctypes.c_int(step_1x), ctypes.c_int(step_2x))
+        ctypes.c_int(step_1x), ctypes.c_int(step_2x),
+        ctypes.c_double(threshold))
 
 
 def prefilter_range(start_seed, n, lo, hi, survivors):
@@ -264,10 +266,12 @@ def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
 
 def verify_and_flood(seed, gx, gz, geometry_code,
                      validation_step_1x, validation_step_2x,
-                     validation_target_area, cpu_6oct_gate):
+                     validation_target_area, validation_threshold,
+                     cpu_6oct_gate):
     validation_started = time.perf_counter()
     validation_area = estimate_triple_area_6oct(
-        seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x)
+        seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x,
+        validation_threshold)
     validation_seconds = time.perf_counter() - validation_started
     if validation_area < validation_target_area:
         return (False, False, None, validation_seconds, 0.0, 0.0,
@@ -289,11 +293,12 @@ def verify_and_flood(seed, gx, gz, geometry_code,
 
 def verify_and_flood_profiled(submitted_at, seed, gx, gz, geometry_code,
                               validation_step_1x, validation_step_2x,
-                              validation_target_area, cpu_6oct_gate):
+                              validation_target_area, validation_threshold,
+                              cpu_6oct_gate):
     started_at = time.perf_counter()
     result = verify_and_flood(
         seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x,
-        validation_target_area, cpu_6oct_gate)
+        validation_target_area, validation_threshold, cpu_6oct_gate)
     finished_at = time.perf_counter()
     return (*result, started_at - submitted_at, finished_at - started_at)
 
@@ -325,6 +330,8 @@ if __name__ == '__main__':
         'HUNT_CPU_VALIDATION_STEP_2X', CPU_VALIDATION_STEP_2X)
     validation_target_area = _env_int(
         'HUNT_CPU_VALIDATION_TARGET', CPU_VALIDATION_TARGET_AREA)
+    validation_threshold = _env_float(
+        'HUNT_CPU_VALIDATION_THRESHOLD', CPU_VALIDATION_THRESHOLD)
     requested_G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
     G = cap_o6_grid_size(requested_G, scan_step_2x, translation_period)
     batch = _env_int('HUNT_BATCH_SIZE', 8192)
@@ -368,7 +375,7 @@ if __name__ == '__main__':
         print(f'Pre-filter: OFF')
     print('GPU: O6 triple scan -> translated O6+O15 R=2 estimate.')
     print(f'CPU: six-octave 1x validation step={validation_step_1x} '
-          f'target>={validation_target_area:,} -> '
+          f'threshold<{validation_threshold} target>={validation_target_area:,} -> '
           f'flood gate>={cpu_6oct_gate:,} -> full flood.')
     print()
 
@@ -478,13 +485,15 @@ if __name__ == '__main__':
                     verify_and_flood_profiled, submitted_at,
                     seed, gx, gz, geometry_code,
                     validation_step_1x, validation_step_2x,
-                    validation_target_area, cpu_6oct_gate)
+                    validation_target_area, validation_threshold,
+                    cpu_6oct_gate)
             else:
                 future = pool.submit(
                     verify_and_flood,
                     seed, gx, gz, geometry_code,
                     validation_step_1x, validation_step_2x,
-                    validation_target_area, cpu_6oct_gate)
+                    validation_target_area, validation_threshold,
+                    cpu_6oct_gate)
             future.add_done_callback(on_done_releasing)
             if profile_stages:
                 stage_profile['pool_submit_seconds'] += (

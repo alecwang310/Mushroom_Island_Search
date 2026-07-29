@@ -135,10 +135,11 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
  * Six-octave version of cont_estimate_triple_area for the CPU validation gate.
  * Samples a 1x hex lattice, normally at 250-block spacing around a 500-block
  * GPU hit, and uses only O6, O7, O8, O15, O16, and O17.
+ * A sample is considered mushroom when its continentalness is below threshold.
  */
 double cont_estimate_triple_area_6oct(uint64_t seed, int gx, int gz,
                                       int geometry_code, int step_1x,
-                                      int step_2x);
+                                      int step_2x, double threshold);
 
 /**
  * Batch-init N seeds and write perlin data directly into flat SoA arrays.
