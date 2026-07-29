@@ -25,13 +25,110 @@ struct GridEstimate {
     bool clipped = false;
 };
 
+static inline float fade_value(float value) {
+    return value * value * value
+        * (value * (value * 6.0f - 15.0f) + 10.0f);
+}
+
+static inline float gradient_dot(uint32_t hash, float x, float y, float z) {
+    const uint32_t gradient = hash & 15u;
+    float first = gradient < 8u ? x : y;
+    float second = gradient < 4u
+        ? y : ((gradient == 12u || gradient == 14u) ? x : z);
+    if (gradient & 1u)
+        first = -first;
+    if (gradient & 2u)
+        second = -second;
+    return first + second;
+}
+
+static inline uint32_t permutation_pair(
+        const ContTieredParams& params, uint32_t index) {
+    const uint32_t wrapped = index & 0xFFu;
+    const uint32_t next = (wrapped + 1u) & 0xFFu;
+    return static_cast<uint32_t>(params.perm[0][wrapped])
+        | (static_cast<uint32_t>(params.perm[0][next]) << 8);
+}
+
+static float sample_o6(const ContTieredParams& params, float x, float z) {
+    const float offset_x = params.offset_a[0];
+    const float offset_z = params.offset_c[0];
+    const float cached_d2 = params.cached_d2[0];
+    const float cached_t2 = params.cached_t2[0];
+    const float shifted_x = x + offset_x;
+    const float shifted_z = z + offset_z;
+    const int cell_x = static_cast<int>(std::floor(shifted_x));
+    const int cell_z = static_cast<int>(std::floor(shifted_z));
+    const float local_x = shifted_x - static_cast<float>(cell_x);
+    const float local_z = shifted_z - static_cast<float>(cell_z);
+    const uint32_t hash_x = static_cast<uint32_t>(cell_x) & 0xFFu;
+    const uint32_t hash_z = static_cast<uint32_t>(cell_z) & 0xFFu;
+    const float fade_x = fade_value(local_x);
+    const float fade_z = fade_value(local_z);
+
+    uint32_t pair = permutation_pair(params, hash_x);
+    const uint32_t first_a = (pair & 0xFFu) + params.cached_h2[0];
+    const uint32_t first_b = (pair >> 8) + params.cached_h2[0];
+    pair = permutation_pair(params, first_a);
+    const uint32_t second_a = (pair & 0xFFu) + hash_z;
+    const uint32_t second_b = (pair >> 8) + hash_z;
+    pair = permutation_pair(params, first_b);
+    const uint32_t third_a = (pair & 0xFFu) + hash_z;
+    const uint32_t third_b = (pair >> 8) + hash_z;
+
+    pair = permutation_pair(params, second_a);
+    const uint32_t fourth_a = pair & 0xFFu;
+    const uint32_t fourth_b = pair >> 8;
+    pair = permutation_pair(params, second_b);
+    const uint32_t fifth_a = pair & 0xFFu;
+    const uint32_t fifth_b = pair >> 8;
+    pair = permutation_pair(params, third_a);
+    const uint32_t sixth_a = pair & 0xFFu;
+    const uint32_t sixth_b = pair >> 8;
+    pair = permutation_pair(params, third_b);
+    const uint32_t seventh_a = pair & 0xFFu;
+    const uint32_t seventh_b = pair >> 8;
+
+    float lower_left = gradient_dot(fourth_a, local_x, cached_d2, local_z);
+    float lower_right = gradient_dot(
+        sixth_a, local_x - 1.0f, cached_d2, local_z);
+    float upper_left = gradient_dot(
+        fifth_a, local_x, cached_d2 - 1.0f, local_z);
+    float upper_right = gradient_dot(
+        seventh_a, local_x - 1.0f, cached_d2 - 1.0f, local_z);
+    float lower_left_back = gradient_dot(
+        fourth_b, local_x, cached_d2, local_z - 1.0f);
+    float lower_right_back = gradient_dot(
+        sixth_b, local_x - 1.0f, cached_d2, local_z - 1.0f);
+    float upper_left_back = gradient_dot(
+        fifth_b, local_x, cached_d2 - 1.0f, local_z - 1.0f);
+    float upper_right_back = gradient_dot(
+        seventh_b, local_x - 1.0f, cached_d2 - 1.0f, local_z - 1.0f);
+
+    lower_left = std::fmaf(
+        fade_x, lower_right - lower_left, lower_left);
+    upper_left = std::fmaf(
+        fade_x, upper_right - upper_left, upper_left);
+    lower_left_back = std::fmaf(
+        fade_x, lower_right_back - lower_left_back, lower_left_back);
+    upper_left_back = std::fmaf(
+        fade_x, upper_right_back - upper_left_back, upper_left_back);
+    lower_left = std::fmaf(
+        cached_t2, upper_left - lower_left, lower_left);
+    lower_left_back = std::fmaf(
+        cached_t2, upper_left_back - lower_left_back, lower_left_back);
+    return std::fmaf(
+        fade_z, lower_left_back - lower_left, lower_left)
+        * params.amplitude[0] * params.cont_dbl_amp;
+}
+
 static constexpr double HEX_AREA_SCALE =
     0.86602540378443864676 * 16.0;
 static constexpr int DEFAULT_STEP = 250;
 static constexpr int DEFAULT_RADIUS = 16;
 static constexpr int DEFAULT_ESTIMATE_MIN_AREA = 6'000'000;
 static constexpr double MIN_THRESHOLD = -1.05;
-static constexpr double MAX_THRESHOLD = -0.40;
+static constexpr double MAX_THRESHOLD = 0.00;
 static constexpr double THRESHOLD_STEP = 0.01;
 
 static int64_t read_integer(const std::string& line, const char* key) {
@@ -149,17 +246,21 @@ static std::vector<double> sample_o6_grid(const IslandRecord& record,
     const double spacing_z = step * 0.86602540378443864676;
     const int half_step = step / 2;
     std::vector<double> values(width * width);
-    ContEngine engine;
-    cont_engine_init_6oct(
-        &engine, static_cast<uint64_t>(record.seed), 0);
+    const uint64_t seed = static_cast<uint64_t>(record.seed);
+    ContTieredParams params;
+    cont_batch_init_tiered(&seed, 1, 0, &params);
 
     for (int row = -radius; row <= radius; ++row) {
         const int parity = row & 1;
-        const int z = record.cz + static_cast<int>(row * spacing_z);
+        const float sample_z = static_cast<float>(record.cz)
+            + static_cast<float>(row) * static_cast<float>(spacing_z);
         for (int col = -radius; col <= radius; ++col) {
-            const int x = record.cx + col * step + parity * half_step;
-            values[grid_index(col, row, radius)] = cont_sample(
-                &engine, x, z);
+            const float sample_x = static_cast<float>(record.cx)
+                + static_cast<float>(col * step + parity * half_step);
+            values[grid_index(col, row, radius)] = sample_o6(
+                params,
+                sample_x * params.lacunarity[0],
+                sample_z * params.lacunarity[0]);
         }
     }
     return values;
