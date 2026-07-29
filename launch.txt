@@ -22,6 +22,7 @@ across all translations.
 3. Build the GPU DLL. Use a fresh shell before calling vcvars64.bat:
 
     cd /d D:\Code\Seeds
+    gcc -O3 -shared -o engine\continentalness.dll engine\continentalness.c -Iengine -lm
     call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
     nvcc -O3 -arch=sm_120 -Xptxas=-v,-warn-spills,-warn-lmem-usage -shared -o gpu\hunt_engine.dll gpu\hunt_engine.cu gpu\tiered_kernel.cu gpu\coarse_verify_kernel.cu gpu\prefilter_kernel.cu engine\continentalness.c -Iengine -lcudart
 
