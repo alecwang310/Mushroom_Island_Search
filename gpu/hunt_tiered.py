@@ -90,6 +90,8 @@ FINAL_TARGET_AREA = 6_000_000
 CPU_WORKERS = 28
 OUTPUT_FILE = 'islands_6m.jsonl'
 BEST_FILE = 'best_6m.jsonl'
+DEBUG_VALIDATION = os.environ.get('HUNT_DEBUG_VALIDATION', '0').lower() \
+    not in ('0', 'false', 'no', 'off')
 
 # ── Pre-filter config ──────────────────────────────────────────────────
 # p99.15-p99.25 band: score [0.04330, 0.04331]
@@ -274,6 +276,10 @@ def verify_and_flood(seed, gx, gz, geometry_code,
         seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x,
         validation_threshold)
     validation_seconds = time.perf_counter() - validation_started
+    if DEBUG_VALIDATION:
+        print(f'\n  validation: seed={seed} x={gx} z={gz} '
+              f'geometry=0x{geometry_code:02x} area={validation_area:,.0f}',
+              flush=True)
     if validation_area < validation_target_area:
         return (False, False, None, validation_seconds, 0.0, 0.0,
                 validation_area)
