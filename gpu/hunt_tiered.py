@@ -71,7 +71,7 @@ _hunt.hunt_cleanup.restype = None
 
 INITIAL_HIT_CAP = 65_536
 
-O6_THRESHOLD = -0.46
+O6_THRESHOLD = -0.47
 O6_STEP_2X = 500
 GPU_GRID_SIZE = 512
 O6_TRANSLATION_PERIOD = 512 * 256
@@ -94,11 +94,10 @@ DEBUG_VALIDATION = os.environ.get('HUNT_DEBUG_VALIDATION', '0').lower() \
     not in ('0', 'false', 'no', 'off')
 
 # ── Pre-filter config ──────────────────────────────────────────────────
-# p99.15-p99.25 band: score [0.04330, 0.04331]
-# Keeps seeds BETWEEN these scores (0.1% of randoms)
+# Keeps seeds BETWEEN these scores
 # Lower rejects noise, upper rejects score-ceiling randoms
-PREFT_LO = 0.0432   # captures 65% of 4M+ in [0.0429, 0.0433]
-PREFT_HI = 0.0434   # 23× enrichment, ~0.95% random pass
+PREFT_LO = 0.04335
+PREFT_HI = 0.0435 
 PREFT_ENABLED = True
 PREF_BATCH = 500_000_000
 PREF_SURVIVOR_CAP = 2_000_000
@@ -530,6 +529,9 @@ if __name__ == '__main__':
 
             if use_prefilter:
                 batch_num += 1
+                with lock:
+                    submitted.clear()
+                    seen.clear()
                 n_pass = prefilter_range(
                     start, pref_batch, PREFT_LO, PREFT_HI, survivors)
                 if n_pass < 0:

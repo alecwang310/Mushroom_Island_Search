@@ -72,6 +72,9 @@ extern "C" __global__ void prefilter_seeds(
     uint64_t *survivors, int survivor_capacity, int *pass_count,
     float lo_thresh, float hi_thresh, int large_biomes);
 
+extern "C" __global__ void prefilter_score_array(
+    const uint64_t *seeds, int n, float *scores, int large_biomes);
+
 struct TierBuffers {
     ContTieredParams *h_params;
     ContTieredParams *d_params;
@@ -249,6 +252,24 @@ static int translation_min_index(int coordinate, int period, int border) {
 static int translation_max_index(int coordinate, int period, int border) {
     return (int)floor_division(
         static_cast<int64_t>(border) - coordinate, period);
+}
+
+extern "C" __declspec(dllexport) void prefilter_scores(
+    const uint64_t *h_seeds, int n, float *h_scores)
+{
+    if (n <= 0) return;
+    uint64_t *d_seeds = nullptr;
+    float *d_scores = nullptr;
+    cudaMalloc(&d_seeds, (size_t)n * sizeof(uint64_t));
+    cudaMalloc(&d_scores, (size_t)n * sizeof(float));
+    cudaMemcpy(d_seeds, h_seeds, (size_t)n * sizeof(uint64_t),
+               cudaMemcpyHostToDevice);
+    prefilter_score_array<<<(n + THREADS - 1) / THREADS, THREADS>>>(
+        d_seeds, n, d_scores, 0);
+    cudaMemcpy(h_scores, d_scores, (size_t)n * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_seeds);
+    cudaFree(d_scores);
 }
 
 extern "C" __declspec(dllexport) int prefilter_range(

@@ -83,6 +83,40 @@ __device__ __forceinline__ float lut_lookup(float dy) {
 // Main pre-filter kernel
 // ═══════════════════════════════════════════════════════════════════════════
 
+extern "C" __global__ void prefilter_score_array(
+    const uint64_t *seeds, int n, float *scores, int large_biomes)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    uint64_t seed = seeds[tid];
+
+    uint64_t lo, hi;
+    xSetSeed(seed, lo, hi);
+
+    uint64_t xlo, xhi;
+    xNextLong(lo, hi, xlo);
+    xNextLong(lo, hi, xhi);
+
+    uint64_t cont_lo = xlo ^ (large_biomes ? MD5_CONT_LARGE_LO : MD5_CONT_LO);
+    uint64_t cont_hi = xhi ^ (large_biomes ? MD5_CONT_LARGE_HI : MD5_CONT_HI);
+
+    uint64_t ixlo_A, ixhi_A, ixlo_B, ixhi_B;
+    xNextLong(cont_lo, cont_hi, ixlo_A);
+    xNextLong(cont_lo, cont_hi, ixhi_A);
+    xNextLong(cont_lo, cont_hi, ixlo_B);
+    xNextLong(cont_lo, cont_hi, ixhi_B);
+
+    float ob6 = extract_ob(ixlo_A, ixhi_A, 3);
+    float ob15 = extract_ob(ixlo_B, ixhi_B, 3);
+
+    float dy6 = ob6 - floorf(ob6);
+    float dy15 = ob15 - floorf(ob15);
+
+    scores[tid] = CONT_AMP_SQ * lut_lookup(dy6)
+                + CONT_AMP_SQ * lut_lookup(dy15);
+}
+
 extern "C" __global__ void prefilter_seeds(
     uint64_t start_seed, int n,
     uint64_t *survivors, int survivor_capacity, int *pass_count,
