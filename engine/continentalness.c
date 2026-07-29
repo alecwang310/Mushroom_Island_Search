@@ -520,9 +520,9 @@ static int estimate_add_point(int points[][2], int *count,
     return 1;
 }
 
-double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
-                                 int geometry_code, int step_05x,
-                                 int step_2x) {
+static double cont_estimate_triple_area_impl(uint64_t seed, int gx, int gz,
+                                             int geometry_code, int step,
+                                             int step_2x, int six_octaves) {
     int row_parity = (geometry_code >> 6) & 1;
     int pair_mask = geometry_code & 0x3F;
     int radius_steps;
@@ -540,11 +540,11 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
     int queue_head = 0;
     int queue_tail = 0;
 
-    if (step_05x <= 0 || step_2x <= 0)
+    if (step <= 0 || step_2x <= 0)
         return 0.0;
 
     radius_steps = estimate_round_to_int(
-        (double)step_2x / (double)step_05x);
+        (double)step_2x / (double)step);
     if (radius_steps < 1) radius_steps = 1;
     if (radius_steps > ESTIMATE_MAX_RADIUS)
         return 0.0;
@@ -581,9 +581,9 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
         point_x = (direction == 2 || direction == 4)
             ? signed_stagger : -signed_stagger;
         int row_shift = estimate_lattice_offset_x(
-            step_05x, row_parity, 0, point_row);
+            step, row_parity, 0, point_row);
         roots[root + 1][0] = estimate_round_to_int(
-            (double)(point_x - row_shift) / (double)step_05x);
+            (double)(point_x - row_shift) / (double)step);
         roots[root + 1][1] = point_row;
     }
 
@@ -619,11 +619,14 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
     }
 
     ContEngine e;
-    cont_engine_init(&e, seed, 0);
+    if (six_octaves)
+        cont_engine_init_6oct(&e, seed, 0);
+    else
+        cont_engine_init(&e, seed, 0);
     for (int i = 0; i < point_count; i++) {
         int offset_x = estimate_lattice_offset_x(
-            step_05x, row_parity, points[i][0], points[i][1]);
-        int offset_z = estimate_lattice_offset_z(step_05x, points[i][1]);
+            step, row_parity, points[i][0], points[i][1]);
+        int offset_z = estimate_lattice_offset_z(step, points[i][1]);
         low[i] = cont_sample(&e, gx + offset_x, gz + offset_z)
             < -1.05;
         connected[i] = 0;
@@ -674,8 +677,22 @@ double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
     for (int i = 0; i < point_count; i++)
         connected_count += connected[i] != 0;
 
-    return (double)connected_count * step_05x * step_05x
+    return (double)connected_count * step * step
         * 0.8660254037844386 * 16.0;
+}
+
+double cont_estimate_triple_area(uint64_t seed, int gx, int gz,
+                                 int geometry_code, int step_05x,
+                                 int step_2x) {
+    return cont_estimate_triple_area_impl(
+        seed, gx, gz, geometry_code, step_05x, step_2x, 0);
+}
+
+double cont_estimate_triple_area_6oct(uint64_t seed, int gx, int gz,
+                                      int geometry_code, int step_1x,
+                                      int step_2x) {
+    return cont_estimate_triple_area_impl(
+        seed, gx, gz, geometry_code, step_1x, step_2x, 1);
 }
 
 void cont_batch_init(const uint64_t *seeds, int n, int large_biomes,

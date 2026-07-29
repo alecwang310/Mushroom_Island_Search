@@ -6,7 +6,8 @@ same O6 pattern is not rescanned before translation expansion.
 Each triple hit is translated to every O6-period position inside the configured
 world border. A second GPU pass evaluates O6+O15 on a 1x R=2 grid at
 250-block spacing and sends only estimated >=6M candidates to the CPU. The CPU
-runs the six-octave flood and, when that gate passes, the full 24-octave flood.
+then runs a native six-octave 1x connected-grid validation before the
+six-octave flood and, when that gate passes, the full 24-octave flood.
 """
 import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
@@ -80,6 +81,9 @@ GPU_ESTIMATE_RADIUS = 2
 GPU_ESTIMATE_TARGET_AREA = 6_000_000
 GPU_ESTIMATE_THRESHOLD = -0.88
 CPU_6OCT_GATE_AREA = 6_000_000
+CPU_VALIDATION_STEP_1X = 250
+CPU_VALIDATION_STEP_2X = 500
+CPU_VALIDATION_TARGET_AREA = 6_000_000
 FINAL_TARGET_AREA = 6_000_000
 CPU_WORKERS = 28
 OUTPUT_FILE = 'islands_6m.jsonl'
@@ -160,6 +164,15 @@ def hunt_batch_tiered_translated(
     return [(int(results[i * 4]), int(results[i * 4 + 1]),
              int(results[i * 4 + 2]), int(results[i * 4 + 3]))
             for i in range(hc)]
+
+
+def estimate_triple_area_6oct(seed, gx, gz, geometry_code,
+                              step_1x, step_2x):
+    """Run the native six-octave 1x connected-grid validation."""
+    return _eng._lib.cont_estimate_triple_area_6oct(
+        ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
+        ctypes.c_int(gx), ctypes.c_int(gz), ctypes.c_int(geometry_code),
+        ctypes.c_int(step_1x), ctypes.c_int(step_2x))
 
 
 def prefilter_range(start_seed, n, lo, hi, survivors):
@@ -249,20 +262,38 @@ def flood_fill_full(seed, cx, cz, max_cells=10_000_000):
     return {'seed': seed, 'area': area, 'cx': cx, 'cz': cz}
 
 
-def verify_and_flood(seed, gx, gz, cpu_6oct_gate):
-    t0 = time.perf_counter()
+def verify_and_flood(seed, gx, gz, geometry_code,
+                     validation_step_1x, validation_step_2x,
+                     validation_target_area, cpu_6oct_gate):
+    validation_started = time.perf_counter()
+    validation_area = estimate_triple_area_6oct(
+        seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x)
+    validation_seconds = time.perf_counter() - validation_started
+    if validation_area < validation_target_area:
+        return (False, False, None, validation_seconds, 0.0, 0.0,
+                validation_area)
+
+    flood6_started = time.perf_counter()
     area_6 = flood_fill_6oct(seed, gx, gz)
-    t_6oct = time.perf_counter() - t0
+    flood6_seconds = time.perf_counter() - flood6_started
     if area_6 < cpu_6oct_gate:
-        return (False, None, t_6oct, 0)
-    t0 = time.perf_counter()
-    ff = flood_fill_full(seed, gx, gz)
-    return (True, ff, t_6oct, time.perf_counter() - t0)
+        return (True, False, None, validation_seconds, flood6_seconds, 0.0,
+                validation_area)
+
+    full_flood_started = time.perf_counter()
+    result = flood_fill_full(seed, gx, gz)
+    full_flood_seconds = time.perf_counter() - full_flood_started
+    return (True, True, result, validation_seconds, flood6_seconds,
+            full_flood_seconds, validation_area)
 
 
-def verify_and_flood_profiled(submitted_at, seed, gx, gz, cpu_6oct_gate):
+def verify_and_flood_profiled(submitted_at, seed, gx, gz, geometry_code,
+                              validation_step_1x, validation_step_2x,
+                              validation_target_area, cpu_6oct_gate):
     started_at = time.perf_counter()
-    result = verify_and_flood(seed, gx, gz, cpu_6oct_gate)
+    result = verify_and_flood(
+        seed, gx, gz, geometry_code, validation_step_1x, validation_step_2x,
+        validation_target_area, cpu_6oct_gate)
     finished_at = time.perf_counter()
     return (*result, started_at - submitted_at, finished_at - started_at)
 
@@ -288,6 +319,12 @@ if __name__ == '__main__':
         'HUNT_TRANSLATION_GROUPED_THREADS', 256)
     cpu_6oct_gate = _env_int(
         'HUNT_CPU_6OCT_GATE', CPU_6OCT_GATE_AREA)
+    validation_step_1x = _env_int(
+        'HUNT_CPU_VALIDATION_STEP_1X', CPU_VALIDATION_STEP_1X)
+    validation_step_2x = _env_int(
+        'HUNT_CPU_VALIDATION_STEP_2X', CPU_VALIDATION_STEP_2X)
+    validation_target_area = _env_int(
+        'HUNT_CPU_VALIDATION_TARGET', CPU_VALIDATION_TARGET_AREA)
     requested_G = _env_int('HUNT_GRID_SIZE', GPU_GRID_SIZE)
     G = cap_o6_grid_size(requested_G, scan_step_2x, translation_period)
     batch = _env_int('HUNT_BATCH_SIZE', 8192)
@@ -308,6 +345,8 @@ if __name__ == '__main__':
         raise ValueError('the current CUDA translation estimator requires R=2')
     if estimate_step_2x != estimate_step_1x * 2:
         raise ValueError('GPU estimate step_2x must equal 2 * step_1x')
+    if validation_step_2x != validation_step_1x * 2:
+        raise ValueError('CPU validation step_2x must equal 2 * step_1x')
 
     print(f'Target: >= {TARGET:,} blocks^2 (final flood)')
     print(f'O6 scan: step={scan_step_2x} threshold<{o6_threshold}')
@@ -328,13 +367,16 @@ if __name__ == '__main__':
     else:
         print(f'Pre-filter: OFF')
     print('GPU: O6 triple scan -> translated O6+O15 R=2 estimate.')
-    print(f'CPU: six-octave gate >= {cpu_6oct_gate:,} -> full flood.')
+    print(f'CPU: six-octave 1x validation step={validation_step_1x} '
+          f'target>={validation_target_area:,} -> '
+          f'flood gate>={cpu_6oct_gate:,} -> full flood.')
     print()
 
     pool = ThreadPoolExecutor(max_workers=FF_WORKERS)
     best = None
-    scanned, tiered_scanned, hits_gpu, hits_estimated, hits_ok, hits_big = 0, 0, 0, 0, 0, 0
-    t_gpu, t_vfy, t_ff = 0.0, 0.0, 0.0
+    scanned, tiered_scanned, hits_gpu = 0, 0, 0
+    hits_validation, hits_flood6, hits_big = 0, 0, 0
+    t_gpu, t_validation, t_flood6, t_ff = 0.0, 0.0, 0.0, 0.0
     seen = set()
     submitted = set()
     lock = threading.Lock()
@@ -363,11 +405,13 @@ if __name__ == '__main__':
     running = True
 
     def on_done(future):
-        global best, hits_ok, hits_big, hits_estimated, t_vfy, t_ff
+        global best, hits_validation, hits_flood6, hits_big
+        global t_validation, t_flood6, t_ff
         result = future.result()
-        verified, r, tv, tf = result[:4]
+        validation_passed, flood6_passed, r = result[:3]
+        tv, tf6, tf = result[3:6]
         if profile_stages:
-            queue_delay, service_seconds = result[4:]
+            queue_delay, service_seconds = result[7:9]
             completed_at = time.perf_counter()
             with profile_lock:
                 stage_profile['queue_delay_seconds'] += queue_delay
@@ -379,10 +423,12 @@ if __name__ == '__main__':
                 stage_profile['completed'] += 1
                 stage_profile['last_complete_at'] = completed_at
         with lock:
-            if verified: hits_estimated += 1
-            t_vfy += tv; t_ff += tf
+            if validation_passed: hits_validation += 1
+            if flood6_passed: hits_flood6 += 1
+            t_validation += tv
+            t_flood6 += tf6
+            t_ff += tf
         if r is None: return
-        with lock: hits_ok += 1
         if r['area'] < TARGET: return
         with lock:
             key = (r['seed'], r['area'])
@@ -406,7 +452,6 @@ if __name__ == '__main__':
             pending.release()
 
     def submit_verification(seed, gx, gz, geometry_code):
-        del geometry_code
         with lock:
             key = (seed, gx, gz)
             if key in submitted:
@@ -431,11 +476,15 @@ if __name__ == '__main__':
             if profile_stages:
                 future = pool.submit(
                     verify_and_flood_profiled, submitted_at,
-                    seed, gx, gz, cpu_6oct_gate)
+                    seed, gx, gz, geometry_code,
+                    validation_step_1x, validation_step_2x,
+                    validation_target_area, cpu_6oct_gate)
             else:
                 future = pool.submit(
                     verify_and_flood,
-                    seed, gx, gz, cpu_6oct_gate)
+                    seed, gx, gz, geometry_code,
+                    validation_step_1x, validation_step_2x,
+                    validation_target_area, cpu_6oct_gate)
             future.add_done_callback(on_done_releasing)
             if profile_stages:
                 stage_profile['pool_submit_seconds'] += (
@@ -526,7 +575,8 @@ if __name__ == '__main__':
                 elapsed = time.perf_counter() - t0
                 print(f'\r  tiered: {tiered_scanned:,} seeds '
                       f'({tiered_scanned/elapsed:,.0f}/s) | '
-                      f'{hits_estimated} estimates ({hits_ok} flood) | {hits_big} big | best {ba:,}  ',
+                      f'{hits_validation} validations ({hits_flood6} six-oct floods) | '
+                      f'{hits_big} big | best {ba:,}  ',
                       end='', flush=True)
     except KeyboardInterrupt:
         pass
@@ -572,7 +622,10 @@ if __name__ == '__main__':
     elapsed = time.perf_counter() - t0
     print(f'\nScanned {scanned:,} seeds in {elapsed:.0f}s ({scanned/elapsed:,.0f}/s)')
     print(f'{hits_gpu} GPU translation estimates -> '
-          f'{hits_estimated} six-octave gates passed -> '
+          f'{hits_validation} CPU validations passed -> '
+          f'{hits_flood6} six-octave floods passed -> '
           f'{hits_big} final islands (>= {TARGET:,})')
+    print(f'CPU service totals: validation {t_validation:.3f}s, '
+          f'six-octave flood {t_flood6:.3f}s, full flood {t_ff:.3f}s')
     if best:
         print(f'BEST: seed {best["seed"]}, {best["area"]:,} at ({best["cx"]},{best["cz"]})')

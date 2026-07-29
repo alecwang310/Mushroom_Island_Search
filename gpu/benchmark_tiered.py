@@ -13,8 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from hunt_tiered import (
     CHUNK,
     INITIAL_HIT_CAP,
-    GPU_COARSE_MIN_AREA,
-    ESTIMATE_TARGET_AREA,
+    CPU_6OCT_GATE_AREA,
+    CPU_VALIDATION_STEP_1X,
+    CPU_VALIDATION_STEP_2X,
+    CPU_VALIDATION_TARGET_AREA,
+    GPU_ESTIMATE_TARGET_AREA,
     PREF_BATCH,
     PREF_SURVIVOR_CAP,
     PREFT_HI,
@@ -23,7 +26,7 @@ from hunt_tiered import (
     flood_fill_6oct,
     flood_fill_full,
     prefilter_range,
-    estimate_triple_area,
+    estimate_triple_area_6oct,
 )
 
 
@@ -31,6 +34,14 @@ STEP_05X = int(os.environ.get('HUNT_STEP_05X', '125'))
 STEP_2X = int(os.environ.get('HUNT_STEP_2X', '500'))
 GRID_SIZE = int(os.environ.get('HUNT_GRID_SIZE', '512'))
 THRESHOLD = float(os.environ.get('HUNT_THRESHOLD', '-0.95'))
+VALIDATION_STEP_1X = int(os.environ.get(
+    'HUNT_CPU_VALIDATION_STEP_1X', str(CPU_VALIDATION_STEP_1X)))
+VALIDATION_STEP_2X = int(os.environ.get(
+    'HUNT_CPU_VALIDATION_STEP_2X', str(CPU_VALIDATION_STEP_2X)))
+VALIDATION_TARGET_AREA = int(os.environ.get(
+    'HUNT_CPU_VALIDATION_TARGET', str(CPU_VALIDATION_TARGET_AREA)))
+CPU_FLOOD6_GATE = int(os.environ.get(
+    'HUNT_CPU_6OCT_GATE', str(CPU_6OCT_GATE_AREA)))
 BENCH_PREF_BATCH = int(os.environ.get('HUNT_PREF_BATCH', str(PREF_BATCH)))
 SCAN_LIMIT = int(os.environ.get('HUNT_SCAN_LIMIT', '0'))
 SKIP_CPU = os.environ.get('HUNT_SKIP_CPU', '0') == '1'
@@ -45,16 +56,17 @@ TIER_TIMING_NAMES = (
 
 def benchmark_verify_and_flood(seed, grid_x, grid_z, geometry_code):
     estimate_started = time.perf_counter()
-    estimated_area = estimate_triple_area(
-        seed, grid_x, grid_z, geometry_code, STEP_05X, STEP_2X)
+    estimated_area = estimate_triple_area_6oct(
+        seed, grid_x, grid_z, geometry_code,
+        VALIDATION_STEP_1X, VALIDATION_STEP_2X)
     estimate_seconds = time.perf_counter() - estimate_started
-    if estimated_area < ESTIMATE_TARGET_AREA:
+    if estimated_area < VALIDATION_TARGET_AREA:
         return False, None, estimate_seconds, 0.0, 0.0, False, estimated_area
 
     flood6_started = time.perf_counter()
     flood6_area = flood_fill_6oct(seed, grid_x, grid_z)
     flood6_seconds = time.perf_counter() - flood6_started
-    if flood6_area < 3_000_000:
+    if flood6_area < CPU_FLOOD6_GATE:
         return (
             True, None, estimate_seconds, flood6_seconds,
             0.0, False, estimated_area,
@@ -289,7 +301,11 @@ def main():
     print(
         f'Tiered config: G={GRID_SIZE}, step_2x={STEP_2X}, '
         f'step_05x={STEP_05X}, threshold={THRESHOLD}')
-    print(f'GPU coarse gate: >= {GPU_COARSE_MIN_AREA:,} estimated blocks^2')
+    print(f'GPU coarse gate: >= {GPU_ESTIMATE_TARGET_AREA:,} estimated blocks^2')
+    print(
+        f'CPU validation: six octaves, 1x step={VALIDATION_STEP_1X}, '
+        f'2x step={VALIDATION_STEP_2X}, '
+        f'target>={VALIDATION_TARGET_AREA:,}')
     print(f'Prefilter band: [{PREFT_LO:.5f}, {PREFT_HI:.5f}]')
     print(
         f'Prefilter: {survivor_count:,} survivors in {prefilter_seconds:.3f}s '
@@ -334,7 +350,7 @@ def main():
         print(
             f'CPU estimate: mean {cpu["estimated_area_sum"] / len(cpu_hits):,.0f}, '
             f'max {cpu["estimated_area_max"]:,.0f}, '
-            f'gate {ESTIMATE_TARGET_AREA:,}')
+            f'gate {VALIDATION_TARGET_AREA:,}')
     if not SKIP_CPU:
         print(
             f'CPU queue: peak {cpu["peak_pending"]}/{MAX_PENDING} pending, '

@@ -3,9 +3,11 @@ Mushroom Island Search — Windows launch instructions
 The current gpt branch is the O6 translation pipeline. The first GPU tier
 uses O6 only at step 500 and threshold -0.4. Each hit is translated across
 the world border and screened on the GPU with O6+O15 threshold -0.88 at
-250-block spacing and R=2, then sent to the CPU for six-octave and full flood
-fill. Grouped mode keeps translation enumeration on the GPU and reuses each
-seed's permutation tables across all translations.
+250-block spacing and R=2, then sent to the CPU. The CPU first runs a native
+six-octave 1x connected-grid validation at 250-block spacing; only validation
+passes enter the six-octave flood and then the full flood. Grouped mode keeps
+translation enumeration on the GPU and reuses each seed's permutation tables
+across all translations.
 
 1. Open an SSH shell or a Developer Command Prompt on Windows.
 
@@ -39,6 +41,9 @@ seed's permutation tables across all translations.
     set HUNT_TRANSLATION_ESTIMATE_TARGET=6000000
     set HUNT_TRANSLATION_GROUPED=1
     set HUNT_TRANSLATION_GROUPED_THREADS=256
+    set HUNT_CPU_VALIDATION_STEP_1X=250
+    set HUNT_CPU_VALIDATION_STEP_2X=500
+    set HUNT_CPU_VALIDATION_TARGET=6000000
     set HUNT_CPU_6OCT_GATE=6000000
     set HUNT_TARGET_AREA=6000000
     set HUNT_CPU_WORKERS=28
