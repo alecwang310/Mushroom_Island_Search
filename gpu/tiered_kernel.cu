@@ -1,14 +1,14 @@
 /*
- * tiered_kernel.cu — Hex-grid O6/O15 mushroom triple prefilter.
+ * tiered_kernel.cu — Hex-grid O6 area prefilter.
  *
  * Default path:
  *   - Each block keeps both permutation tables in packed shared memory.
  *   - Each adjacent permutation pair is stored in one uint32 entry, reducing
  *     the shared-memory lookup count without changing the Perlin sequence.
  *   - One cell is evaluated per thread wave to keep register pressure bounded.
- *   - Detection uses one 32-bit mask per row instead of a float shared grid.
- *     A hit is the center plus two true hex neighbors; the two directions
- *     and coarse-row parity are packed into the returned geometry code.
+ *   - A shared-memory label propagation pass finds connected O6 components on
+ *     the 1x grid.  Seven rounds are sufficient for the default 6M gate,
+ *     which is seven 250-block hex cells.
  *
  * Build with -DTIERED_USE_WARP_PERM=1 for the warp-register reference path.
  * The shared path stores each adjacent permutation pair in one 32-bit word,
@@ -31,9 +31,12 @@
 
 #define THREADS  256
 #define TILE     32
+#define TILE_INTERIOR 26
+#define TILE_HALO 3
 #define WAVES    4
 #define MAX_HITS 512
 #define FULL_MASK 0xFFFFFFFFu
+#define INVALID_LABEL -1
 
 #ifndef TIERED_USE_WARP_PERM
 #define TIERED_USE_WARP_PERM 0
@@ -378,7 +381,8 @@ __device__ __forceinline__ void emit_warp_hits(
 extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
 __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_2x, float threshold, int o6_only,
+    int G, int step_1x, float threshold, int o6_only,
+    int minimum_connected_cells,
     int hit_capacity, int *hit_count,
     int4 *hits)
 {
@@ -479,75 +483,73 @@ __global__ void tiered_scan(
 #endif
 #endif
 
-    __shared__ uint32_t row_masks[TILE];
+    __shared__ int component_labels_a[TILE * TILE];
+    __shared__ int component_labels_b[TILE * TILE];
     __shared__ int seed_hit_count;
     if (tid == 0) seed_hit_count = 0;
     __syncthreads();
 
-    float spacing_x = (float)step_2x;
+    float spacing_x = (float)step_1x;
     float spacing_z = spacing_x * 0.8660254037844386f;
     float half_spacing_x = spacing_x * 0.5f;
     int center_x = (int)(-(G / 2) * spacing_x);
     int center_z = (int)(-(G / 2) * spacing_z);
-    int tiles_dim = (G + TILE - 1) / TILE;
+    int tiles_dim = (G + TILE_INTERIOR - 1) / TILE_INTERIOR;
+    if (minimum_connected_cells < 1)
+        minimum_connected_cells = 1;
+    if (minimum_connected_cells > TILE * TILE)
+        return;
 
     for (int tile_z = 0; tile_z < tiles_dim; tile_z++) {
         for (int tile_x = 0; tile_x < tiles_dim; tile_x++) {
-            float tile_origin_x = center_x + tile_x * TILE * spacing_x;
-            float tile_origin_z = center_z + tile_z * TILE * spacing_z;
-            int tile_width = tile_x == tiles_dim - 1 ? G - tile_x * TILE : TILE;
-            int tile_height = tile_z == tiles_dim - 1 ? G - tile_z * TILE : TILE;
-            int tile_cells = tile_width * tile_height;
-            bool full_tile = tile_width == TILE && tile_height == TILE;
-
-            if (!full_tile) {
-                if (tid < TILE) row_masks[tid] = 0u;
-                __syncthreads();
-            }
+            int tile_base_x = tile_x * TILE_INTERIOR - TILE_HALO;
+            int tile_base_z = tile_z * TILE_INTERIOR - TILE_HALO;
+            int interior_begin_x = tile_x * TILE_INTERIOR;
+            int interior_begin_z = tile_z * TILE_INTERIOR;
+            int interior_end_x = interior_begin_x + TILE_INTERIOR;
+            int interior_end_z = interior_begin_z + TILE_INTERIOR;
+            if (interior_end_x > G) interior_end_x = G;
+            if (interior_end_z > G) interior_end_z = G;
 
 #if !TIERED_USE_WARP_PERM && TIERED_USE_PREFIX_LUT
             uint32_t prefix6 = 0u;
             uint32_t prefix15 = 0u;
-            if (full_tile) {
-                int prefix_cell_z = warp;
-                float prefix_sample_x = tile_origin_x
-                    + lane * spacing_x
-                    + (prefix_cell_z & 1) * half_spacing_x;
-                uint32_t prefix_h16 = (uint32_t)__float2int_rd(
-                    prefix_sample_x * lac6 + oa6);
-                prefix6 = build_shared_prefix(
-                    shared_perm6, lane, prefix_h16, h26);
-                if (!o6_only) {
-                    uint32_t prefix_h115 = (uint32_t)__float2int_rd(
-                        prefix_sample_x * lac15 * frequency_ratio + oa15);
-                    prefix15 = build_shared_prefix(
-                        shared_perm15, lane, prefix_h115, h215);
-                }
+            int prefix_global_z = tile_base_z + warp;
+            float prefix_sample_x = center_x
+                + (tile_base_x + lane) * spacing_x
+                + (prefix_global_z & 1) * half_spacing_x;
+            uint32_t prefix_h16 = (uint32_t)__float2int_rd(
+                prefix_sample_x * lac6 + oa6);
+            prefix6 = build_shared_prefix(
+                shared_perm6, lane, prefix_h16, h26);
+            if (!o6_only) {
+                uint32_t prefix_h115 = (uint32_t)__float2int_rd(
+                    prefix_sample_x * lac15 * frequency_ratio + oa15);
+                prefix15 = build_shared_prefix(
+                    shared_perm15, lane, prefix_h115, h215);
             }
 #endif
 
+            int *labels_current = component_labels_a;
+            int *labels_next = component_labels_b;
             #pragma unroll
             for (int wave = 0; wave < WAVES; wave++) {
                 int cell_index = tid + wave * THREADS;
-                bool valid;
                 int cell_x;
                 int cell_z;
-                if (full_tile) {
-                    valid = true;
-                    cell_x = lane;
-                    cell_z = warp + wave * (THREADS / 32);
-                } else {
-                    valid = cell_index < tile_cells;
-                    cell_x = valid ? cell_index % tile_width : 0;
-                    cell_z = valid ? cell_index / tile_width : 0;
-                }
+                cell_x = cell_index & (TILE - 1);
+                cell_z = cell_index / TILE;
+                int global_x = tile_base_x + cell_x;
+                int global_z = tile_base_z + cell_z;
+                bool valid = global_x >= 0 && global_x < G
+                    && global_z >= 0 && global_z < G;
 
                 float sample_x = valid
-                    ? tile_origin_x + cell_x * spacing_x
-                        + (cell_z & 1) * half_spacing_x
+                    ? center_x + global_x * spacing_x
+                        + (global_z & 1) * half_spacing_x
                     : 0.0f;
                 float sample_z = valid
-                    ? tile_origin_z + cell_z * spacing_z
+                    ? center_z + global_z * spacing_z
                     : 0.0f;
 
 #if TIERED_USE_WARP_PERM
@@ -563,29 +565,15 @@ __global__ void tiered_scan(
                 }
 #else
 #if TIERED_USE_PREFIX_LUT
-                float continentalness;
-                if (full_tile) {
-                    continentalness = amp6 * perlin_shared_prefix(
-                        shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
-                        sample_x * lac6, sample_z * lac6);
-                    if (!o6_only) {
-                        continentalness += amp15 * perlin_shared_prefix(
-                            shared_perm15, lane, prefix15, oa15, oc15,
-                            d215, t215,
-                            sample_x * lac15 * frequency_ratio,
-                            sample_z * lac15 * frequency_ratio);
-                    }
-                } else {
-                    continentalness = amp6 * perlin_shared(
-                        shared_perm6, lane, oa6, oc6, h26, d26, t26,
-                        sample_x * lac6, sample_z * lac6);
-                    if (!o6_only) {
-                        continentalness += amp15 * perlin_shared(
-                            shared_perm15, lane, oa15, oc15, h215, d215,
-                            t215,
-                            sample_x * lac15 * frequency_ratio,
-                            sample_z * lac15 * frequency_ratio);
-                    }
+                float continentalness = amp6 * perlin_shared_prefix(
+                    shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
+                    sample_x * lac6, sample_z * lac6);
+                if (!o6_only) {
+                    continentalness += amp15 * perlin_shared_prefix(
+                        shared_perm15, lane, prefix15, oa15, oc15,
+                        d215, t215,
+                        sample_x * lac15 * frequency_ratio,
+                        sample_z * lac15 * frequency_ratio);
                 }
 #else
                 float continentalness = amp6 * perlin_shared(
@@ -601,65 +589,113 @@ __global__ void tiered_scan(
 #endif
 
                 bool low = valid && continentalness * ct_amp < threshold;
-                if (full_tile) {
-                    uint32_t mask = __ballot_sync(FULL_MASK, low);
-                    if (lane == 0) row_masks[cell_z] = mask;
-                } else if (low) {
-                    atomicOr(&row_masks[cell_z], 1u << cell_x);
+                labels_current[cell_index] = low ? cell_index : INVALID_LABEL;
+            }
+            __syncthreads();
+
+            for (int round = 0; round < minimum_connected_cells; round++) {
+                #pragma unroll
+                for (int wave = 0; wave < WAVES; wave++) {
+                    int cell_index = tid + wave * THREADS;
+                    int cell_x = cell_index & (TILE - 1);
+                    int cell_z = cell_index / TILE;
+                    int global_z = tile_base_z + cell_z;
+                    int current_label = labels_current[cell_index];
+                    int minimum_label = current_label;
+                    if (current_label != INVALID_LABEL) {
+                        if (cell_x > 0) {
+                            int neighbor = labels_current[cell_index - 1];
+                            if (neighbor >= 0 && neighbor < minimum_label)
+                                minimum_label = neighbor;
+                        }
+                        if (cell_x + 1 < TILE) {
+                            int neighbor = labels_current[cell_index + 1];
+                            if (neighbor >= 0 && neighbor < minimum_label)
+                                minimum_label = neighbor;
+                        }
+                        if (cell_z > 0) {
+                            int neighbor = labels_current[cell_index - TILE];
+                            if (neighbor >= 0 && neighbor < minimum_label)
+                                minimum_label = neighbor;
+                            int diagonal_x = cell_x
+                                + ((global_z & 1) ? 1 : -1);
+                            if (diagonal_x >= 0 && diagonal_x < TILE) {
+                                neighbor = labels_current[
+                                    cell_index - TILE + diagonal_x - cell_x];
+                                if (neighbor >= 0 && neighbor < minimum_label)
+                                    minimum_label = neighbor;
+                            }
+                        }
+                        if (cell_z + 1 < TILE) {
+                            int neighbor = labels_current[cell_index + TILE];
+                            if (neighbor >= 0 && neighbor < minimum_label)
+                                minimum_label = neighbor;
+                            int diagonal_x = cell_x
+                                + ((global_z & 1) ? 1 : -1);
+                            if (diagonal_x >= 0 && diagonal_x < TILE) {
+                                neighbor = labels_current[
+                                    cell_index + TILE + diagonal_x - cell_x];
+                                if (neighbor >= 0 && neighbor < minimum_label)
+                                    minimum_label = neighbor;
+                            }
+                        }
+                    }
+                    labels_next[cell_index] = minimum_label;
                 }
+                __syncthreads();
+                int *swap = labels_current;
+                labels_current = labels_next;
+                labels_next = swap;
+            }
+
+            #pragma unroll
+            for (int wave = 0; wave < WAVES; wave++) {
+                int cell_index = tid + wave * THREADS;
+                labels_next[cell_index] = 0;
             }
             __syncthreads();
 
             #pragma unroll
             for (int wave = 0; wave < WAVES; wave++) {
                 int cell_index = tid + wave * THREADS;
-                bool valid;
+                int label = labels_current[cell_index];
+                if (label >= 0)
+                    atomicAdd(&labels_next[label], 1);
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int wave = 0; wave < WAVES; wave++) {
+                int cell_index = tid + wave * THREADS;
                 int cell_x;
                 int cell_z;
-                if (full_tile) {
-                    valid = true;
-                    cell_x = lane;
-                    cell_z = warp + wave * (THREADS / 32);
-                } else {
-                    valid = cell_index < tile_cells;
-                    cell_x = valid ? cell_index % tile_width : 0;
-                    cell_z = valid ? cell_index / tile_width : 0;
+                cell_x = cell_index & (TILE - 1);
+                cell_z = cell_index / TILE;
+                int global_x = tile_base_x + cell_x;
+                int global_z = tile_base_z + cell_z;
+                bool valid = global_x >= 0 && global_x < G
+                    && global_z >= 0 && global_z < G;
+                bool interior = global_x >= interior_begin_x
+                    && global_x < interior_end_x
+                    && global_z >= interior_begin_z
+                    && global_z < interior_end_z;
+                int label = labels_current[cell_index];
+                int component_size = label >= 0
+                    ? labels_next[label] : 0;
+                bool candidate = valid && interior && label >= 0
+                    && component_size >= minimum_connected_cells;
+                bool emit = false;
+                if (candidate) {
+                    unsigned int old = atomicOr(
+                        reinterpret_cast<unsigned int*>(&labels_next[label]),
+                        0x80000000u);
+                    emit = (old & 0x80000000u) == 0;
                 }
-
-                uint32_t row = valid ? row_masks[cell_z] : 0u;
-                uint32_t bit = 1u << cell_x;
-                uint32_t neighbor_mask = 0u;
-                neighbor_mask |= ((row << 1) & bit) ? (1u << 0) : 0u;
-                neighbor_mask |= ((row >> 1) & bit) ? (1u << 1) : 0u;
-                int row_parity = cell_z & 1;
-                if (valid && cell_z > 0) {
-                    uint32_t above = row_masks[cell_z - 1];
-                    neighbor_mask |= (above & bit) ? (1u << 2) : 0u;
-                    uint32_t above_diagonal = row_parity
-                        ? (above >> 1) : (above << 1);
-                    neighbor_mask |= (above_diagonal & bit) ? (1u << 3) : 0u;
-                }
-                if (valid && cell_z + 1 < tile_height) {
-                    uint32_t below = row_masks[cell_z + 1];
-                    neighbor_mask |= (below & bit) ? (1u << 4) : 0u;
-                    uint32_t below_diagonal = row_parity
-                        ? (below >> 1) : (below << 1);
-                    neighbor_mask |= (below_diagonal & bit) ? (1u << 5) : 0u;
-                }
-
-                bool candidate = valid && (row & bit)
-                    && (__popc(neighbor_mask) >= 2);
-                uint32_t candidate_mask = __ballot_sync(FULL_MASK, candidate);
-                uint32_t first_neighbor = neighbor_mask & (~neighbor_mask + 1u);
-                uint32_t remaining_neighbors = neighbor_mask ^ first_neighbor;
-                uint32_t second_neighbor = remaining_neighbors
-                    & (~remaining_neighbors + 1u);
-                int hit_code = (int)(first_neighbor | second_neighbor)
-                    | ((cell_z & 1) << 6);
-                int hit_x = (int)(tile_origin_x + cell_x * spacing_x
-                    + (cell_z & 1) * half_spacing_x);
-                int hit_z = (int)(tile_origin_z + cell_z * spacing_z);
-                emit_warp_hits(candidate_mask, lane, hit_x, hit_z, hit_code,
+                int hit_x = (int)(center_x + global_x * spacing_x
+                    + (global_z & 1) * half_spacing_x);
+                int hit_z = (int)(center_z + global_z * spacing_z);
+                uint32_t candidate_mask = __ballot_sync(FULL_MASK, emit);
+                emit_warp_hits(candidate_mask, lane, hit_x, hit_z, 0,
                                &seed_hit_count, hit_capacity, hit_count,
                                seed, hits);
             }

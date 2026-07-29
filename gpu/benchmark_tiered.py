@@ -19,6 +19,7 @@ from hunt_tiered import (
     CPU_VALIDATION_TARGET_AREA,
     CPU_VALIDATION_THRESHOLD,
     GPU_ESTIMATE_TARGET_AREA,
+    O6_THRESHOLD,
     PREF_BATCH,
     PREF_SURVIVOR_CAP,
     PREFT_HI,
@@ -34,7 +35,7 @@ from hunt_tiered import (
 STEP_05X = int(os.environ.get('HUNT_STEP_05X', '125'))
 STEP_2X = int(os.environ.get('HUNT_STEP_2X', '500'))
 GRID_SIZE = int(os.environ.get('HUNT_GRID_SIZE', '512'))
-THRESHOLD = float(os.environ.get('HUNT_THRESHOLD', '-0.95'))
+THRESHOLD = float(os.environ.get('HUNT_THRESHOLD', str(O6_THRESHOLD)))
 VALIDATION_STEP_1X = int(os.environ.get(
     'HUNT_CPU_VALIDATION_STEP_1X', str(CPU_VALIDATION_STEP_1X)))
 VALIDATION_STEP_2X = int(os.environ.get(

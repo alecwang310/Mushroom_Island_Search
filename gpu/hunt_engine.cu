@@ -30,7 +30,8 @@ extern "C" {
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_2x, float threshold, int o6_only,
+    int G, int step_1x, float threshold, int o6_only,
+    int minimum_connected_cells,
     int hit_capacity, int *hit_count,
     int4 *hits);
 
@@ -279,6 +280,14 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
                         TierTimings *timings)
 {
     if (n <= 0) return 0;
+    if (step_2x <= 0 || (step_2x & 1) != 0) return -1;
+    const int step_1x = step_2x / 2;
+    const double o6_cell_area = (double)step_1x * step_1x
+        * 0.8660254037844386 * 16.0;
+    int o6_minimum_connected_cells = (int)ceil(
+        (double)coarse_min_area() / o6_cell_area);
+    if (o6_minimum_connected_cells < 1)
+        o6_minimum_connected_cells = 1;
     TierClock::time_point total_started;
     if (timings) {
         *timings = {};
@@ -311,8 +320,8 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         cudaEventRecord(g_tier.memset_done);
 
     tiered_scan<<<n, THREADS>>>(
-        g_tier.d_params, n, G, step_2x, threshold,
-        0,
+        g_tier.d_params, n, G, step_1x, threshold,
+        1, o6_minimum_connected_cells,
         hit_capacity, g_tier.d_hit_count,
         g_tier.d_hits);
     if (timings) {
@@ -344,7 +353,6 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         return 0;
     }
 
-    int step_1x = step_2x / 2;
     coarse_verify_r2<<<total, VERIFY_THREADS>>>(
         g_tier.d_verify_params, g_tier.d_hits, total,
         step_1x, step_2x, g_tier.d_coarse_results);
@@ -399,9 +407,11 @@ static int tiered_translation_chunk(
 {
     if (n <= 0) return 0;
     if (hit_capacity <= 0 || translation_period <= 0
+            || scan_step_2x <= 0 || (scan_step_2x & 1) != 0
             || world_border < 0 || estimate_step_1x <= 0
             || estimate_step_2x != estimate_step_1x * 2)
         return -1;
+    const int scan_step_1x = scan_step_2x / 2;
     const int debug_stats = debug_translation_stats();
     const int grouped = translation_grouped();
     const int grouped_threads = translation_grouped_threads();
@@ -412,6 +422,12 @@ static int tiered_translation_chunk(
         (double)estimate_min_area / cell_area);
     if (minimum_connected_cells < 1)
         minimum_connected_cells = 1;
+    const double o6_cell_area = (double)scan_step_1x * scan_step_1x
+        * 0.8660254037844386 * 16.0;
+    int o6_minimum_connected_cells = (int)ceil(
+        (double)coarse_min_area() / o6_cell_area);
+    if (o6_minimum_connected_cells < 1)
+        o6_minimum_connected_cells = 1;
     float scan_kernel_ms = 0.0f;
     float estimate_kernel_ms = 0.0f;
     double init_ms = 0.0;
@@ -428,7 +444,7 @@ static int tiered_translation_chunk(
     double pack_ms = 0.0;
     auto total_started = TierClock::now();
     auto stage_started = total_started;
-    G = cap_o6_grid_size(G, scan_step_2x, translation_period);
+    G = cap_o6_grid_size(G, scan_step_1x, translation_period);
     ensure_seed_capacity(n);
     ensure_hit_capacity(hit_capacity);
     if (!g_tier.d_hit_count)
@@ -453,8 +469,9 @@ static int tiered_translation_chunk(
     if (debug_stats)
         cudaEventRecord(g_tier.phase_start);
     tiered_scan<<<n, THREADS>>>(
-        g_tier.d_params, n, G, scan_step_2x, o6_threshold,
-        1, hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
+        g_tier.d_params, n, G, scan_step_1x, o6_threshold,
+        1, o6_minimum_connected_cells,
+        hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
     if (debug_stats) {
         cudaEventRecord(g_tier.kernel_done);
         cudaEventSynchronize(g_tier.kernel_done);
