@@ -33,10 +33,15 @@ extern "C" {
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_1x, float threshold, int o6_only,
-    int minimum_connected_cells, int vector_screen,
-    float vector_margin,
+    int minimum_connected_cells,
+    const uint32_t *vector_masks,
     int hit_capacity, int *hit_count,
-    TieredHit *hits,
+    TieredHit *hits);
+
+extern "C" __global__ void tiered_vector_screen(
+    const ContTieredParams *params, int num_seeds,
+    float threshold, float vector_margin,
+    uint32_t *refine_masks,
     unsigned long long *vector_stats);
 
 extern "C" __global__ void coarse_verify_r2(
@@ -84,6 +89,7 @@ struct TierBuffers {
     ContTieredParams *d_params;
     ContVerifyParams *h_verify_params;
     ContVerifyParams *d_verify_params;
+    uint32_t *d_vector_masks;
     int *d_hit_count;
     unsigned long long *d_translation_stats;
     unsigned long long *d_vector_stats;
@@ -221,12 +227,15 @@ static void ensure_seed_capacity(int n) {
     if (g_tier.d_params) cudaFree(g_tier.d_params);
     if (g_tier.h_verify_params) free(g_tier.h_verify_params);
     if (g_tier.d_verify_params) cudaFree(g_tier.d_verify_params);
+    if (g_tier.d_vector_masks) cudaFree(g_tier.d_vector_masks);
     g_tier.h_params = (ContTieredParams*)malloc((size_t)n * sizeof(ContTieredParams));
     cudaMalloc(&g_tier.d_params, (size_t)n * sizeof(ContTieredParams));
     g_tier.h_verify_params = (ContVerifyParams*)malloc(
         (size_t)n * sizeof(ContVerifyParams));
     cudaMalloc(&g_tier.d_verify_params,
                (size_t)n * sizeof(ContVerifyParams));
+    cudaMalloc(&g_tier.d_vector_masks,
+               (size_t)n * TIERED_VECTOR_CELL_WORDS * sizeof(uint32_t));
     g_tier.seed_cap = n;
 }
 
@@ -332,6 +341,8 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         (double)coarse_min_area() / o6_cell_area);
     if (o6_minimum_connected_cells < 1)
         o6_minimum_connected_cells = 1;
+    const int vector_screen = o6_vector_screen();
+    const float vector_margin = o6_vector_margin();
     TierClock::time_point total_started;
     if (timings) {
         *timings = {};
@@ -363,12 +374,17 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
     if (timings)
         cudaEventRecord(g_tier.memset_done);
 
+    if (vector_screen) {
+        tiered_vector_screen<<<n, THREADS>>>(
+            g_tier.d_params, n, threshold, vector_margin,
+            g_tier.d_vector_masks, nullptr);
+    }
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, step_1x, threshold,
         1, o6_minimum_connected_cells,
-        o6_vector_screen(), o6_vector_margin(),
+        vector_screen ? g_tier.d_vector_masks : nullptr,
         hit_capacity, g_tier.d_hit_count,
-        g_tier.d_hits, nullptr);
+        g_tier.d_hits);
     if (timings) {
         cudaEventRecord(g_tier.kernel_done);
         cudaEventSynchronize(g_tier.kernel_done);
@@ -527,12 +543,17 @@ static int tiered_translation_chunk(
     scan_setup_ms = elapsed_ms(stage_started, TierClock::now());
     if (debug_stats)
         cudaEventRecord(g_tier.phase_start);
+    if (vector_screen) {
+        tiered_vector_screen<<<n, THREADS>>>(
+            g_tier.d_params, n, o6_threshold, vector_margin,
+            g_tier.d_vector_masks,
+            debug_stats ? g_tier.d_vector_stats : nullptr);
+    }
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, scan_step_1x, o6_threshold,
         1, o6_minimum_connected_cells,
-        vector_screen, vector_margin,
-        hit_capacity, g_tier.d_hit_count, g_tier.d_hits,
-        debug_stats ? g_tier.d_vector_stats : nullptr);
+        vector_screen ? g_tier.d_vector_masks : nullptr,
+        hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
     if (debug_stats) {
         cudaEventRecord(g_tier.kernel_done);
         cudaEventSynchronize(g_tier.kernel_done);
@@ -914,6 +935,7 @@ extern "C" __declspec(dllexport) void hunt_cleanup() {
     }
     if (g_tier.d_params) cudaFree(g_tier.d_params);
     if (g_tier.d_verify_params) cudaFree(g_tier.d_verify_params);
+    if (g_tier.d_vector_masks) cudaFree(g_tier.d_vector_masks);
     if (g_tier.d_hit_count) cudaFree(g_tier.d_hit_count);
     if (g_tier.d_translation_stats) cudaFree(g_tier.d_translation_stats);
     if (g_tier.d_vector_stats) cudaFree(g_tier.d_vector_stats);

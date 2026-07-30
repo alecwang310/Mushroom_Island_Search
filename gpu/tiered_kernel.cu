@@ -38,10 +38,9 @@
 #define MAX_HITS 512
 #define FULL_MASK 0xFFFFFFFFu
 #define INVALID_LABEL -1
-#define VECTOR_CELL_SIDE 256
-#define VECTOR_WORDS_PER_ROW (VECTOR_CELL_SIDE / 32)
-#define VECTOR_CELL_WORDS \
-    (VECTOR_CELL_SIDE * VECTOR_WORDS_PER_ROW)
+#define VECTOR_CELL_SIDE TIERED_VECTOR_CELL_SIDE
+#define VECTOR_WORDS_PER_ROW TIERED_VECTOR_WORDS_PER_ROW
+#define VECTOR_CELL_WORDS TIERED_VECTOR_CELL_WORDS
 
 #ifndef TIERED_USE_WARP_PERM
 #define TIERED_USE_WARP_PERM 0
@@ -447,15 +446,141 @@ __device__ __forceinline__ void write_component_hit(
     hits[output_index] = hit;
 }
 
+extern "C" __global__ void tiered_vector_screen(
+    const ContTieredParams *params, int num_seeds,
+    float threshold, float vector_margin,
+    uint32_t *refine_masks,
+    unsigned long long *vector_stats)
+{
+    int seed = blockIdx.x;
+    int tid = threadIdx.x;
+    if (seed >= num_seeds) return;
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int warp_count = blockDim.x >> 5;
+    const ContTieredParams *seed_params = params + seed;
+    float amp6 = seed_params->amplitude[0];
+    uint32_t h26 = seed_params->cached_h2[0];
+    float d26 = seed_params->cached_d2[0];
+    float t26 = seed_params->cached_t2[0];
+    float ct_amp = seed_params->cont_dbl_amp;
+
+#if TIERED_USE_WARP_PERM
+    const uint2 *perm_words = reinterpret_cast<const uint2*>(
+        seed_params->perm[0]);
+    uint2 perm6 = perm_words[lane];
+#else
+#if TIERED_USE_TRANSPOSED_SHARED_PERM
+    __shared__ uint32_t shared_perm6[
+        CONT_TIERED_PERM_SIZE * TIERED_SHARED_REPLICAS];
+    if (tid < CONT_TIERED_PERM_SIZE) {
+        uint32_t perm_value = (uint32_t)seed_params->perm[0][tid];
+#if TIERED_SHARED_PACKED_PAIRS
+        perm_value |= (uint32_t)seed_params->perm[0]
+            [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8;
+#endif
+        #pragma unroll
+        for (int copy_lane = 0;
+             copy_lane < TIERED_SHARED_REPLICAS; copy_lane++) {
+            int destination_replica = (lane + copy_lane)
+                & (TIERED_SHARED_REPLICAS - 1);
+            shared_perm6[tid * TIERED_SHARED_REPLICAS
+                + destination_replica] = perm_value;
+        }
+    }
+#else
+    __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE];
+    if (tid < CONT_TIERED_PERM_SIZE) {
+#if TIERED_SHARED_PACKED_PAIRS
+        shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid]
+            | ((uint32_t)seed_params->perm[0]
+                [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
+#else
+        shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid];
+#endif
+    }
+#endif
+#endif
+
+    __shared__ uint32_t vector_candidates[VECTOR_CELL_WORDS];
+    __shared__ unsigned int vector_candidate_count;
+    __shared__ unsigned int vector_refine_count;
+    __syncthreads();
+
+    float vector_threshold = threshold + vector_margin;
+    for (int word_index = warp;
+         word_index < VECTOR_CELL_WORDS;
+         word_index += warp_count) {
+        int vector_cell = word_index * 32 + lane;
+        int vector_x = vector_cell & (VECTOR_CELL_SIDE - 1);
+        int vector_z = vector_cell >> 8;
+#if TIERED_USE_WARP_PERM
+        float center_value = amp6 * perlin_warp(
+            perm6.x, perm6.y, 0.0f, 0.0f, h26, d26, t26,
+            (float)vector_x + 0.5f,
+            (float)vector_z + 0.5f) * ct_amp;
+#else
+        float center_value = amp6 * perlin_shared(
+            shared_perm6, lane, 0.0f, 0.0f, h26, d26, t26,
+            (float)vector_x + 0.5f,
+            (float)vector_z + 0.5f) * ct_amp;
+#endif
+        uint32_t promising_mask = __ballot_sync(
+            FULL_MASK, center_value < vector_threshold);
+        if (lane == 0)
+            vector_candidates[word_index] = promising_mask;
+    }
+    __syncthreads();
+
+    unsigned int local_candidates = 0;
+    unsigned int local_refine = 0;
+    uint32_t *seed_mask = refine_masks
+        + (size_t)seed * VECTOR_CELL_WORDS;
+    for (int word_index = tid;
+         word_index < VECTOR_CELL_WORDS;
+         word_index += blockDim.x) {
+        int row = word_index / VECTOR_WORDS_PER_ROW;
+        int word = word_index & (VECTOR_WORDS_PER_ROW - 1);
+        uint32_t refined = dilate_vector_word(
+            vector_candidates, row - 1, word)
+            | dilate_vector_word(vector_candidates, row, word)
+            | dilate_vector_word(vector_candidates, row + 1, word);
+        seed_mask[word_index] = refined;
+        if (vector_stats) {
+            local_candidates += __popc(vector_candidates[word_index]);
+            local_refine += __popc(refined);
+        }
+    }
+
+    if (vector_stats) {
+        if (tid == 0) {
+            vector_candidate_count = 0;
+            vector_refine_count = 0;
+        }
+        __syncthreads();
+        atomicAdd(&vector_candidate_count, local_candidates);
+        atomicAdd(&vector_refine_count, local_refine);
+        __syncthreads();
+        if (tid == 0) {
+            atomicAdd(vector_stats + 0,
+                      (unsigned long long)VECTOR_CELL_SIDE * VECTOR_CELL_SIDE);
+            atomicAdd(vector_stats + 1,
+                      (unsigned long long)vector_candidate_count);
+            atomicAdd(vector_stats + 2,
+                      (unsigned long long)vector_refine_count);
+        }
+    }
+}
+
 extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
 __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_1x, float threshold, int o6_only,
-    int minimum_connected_cells, int vector_screen,
-    float vector_margin,
+    int minimum_connected_cells,
+    const uint32_t *vector_masks,
     int hit_capacity, int *hit_count,
-    TieredHit *hits,
-    unsigned long long *vector_stats)
+    TieredHit *hits)
 {
     int seed = blockIdx.x;
     int tid = threadIdx.x;
@@ -554,90 +679,20 @@ __global__ void tiered_scan(
 #endif
 #endif
 
-    __shared__ uint32_t vector_candidates[VECTOR_CELL_WORDS];
     __shared__ uint32_t vector_refine[VECTOR_CELL_WORDS];
     __shared__ int component_labels_a[TILE * TILE];
     __shared__ int component_labels_b[TILE * TILE];
     __shared__ int seed_hit_count;
     __shared__ int tile_has_refine;
-    __shared__ unsigned int vector_candidate_count;
-    __shared__ unsigned int vector_refine_count;
     if (tid == 0) seed_hit_count = 0;
-    __syncthreads();
-
-    bool use_vector_screen = o6_only && vector_screen;
-    float vector_threshold = threshold + vector_margin;
-    int warp_count = THREADS / 32;
-    for (int word_index = warp;
-         word_index < VECTOR_CELL_WORDS;
-         word_index += warp_count) {
-        int vector_cell = word_index * 32 + lane;
-        int vector_x = vector_cell & (VECTOR_CELL_SIDE - 1);
-        int vector_z = vector_cell >> 8;
-        bool promising = true;
-        if (use_vector_screen) {
-#if TIERED_USE_WARP_PERM
-            keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
-            float center_value = amp6 * perlin_warp(
-                perm6.x, perm6.y, 0.0f, 0.0f, h26, d26, t26,
-                (float)vector_x + 0.5f,
-                (float)vector_z + 0.5f) * ct_amp;
-#else
-            float center_value = amp6 * perlin_shared(
-                shared_perm6, lane, 0.0f, 0.0f, h26, d26, t26,
-                (float)vector_x + 0.5f,
-                (float)vector_z + 0.5f) * ct_amp;
-#endif
-            promising = center_value < vector_threshold;
-        }
-        uint32_t promising_mask = __ballot_sync(FULL_MASK, promising);
-        if (lane == 0)
-            vector_candidates[word_index] = promising_mask;
-    }
-    __syncthreads();
-
+    bool use_vector_screen = o6_only && vector_masks;
+    const uint32_t *seed_vector_mask = use_vector_screen
+        ? vector_masks + (size_t)seed * VECTOR_CELL_WORDS : nullptr;
     for (int word_index = tid;
          word_index < VECTOR_CELL_WORDS;
          word_index += THREADS) {
-        int row = word_index / VECTOR_WORDS_PER_ROW;
-        int word = word_index & (VECTOR_WORDS_PER_ROW - 1);
-        uint32_t refined;
-        if (use_vector_screen) {
-            refined = dilate_vector_word(vector_candidates, row - 1, word)
-                | dilate_vector_word(vector_candidates, row, word)
-                | dilate_vector_word(vector_candidates, row + 1, word);
-        } else {
-            refined = FULL_MASK;
-        }
-        vector_refine[word_index] = refined;
-    }
-    __syncthreads();
-
-    if (vector_stats) {
-        if (tid == 0) {
-            vector_candidate_count = 0;
-            vector_refine_count = 0;
-        }
-        __syncthreads();
-        unsigned int local_candidates = 0;
-        unsigned int local_refine = 0;
-        for (int word_index = tid;
-             word_index < VECTOR_CELL_WORDS;
-             word_index += THREADS) {
-            local_candidates += __popc(vector_candidates[word_index]);
-            local_refine += __popc(vector_refine[word_index]);
-        }
-        atomicAdd(&vector_candidate_count, local_candidates);
-        atomicAdd(&vector_refine_count, local_refine);
-        __syncthreads();
-        if (tid == 0) {
-            atomicAdd(vector_stats + 0,
-                      (unsigned long long)VECTOR_CELL_SIDE * VECTOR_CELL_SIDE);
-            atomicAdd(vector_stats + 1,
-                      (unsigned long long)vector_candidate_count);
-            atomicAdd(vector_stats + 2,
-                      (unsigned long long)vector_refine_count);
-        }
+        vector_refine[word_index] = use_vector_screen
+            ? seed_vector_mask[word_index] : FULL_MASK;
     }
     __syncthreads();
 
