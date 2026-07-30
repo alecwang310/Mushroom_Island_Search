@@ -18,6 +18,7 @@
 extern "C" {
 #include "../engine/continentalness.h"
 }
+#include "tiered_hit.h"
 
 #define THREADS             256
 #define VERIFY_THREADS      128
@@ -27,17 +28,20 @@ extern "C" {
 #define COARSE_MIN_AREA     6000000LL
 #define TRANSLATION_ESTIMATE_THRESHOLD -0.88f
 #define TRANSLATION_GROUPED_THREADS 256
+#define O6_VECTOR_MARGIN 0.20f
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_1x, float threshold, int o6_only,
-    int minimum_connected_cells,
+    int minimum_connected_cells, int vector_screen,
+    float vector_margin,
     int hit_capacity, int *hit_count,
-    int4 *hits);
+    TieredHit *hits,
+    unsigned long long *vector_stats);
 
 extern "C" __global__ void coarse_verify_r2(
     const ContVerifyParams *params,
-    const int4 *hits,
+    const TieredHit *hits,
     int hit_count,
     int step_1x,
     int step_2x,
@@ -45,7 +49,7 @@ extern "C" __global__ void coarse_verify_r2(
 
 extern "C" __global__ void coarse_verify_r2_2oct(
     const ContTieredParams *params,
-    const int4 *hits,
+    const TieredHit *hits,
     int hit_count,
     int step_1x,
     int step_2x,
@@ -54,7 +58,7 @@ extern "C" __global__ void coarse_verify_r2_2oct(
 
 extern "C" __global__ void coarse_verify_r2_2oct_grouped(
     const ContTieredParams *params,
-    const int4 *raw_hits,
+    const TieredHit *raw_hits,
     int raw_hit_count,
     int translation_period,
     int world_border,
@@ -82,8 +86,9 @@ struct TierBuffers {
     ContVerifyParams *d_verify_params;
     int *d_hit_count;
     unsigned long long *d_translation_stats;
-    int4 *d_hits;
-    int4 *h_hits;
+    unsigned long long *d_vector_stats;
+    TieredHit *d_hits;
+    TieredHit *h_hits;
     int4 *d_coarse_results;
     int4 *h_coarse_results;
     int seed_cap;
@@ -115,13 +120,30 @@ static double elapsed_ms(TierClock::time_point start,
 }
 
 static int64_t coarse_min_area() {
-    const char *value = getenv("HUNT_GPU_COARSE_MIN_AREA");
+    const char *value = getenv("HUNT_O6_TARGET_AREA");
+    if (!value || !*value)
+        value = getenv("HUNT_GPU_COARSE_MIN_AREA");
     if (!value || !*value) return COARSE_MIN_AREA;
     char *end = nullptr;
     long long parsed = strtoll(value, &end, 10);
     if (end == value || *end != '\0' || parsed <= 0)
         return COARSE_MIN_AREA;
     return (int64_t)parsed;
+}
+
+static int o6_vector_screen() {
+    const char *value = getenv("HUNT_O6_VECTOR_SCREEN");
+    return !value || !*value || atoi(value) != 0;
+}
+
+static float o6_vector_margin() {
+    const char *value = getenv("HUNT_O6_VECTOR_MARGIN");
+    if (!value || !*value) return O6_VECTOR_MARGIN;
+    char *end = nullptr;
+    float parsed = strtof(value, &end);
+    if (end == value || *end != '\0' || parsed < 0.0f)
+        return O6_VECTOR_MARGIN;
+    return parsed;
 }
 
 static int debug_translation_stats() {
@@ -215,8 +237,9 @@ static void ensure_hit_capacity(int capacity) {
     if (g_tier.d_coarse_results) cudaFree(g_tier.d_coarse_results);
     if (g_tier.h_coarse_results) free(g_tier.h_coarse_results);
 
-    cudaMalloc(&g_tier.d_hits, (size_t)capacity * sizeof(int4));
-    g_tier.h_hits = (int4*)malloc((size_t)capacity * sizeof(int4));
+    cudaMalloc(&g_tier.d_hits, (size_t)capacity * sizeof(TieredHit));
+    g_tier.h_hits = (TieredHit*)malloc(
+        (size_t)capacity * sizeof(TieredHit));
     cudaMalloc(&g_tier.d_coarse_results, (size_t)capacity * sizeof(int4));
     g_tier.h_coarse_results = (int4*)malloc(
         (size_t)capacity * sizeof(int4));
@@ -343,8 +366,9 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, step_1x, threshold,
         1, o6_minimum_connected_cells,
+        o6_vector_screen(), o6_vector_margin(),
         hit_capacity, g_tier.d_hit_count,
-        g_tier.d_hits);
+        g_tier.d_hits, nullptr);
     if (timings) {
         cudaEventRecord(g_tier.kernel_done);
         cudaEventSynchronize(g_tier.kernel_done);
@@ -388,7 +412,7 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
 
     stage_started = TierClock::now();
     cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
-               (size_t)total * sizeof(int4), cudaMemcpyDeviceToHost);
+               (size_t)total * sizeof(TieredHit), cudaMemcpyDeviceToHost);
     cudaMemcpy(g_tier.h_coarse_results, g_tier.d_coarse_results,
                (size_t)total * sizeof(int4), cudaMemcpyDeviceToHost);
     if (timings)
@@ -406,11 +430,12 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
         if (coarse.z == 0 && coarse_area < coarse_target)
             continue;
 
-        int seed_idx = g_tier.h_hits[i].x;
+        int seed_idx = g_tier.h_hits[i].seed;
         hit_results[output_count * 4] = (int64_t)seeds[seed_idx];
-        hit_results[output_count * 4 + 1] = (int64_t)g_tier.h_hits[i].y;
+        hit_results[output_count * 4 + 1] = (int64_t)g_tier.h_hits[i].x;
         hit_results[output_count * 4 + 2] = (int64_t)g_tier.h_hits[i].z;
-        hit_results[output_count * 4 + 3] = (int64_t)g_tier.h_hits[i].w;
+        hit_results[output_count * 4 + 3] =
+            (int64_t)tiered_hit_geometry(&g_tier.h_hits[i]);
         output_count++;
     }
     if (timings) {
@@ -436,6 +461,10 @@ static int tiered_translation_chunk(
     const int debug_stats = debug_translation_stats();
     const int grouped = translation_grouped();
     const int grouped_threads = translation_grouped_threads();
+    const int vector_screen = o6_vector_screen();
+    const float vector_margin = o6_vector_margin();
+    if (grouped && estimate_step_1x != scan_step_1x)
+        return -1;
     const float estimate_threshold = translation_estimate_threshold();
     const double cell_area = (double)estimate_step_1x * estimate_step_1x
         * 0.8660254037844386 * 16.0;
@@ -463,6 +492,9 @@ static int tiered_translation_chunk(
     double result_count_d2h_ms = 0.0;
     double result_d2h_ms = 0.0;
     double pack_ms = 0.0;
+    unsigned long long vector_cells = 0;
+    unsigned long long vector_candidates = 0;
+    unsigned long long vector_refine_cells = 0;
     auto total_started = TierClock::now();
     auto stage_started = total_started;
     G = cap_o6_grid_size(G, scan_step_1x, translation_period);
@@ -473,6 +505,9 @@ static int tiered_translation_chunk(
     if (debug_stats && !g_tier.d_translation_stats)
         cudaMalloc(&g_tier.d_translation_stats,
                    6 * sizeof(unsigned long long));
+    if (debug_stats && !g_tier.d_vector_stats)
+        cudaMalloc(&g_tier.d_vector_stats,
+                   3 * sizeof(unsigned long long));
     if (debug_stats)
         ensure_timing_events();
 
@@ -486,13 +521,18 @@ static int tiered_translation_chunk(
 
     stage_started = TierClock::now();
     cudaMemset(g_tier.d_hit_count, 0, sizeof(int));
+    if (debug_stats)
+        cudaMemset(g_tier.d_vector_stats, 0,
+                   3 * sizeof(unsigned long long));
     scan_setup_ms = elapsed_ms(stage_started, TierClock::now());
     if (debug_stats)
         cudaEventRecord(g_tier.phase_start);
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, scan_step_1x, o6_threshold,
         1, o6_minimum_connected_cells,
-        hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
+        vector_screen, vector_margin,
+        hit_capacity, g_tier.d_hit_count, g_tier.d_hits,
+        debug_stats ? g_tier.d_vector_stats : nullptr);
     if (debug_stats) {
         cudaEventRecord(g_tier.kernel_done);
         cudaEventSynchronize(g_tier.kernel_done);
@@ -505,6 +545,25 @@ static int tiered_translation_chunk(
     cudaMemcpy(&raw_count, g_tier.d_hit_count, sizeof(int),
                cudaMemcpyDeviceToHost);
     raw_count_d2h_ms = elapsed_ms(stage_started, TierClock::now());
+    if (debug_stats) {
+        unsigned long long stats[3] = {};
+        cudaMemcpy(stats, g_tier.d_vector_stats, sizeof(stats),
+                   cudaMemcpyDeviceToHost);
+        vector_cells = stats[0];
+        vector_candidates = stats[1];
+        vector_refine_cells = stats[2];
+    }
+    if (debug_stats && vector_cells > 0) {
+        fprintf(stderr,
+                "o6_vector_stats enabled=%d margin=%.3f cells=%llu "
+                "candidates=%llu candidate_rate=%.3f refine=%llu "
+                "refine_rate=%.3f\n",
+                vector_screen, vector_margin,
+                vector_cells, vector_candidates,
+                (double)vector_candidates / (double)vector_cells,
+                vector_refine_cells,
+                (double)vector_refine_cells / (double)vector_cells);
+    }
     if (raw_count > hit_capacity)
         return -raw_count;
     if (raw_count == 0)
@@ -581,17 +640,18 @@ static int tiered_translation_chunk(
     } else {
         stage_started = TierClock::now();
         cudaMemcpy(g_tier.h_hits, g_tier.d_hits,
-                   (size_t)raw_count * sizeof(int4), cudaMemcpyDeviceToHost);
+                   (size_t)raw_count * sizeof(TieredHit),
+                   cudaMemcpyDeviceToHost);
         raw_hits_d2h_ms = elapsed_ms(stage_started, TierClock::now());
 
         stage_started = TierClock::now();
         size_t translated_size = 0;
         for (int i = 0; i < raw_count; i++) {
-            const int4 hit = g_tier.h_hits[i];
+            const TieredHit hit = g_tier.h_hits[i];
             int min_dx = translation_min_index(
-                hit.y, translation_period, world_border);
+                hit.x, translation_period, world_border);
             int max_dx = translation_max_index(
-                hit.y, translation_period, world_border);
+                hit.x, translation_period, world_border);
             int min_dz = translation_min_index(
                 hit.z, translation_period, world_border);
             int max_dz = translation_max_index(
@@ -611,27 +671,26 @@ static int tiered_translation_chunk(
             return 0;
 
         stage_started = TierClock::now();
-        std::vector<int4> translated(translated_size);
+        std::vector<TieredHit> translated(translated_size);
         size_t translated_index = 0;
         for (int i = 0; i < raw_count; i++) {
-            const int4 hit = g_tier.h_hits[i];
+            const TieredHit hit = g_tier.h_hits[i];
             int min_dx = translation_min_index(
-                hit.y, translation_period, world_border);
+                hit.x, translation_period, world_border);
             int max_dx = translation_max_index(
-                hit.y, translation_period, world_border);
+                hit.x, translation_period, world_border);
             int min_dz = translation_min_index(
                 hit.z, translation_period, world_border);
             int max_dz = translation_max_index(
                 hit.z, translation_period, world_border);
             for (int dx = min_dx; dx <= max_dx; dx++) {
                 for (int dz = min_dz; dz <= max_dz; dz++) {
-                    translated[translated_index++] = make_int4(
-                        hit.x,
-                        (int)((int64_t)hit.y
-                            + (int64_t)dx * translation_period),
-                        (int)((int64_t)hit.z
-                            + (int64_t)dz * translation_period),
-                        hit.w);
+                    TieredHit translated_hit = hit;
+                    translated_hit.x = (int)((int64_t)hit.x
+                        + (int64_t)dx * translation_period);
+                    translated_hit.z = (int)((int64_t)hit.z
+                        + (int64_t)dz * translation_period);
+                    translated[translated_index++] = translated_hit;
                 }
             }
         }
@@ -641,7 +700,8 @@ static int tiered_translation_chunk(
         ensure_hit_capacity(translated_count);
         stage_started = TierClock::now();
         cudaMemcpy(g_tier.d_hits, translated.data(),
-                   translated.size() * sizeof(int4), cudaMemcpyHostToDevice);
+                   translated.size() * sizeof(TieredHit),
+                   cudaMemcpyHostToDevice);
         translation_h2d_ms = elapsed_ms(stage_started, TierClock::now());
         if (debug_stats)
             cudaEventRecord(g_tier.phase_start);
@@ -672,11 +732,12 @@ static int tiered_translation_chunk(
             if (estimate.y < minimum_connected_cells)
                 continue;
             if (output_count < hit_capacity) {
-                const int4 hit = translated[i];
-                hit_results[output_count * 4] = (int64_t)seeds[hit.x];
-                hit_results[output_count * 4 + 1] = (int64_t)hit.y;
+                const TieredHit hit = translated[i];
+                hit_results[output_count * 4] = (int64_t)seeds[hit.seed];
+                hit_results[output_count * 4 + 1] = (int64_t)hit.x;
                 hit_results[output_count * 4 + 2] = (int64_t)hit.z;
-                hit_results[output_count * 4 + 3] = (int64_t)hit.w;
+                hit_results[output_count * 4 + 3] =
+                    (int64_t)tiered_hit_geometry(&hit);
             }
             output_count++;
         }
@@ -855,6 +916,7 @@ extern "C" __declspec(dllexport) void hunt_cleanup() {
     if (g_tier.d_verify_params) cudaFree(g_tier.d_verify_params);
     if (g_tier.d_hit_count) cudaFree(g_tier.d_hit_count);
     if (g_tier.d_translation_stats) cudaFree(g_tier.d_translation_stats);
+    if (g_tier.d_vector_stats) cudaFree(g_tier.d_vector_stats);
     if (g_tier.d_hits) cudaFree(g_tier.d_hits);
     if (g_tier.d_coarse_results) cudaFree(g_tier.d_coarse_results);
     free(g_tier.h_params);

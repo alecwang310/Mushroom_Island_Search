@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include "../engine/continentalness.h"
+#include "tiered_hit.h"
 
 #define THREADS  256
 #define TILE     32
@@ -37,6 +38,10 @@
 #define MAX_HITS 512
 #define FULL_MASK 0xFFFFFFFFu
 #define INVALID_LABEL -1
+#define VECTOR_CELL_SIDE 256
+#define VECTOR_WORDS_PER_ROW (VECTOR_CELL_SIDE / 32)
+#define VECTOR_CELL_WORDS \
+    (VECTOR_CELL_SIDE * VECTOR_WORDS_PER_ROW)
 
 #ifndef TIERED_USE_WARP_PERM
 #define TIERED_USE_WARP_PERM 0
@@ -65,6 +70,8 @@
 static_assert(THREADS % 32 == 0, "tiered_scan requires whole warps");
 static_assert(THREADS * WAVES == TILE * TILE,
               "thread waves must cover one complete tile");
+static_assert(TIERED_COMPONENT_CAP <= 8,
+              "component extraction assumes at most eight cells");
 #if TIERED_USE_TRANSPOSED_SHARED_PERM
 static_assert(TIERED_SHARED_REPLICAS >= 1
               && TIERED_SHARED_REPLICAS <= 32
@@ -347,12 +354,34 @@ __device__ __forceinline__ float perlin_shared_prefix(
 
 #endif
 
-__device__ __forceinline__ void emit_warp_hits(
-    uint32_t candidate_mask, int lane, int hit_x, int hit_z, int hit_code,
-    int *seed_hit_count, int hit_capacity, int *hit_count,
-    int seed, int4 *hits)
+__device__ __forceinline__ bool vector_cell_enabled(
+    const uint32_t *refine_cells, int cell_x, int cell_z)
 {
-    if (candidate_mask == 0u) return;
+    uint32_t wrapped_x = (uint32_t)cell_x & 0xFFu;
+    uint32_t wrapped_z = (uint32_t)cell_z & 0xFFu;
+    int word_index = (int)wrapped_z * VECTOR_WORDS_PER_ROW
+        + (int)(wrapped_x >> 5);
+    return (refine_cells[word_index] & (1u << (wrapped_x & 31u))) != 0;
+}
+
+__device__ __forceinline__ uint32_t dilate_vector_word(
+    const uint32_t *candidate_cells, int row, int word)
+{
+    int wrapped_row = row & (VECTOR_CELL_SIDE - 1);
+    int left_word = (word - 1) & (VECTOR_WORDS_PER_ROW - 1);
+    int right_word = (word + 1) & (VECTOR_WORDS_PER_ROW - 1);
+    int base = wrapped_row * VECTOR_WORDS_PER_ROW;
+    uint32_t center = candidate_cells[base + word];
+    return center | (center << 1) | (center >> 1)
+        | (candidate_cells[base + left_word] >> 31)
+        | (candidate_cells[base + right_word] << 31);
+}
+
+__device__ __forceinline__ int reserve_warp_hit(
+    uint32_t candidate_mask, int lane,
+    int *seed_hit_count, int hit_capacity, int *hit_count)
+{
+    if (candidate_mask == 0u) return -1;
 
     int warp_count = __popc(candidate_mask);
     int seed_base = 0;
@@ -371,20 +400,62 @@ __device__ __forceinline__ void emit_warp_hits(
 
     uint32_t lane_bit = 1u << lane;
     int rank = __popc(candidate_mask & (lane_bit - 1u));
-    if ((candidate_mask & lane_bit) && rank < accepted) {
-        int output_index = output_base + rank;
-        if (output_index < hit_capacity)
-            hits[output_index] = make_int4(seed, hit_x, hit_z, hit_code);
+    if ((candidate_mask & lane_bit) == 0 || rank >= accepted)
+        return -1;
+    int output_index = output_base + rank;
+    return output_index < hit_capacity ? output_index : -1;
+}
+
+__device__ __forceinline__ void write_component_hit(
+    int output_index, int seed, int label, int component_size,
+    int tile_base_x, int tile_base_z,
+    int center_x, int center_z,
+    float spacing_x, float spacing_z, float half_spacing_x,
+    const int *component_labels, TieredHit *hits)
+{
+    int anchor_cell_x = label & (TILE - 1);
+    int anchor_cell_z = label / TILE;
+    int anchor_global_x = tile_base_x + anchor_cell_x;
+    int anchor_global_z = tile_base_z + anchor_cell_z;
+
+    TieredHit hit = {};
+    hit.seed = seed;
+    hit.x = (int)(center_x + anchor_global_x * spacing_x
+        + (anchor_global_z & 1) * half_spacing_x);
+    hit.z = (int)(center_z + anchor_global_z * spacing_z);
+
+    int component_count = 0;
+    for (int cell_index = label;
+         cell_index < TILE * TILE
+             && component_count < TIERED_COMPONENT_CAP;
+         cell_index++) {
+        if (component_labels[cell_index] != label)
+            continue;
+        int cell_x = cell_index & (TILE - 1);
+        int cell_z = cell_index / TILE;
+        tiered_store_component_offset(
+            &hit, component_count,
+            cell_x - anchor_cell_x, cell_z - anchor_cell_z);
+        component_count++;
     }
+    if (component_count == 0) {
+        tiered_store_component_offset(&hit, 0, 0, 0);
+        component_count = 1;
+    }
+    hit.meta = tiered_hit_meta(
+        anchor_global_z & 1, component_count, component_size);
+    hits[output_index] = hit;
 }
 
 extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
 __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
     int G, int step_1x, float threshold, int o6_only,
-    int minimum_connected_cells,
+    int minimum_connected_cells, int vector_screen,
+    float vector_margin,
     int hit_capacity, int *hit_count,
-    int4 *hits)
+    TieredHit *hits,
+    unsigned long long *vector_stats)
 {
     int seed = blockIdx.x;
     int tid = threadIdx.x;
@@ -483,10 +554,91 @@ __global__ void tiered_scan(
 #endif
 #endif
 
+    __shared__ uint32_t vector_candidates[VECTOR_CELL_WORDS];
+    __shared__ uint32_t vector_refine[VECTOR_CELL_WORDS];
     __shared__ int component_labels_a[TILE * TILE];
     __shared__ int component_labels_b[TILE * TILE];
     __shared__ int seed_hit_count;
+    __shared__ int tile_has_refine;
+    __shared__ unsigned int vector_candidate_count;
+    __shared__ unsigned int vector_refine_count;
     if (tid == 0) seed_hit_count = 0;
+    __syncthreads();
+
+    bool use_vector_screen = o6_only && vector_screen;
+    float vector_threshold = threshold + vector_margin;
+    int warp_count = THREADS / 32;
+    for (int word_index = warp;
+         word_index < VECTOR_CELL_WORDS;
+         word_index += warp_count) {
+        int vector_cell = word_index * 32 + lane;
+        int vector_x = vector_cell & (VECTOR_CELL_SIDE - 1);
+        int vector_z = vector_cell >> 8;
+        bool promising = true;
+        if (use_vector_screen) {
+#if TIERED_USE_WARP_PERM
+            keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
+            float center_value = amp6 * perlin_warp(
+                perm6.x, perm6.y, 0.0f, 0.0f, h26, d26, t26,
+                (float)vector_x + 0.5f,
+                (float)vector_z + 0.5f) * ct_amp;
+#else
+            float center_value = amp6 * perlin_shared(
+                shared_perm6, lane, 0.0f, 0.0f, h26, d26, t26,
+                (float)vector_x + 0.5f,
+                (float)vector_z + 0.5f) * ct_amp;
+#endif
+            promising = center_value < vector_threshold;
+        }
+        uint32_t promising_mask = __ballot_sync(FULL_MASK, promising);
+        if (lane == 0)
+            vector_candidates[word_index] = promising_mask;
+    }
+    __syncthreads();
+
+    for (int word_index = tid;
+         word_index < VECTOR_CELL_WORDS;
+         word_index += THREADS) {
+        int row = word_index / VECTOR_WORDS_PER_ROW;
+        int word = word_index & (VECTOR_WORDS_PER_ROW - 1);
+        uint32_t refined;
+        if (use_vector_screen) {
+            refined = dilate_vector_word(vector_candidates, row - 1, word)
+                | dilate_vector_word(vector_candidates, row, word)
+                | dilate_vector_word(vector_candidates, row + 1, word);
+        } else {
+            refined = FULL_MASK;
+        }
+        vector_refine[word_index] = refined;
+    }
+    __syncthreads();
+
+    if (vector_stats) {
+        if (tid == 0) {
+            vector_candidate_count = 0;
+            vector_refine_count = 0;
+        }
+        __syncthreads();
+        unsigned int local_candidates = 0;
+        unsigned int local_refine = 0;
+        for (int word_index = tid;
+             word_index < VECTOR_CELL_WORDS;
+             word_index += THREADS) {
+            local_candidates += __popc(vector_candidates[word_index]);
+            local_refine += __popc(vector_refine[word_index]);
+        }
+        atomicAdd(&vector_candidate_count, local_candidates);
+        atomicAdd(&vector_refine_count, local_refine);
+        __syncthreads();
+        if (tid == 0) {
+            atomicAdd(vector_stats + 0,
+                      (unsigned long long)VECTOR_CELL_SIDE * VECTOR_CELL_SIDE);
+            atomicAdd(vector_stats + 1,
+                      (unsigned long long)vector_candidate_count);
+            atomicAdd(vector_stats + 2,
+                      (unsigned long long)vector_refine_count);
+        }
+    }
     __syncthreads();
 
     float spacing_x = (float)step_1x;
@@ -511,22 +663,55 @@ __global__ void tiered_scan(
             if (interior_end_x > G) interior_end_x = G;
             if (interior_end_z > G) interior_end_z = G;
 
+            bool lane_has_refine = false;
+            #pragma unroll
+            for (int wave = 0; wave < WAVES; wave++) {
+                int cell_index = tid + wave * THREADS;
+                int cell_x = cell_index & (TILE - 1);
+                int cell_z = cell_index / TILE;
+                int global_x = tile_base_x + cell_x;
+                int global_z = tile_base_z + cell_z;
+                bool valid = global_x >= 0 && global_x < G
+                    && global_z >= 0 && global_z < G;
+                bool refine = valid;
+                if (valid && use_vector_screen) {
+                    float sample_x = center_x + global_x * spacing_x
+                        + (global_z & 1) * half_spacing_x;
+                    float sample_z = center_z + global_z * spacing_z;
+                    int vector_x = __float2int_rd(sample_x * lac6 + oa6);
+                    int vector_z = __float2int_rd(sample_z * lac6 + oc6);
+                    refine = vector_cell_enabled(
+                        vector_refine, vector_x, vector_z);
+                }
+                lane_has_refine |= refine;
+            }
+            if (tid == 0) tile_has_refine = 0;
+            __syncthreads();
+            bool warp_has_refine = __any_sync(FULL_MASK, lane_has_refine);
+            if (lane == 0 && warp_has_refine)
+                atomicExch(&tile_has_refine, 1);
+            __syncthreads();
+            if (!tile_has_refine)
+                continue;
+
 #if !TIERED_USE_WARP_PERM && TIERED_USE_PREFIX_LUT
             uint32_t prefix6 = 0u;
             uint32_t prefix15 = 0u;
-            int prefix_global_z = tile_base_z + warp;
-            float prefix_sample_x = center_x
-                + (tile_base_x + lane) * spacing_x
-                + (prefix_global_z & 1) * half_spacing_x;
-            uint32_t prefix_h16 = (uint32_t)__float2int_rd(
-                prefix_sample_x * lac6 + oa6);
-            prefix6 = build_shared_prefix(
-                shared_perm6, lane, prefix_h16, h26);
-            if (!o6_only) {
-                uint32_t prefix_h115 = (uint32_t)__float2int_rd(
-                    prefix_sample_x * lac15 * frequency_ratio + oa15);
-                prefix15 = build_shared_prefix(
-                    shared_perm15, lane, prefix_h115, h215);
+            if (lane_has_refine) {
+                int prefix_global_z = tile_base_z + warp;
+                float prefix_sample_x = center_x
+                    + (tile_base_x + lane) * spacing_x
+                    + (prefix_global_z & 1) * half_spacing_x;
+                uint32_t prefix_h16 = (uint32_t)__float2int_rd(
+                    prefix_sample_x * lac6 + oa6);
+                prefix6 = build_shared_prefix(
+                    shared_perm6, lane, prefix_h16, h26);
+                if (!o6_only) {
+                    uint32_t prefix_h115 = (uint32_t)__float2int_rd(
+                        prefix_sample_x * lac15 * frequency_ratio + oa15);
+                    prefix15 = build_shared_prefix(
+                        shared_perm15, lane, prefix_h115, h215);
+                }
             }
 #endif
 
@@ -552,43 +737,56 @@ __global__ void tiered_scan(
                     ? center_z + global_z * spacing_z
                     : 0.0f;
 
-#if TIERED_USE_WARP_PERM
-                keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
-                float continentalness = amp6 * perlin_warp(
-                    perm6.x, perm6.y, oa6, oc6, h26, d26, t26,
-                    sample_x * lac6, sample_z * lac6);
-                if (!o6_only) {
-                    continentalness += amp15 * perlin_warp(
-                        perm15.x, perm15.y, oa15, oc15, h215, d215, t215,
-                        sample_x * lac15 * frequency_ratio,
-                        sample_z * lac15 * frequency_ratio);
+                bool refine = valid;
+                if (valid && use_vector_screen) {
+                    int vector_x = __float2int_rd(sample_x * lac6 + oa6);
+                    int vector_z = __float2int_rd(sample_z * lac6 + oc6);
+                    refine = vector_cell_enabled(
+                        vector_refine, vector_x, vector_z);
                 }
+
+                float continentalness = 0.0f;
+                if (refine) {
+#if TIERED_USE_WARP_PERM
+                    keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
+                    continentalness = amp6 * perlin_warp(
+                        perm6.x, perm6.y, oa6, oc6, h26, d26, t26,
+                        sample_x * lac6, sample_z * lac6);
+                    if (!o6_only) {
+                        continentalness += amp15 * perlin_warp(
+                            perm15.x, perm15.y, oa15, oc15,
+                            h215, d215, t215,
+                            sample_x * lac15 * frequency_ratio,
+                            sample_z * lac15 * frequency_ratio);
+                    }
 #else
 #if TIERED_USE_PREFIX_LUT
-                float continentalness = amp6 * perlin_shared_prefix(
-                    shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
-                    sample_x * lac6, sample_z * lac6);
-                if (!o6_only) {
-                    continentalness += amp15 * perlin_shared_prefix(
-                        shared_perm15, lane, prefix15, oa15, oc15,
-                        d215, t215,
-                        sample_x * lac15 * frequency_ratio,
-                        sample_z * lac15 * frequency_ratio);
-                }
+                    continentalness = amp6 * perlin_shared_prefix(
+                        shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
+                        sample_x * lac6, sample_z * lac6);
+                    if (!o6_only) {
+                        continentalness += amp15 * perlin_shared_prefix(
+                            shared_perm15, lane, prefix15, oa15, oc15,
+                            d215, t215,
+                            sample_x * lac15 * frequency_ratio,
+                            sample_z * lac15 * frequency_ratio);
+                    }
 #else
-                float continentalness = amp6 * perlin_shared(
-                    shared_perm6, lane, oa6, oc6, h26, d26, t26,
-                    sample_x * lac6, sample_z * lac6);
-                if (!o6_only) {
-                    continentalness += amp15 * perlin_shared(
-                        shared_perm15, lane, oa15, oc15, h215, d215, t215,
-                        sample_x * lac15 * frequency_ratio,
-                        sample_z * lac15 * frequency_ratio);
+                    continentalness = amp6 * perlin_shared(
+                        shared_perm6, lane, oa6, oc6, h26, d26, t26,
+                        sample_x * lac6, sample_z * lac6);
+                    if (!o6_only) {
+                        continentalness += amp15 * perlin_shared(
+                            shared_perm15, lane, oa15, oc15,
+                            h215, d215, t215,
+                            sample_x * lac15 * frequency_ratio,
+                            sample_z * lac15 * frequency_ratio);
+                    }
+#endif
+#endif
                 }
-#endif
-#endif
 
-                bool low = valid && continentalness * ct_amp < threshold;
+                bool low = refine && continentalness * ct_amp < threshold;
                 labels_current[cell_index] = low ? cell_index : INVALID_LABEL;
             }
             __syncthreads();
@@ -681,7 +879,7 @@ __global__ void tiered_scan(
                     && global_z < interior_end_z;
                 int label = labels_current[cell_index];
                 int component_size = label >= 0
-                    ? labels_next[label] : 0;
+                    ? labels_next[label] & 0x7FFFFFFF : 0;
                 bool candidate = valid && interior && label >= 0
                     && component_size >= minimum_connected_cells;
                 bool emit = false;
@@ -691,14 +889,18 @@ __global__ void tiered_scan(
                         0x80000000u);
                     emit = (old & 0x80000000u) == 0;
                 }
-                int hit_x = (int)(center_x + global_x * spacing_x
-                    + (global_z & 1) * half_spacing_x);
-                int hit_z = (int)(center_z + global_z * spacing_z);
                 uint32_t candidate_mask = __ballot_sync(FULL_MASK, emit);
-                emit_warp_hits(candidate_mask, lane, hit_x, hit_z,
-                               (global_z & 1) << 6,
-                               &seed_hit_count, hit_capacity, hit_count,
-                               seed, hits);
+                int output_index = reserve_warp_hit(
+                    candidate_mask, lane, &seed_hit_count,
+                    hit_capacity, hit_count);
+                if (output_index >= 0) {
+                    write_component_hit(
+                        output_index, seed, label, component_size,
+                        tile_base_x, tile_base_z,
+                        center_x, center_z,
+                        spacing_x, spacing_z, half_spacing_x,
+                        labels_current, hits);
+                }
             }
             __syncthreads();
             if (seed_hit_count >= MAX_HITS) return;

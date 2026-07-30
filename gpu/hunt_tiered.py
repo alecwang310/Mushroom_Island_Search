@@ -1,14 +1,11 @@
 """hunt_tiered.py — O6 translation hunt with GPU area screening.
 
-The first GPU tier scans a 1x hex grid at 250-block spacing using O6 only.
-Its requested grid size is capped to one open O6 repetition period so the
-the same O6 pattern is not rescanned before translation expansion. Each
-connected component meeting the 6M area gate emits one representative hit,
-which is translated to every O6-period position inside the configured world
-border. A second GPU pass evaluates O6+O15 on a 1x R=2 grid at
-250-block spacing and sends only estimated >=6M candidates to the CPU. The CPU
-then runs a native six-octave 1x connected-grid validation before the
-six-octave flood and, when that gate passes, the full 24-octave flood.
+The first GPU tier classifies the repeating 256x256 O6 Perlin-vector cells,
+then evaluates the exact 1x hex grid only in promising cells and their coarse
+two-step perimeter. Connected components meeting the O6 area gate emit a
+capped eight-cell shape. Each shape is translated to every O6-period position
+inside the world border, expanded by one 250-grid ring, and evaluated with
+O6+O15 before CPU six-octave validation and the final flood fills.
 """
 import sys, os, time, ctypes, json, random
 from concurrent.futures import ThreadPoolExecutor
@@ -78,9 +75,10 @@ O6_TRANSLATION_PERIOD = 512 * 256
 WORLD_BORDER_PIPELINE = 7_500_000
 GPU_ESTIMATE_STEP_1X = 250
 GPU_ESTIMATE_STEP_2X = 500
-GPU_ESTIMATE_RADIUS = 2
 GPU_ESTIMATE_TARGET_AREA = 6_000_000
 GPU_ESTIMATE_THRESHOLD = -0.88
+O6_TARGET_AREA = 6_000_000
+O6_VECTOR_MARGIN = 0.20
 CPU_6OCT_GATE_AREA = 6_000_000
 CPU_VALIDATION_STEP_1X = 250
 CPU_VALIDATION_STEP_2X = 500
@@ -313,6 +311,10 @@ if __name__ == '__main__':
     TARGET = _env_int('HUNT_TARGET_AREA', FINAL_TARGET_AREA)
     scan_step_2x = _env_int('HUNT_O6_STEP', O6_STEP_2X)
     o6_threshold = _env_float('HUNT_O6_THRESHOLD', O6_THRESHOLD)
+    o6_target_area = _env_int('HUNT_O6_TARGET_AREA', O6_TARGET_AREA)
+    o6_vector_screen = _env_flag('HUNT_O6_VECTOR_SCREEN', True)
+    o6_vector_margin = _env_float(
+        'HUNT_O6_VECTOR_MARGIN', O6_VECTOR_MARGIN)
     translation_period = _env_int(
         'HUNT_TRANSLATION_PERIOD', O6_TRANSLATION_PERIOD)
     world_border = _env_int(
@@ -357,23 +359,27 @@ if __name__ == '__main__':
     best_file = os.environ.get('HUNT_BEST_FILE', BEST_FILE)
     fixed_start_value = os.environ.get('HUNT_START_SEED')
     fixed_start = int(fixed_start_value, 0) if fixed_start_value else None
-    if GPU_ESTIMATE_RADIUS != 2:
-        raise ValueError('the current CUDA translation estimator requires R=2')
     if estimate_step_2x != estimate_step_1x * 2:
         raise ValueError('GPU estimate step_2x must equal 2 * step_1x')
+    if translation_grouped and estimate_step_1x != scan_step_1x:
+        raise ValueError(
+            'shape-aware GPU estimation requires matching O6 and estimate steps')
     if validation_step_2x != validation_step_1x * 2:
         raise ValueError('CPU validation step_2x must equal 2 * step_1x')
 
     print(f'Target: >= {TARGET:,} blocks^2 (final flood)')
     print(f'O6 area scan: step={scan_step_1x} threshold<{o6_threshold} '
-          f'(2x reference={scan_step_2x})')
+          f'target>={o6_target_area:,} (2x reference={scan_step_2x})')
+    print(f'O6 vector screen: {"ON" if o6_vector_screen else "OFF"} '
+          f'center margin={o6_vector_margin:.3f}, 256x256 cells, '
+          'one-cell coarse dilation')
     print(f'Translations: period={translation_period:,} border={world_border:,}')
     if G != requested_G:
         print(f'O6 grid cap: requested G={requested_G}, using G={G} '
               f'(span={(G - 1) * scan_step_1x:,} < '
               f'{translation_period:,})')
     print(f'GPU estimate: O6+O15<{estimate_threshold} step={estimate_step_1x} '
-          f'R={GPU_ESTIMATE_RADIUS} target>={estimate_target:,} '
+          f'component+one-ring target>={estimate_target:,} '
           f'mode={"grouped" if translation_grouped else "expanded"} '
           f'threads={translation_grouped_threads}')
     print(f'First-tier grid: {(G-1)*scan_step_1x:,}x'
@@ -383,7 +389,7 @@ if __name__ == '__main__':
               f'(p99.15-p99.25, {pref_batch//1_000_000}M seeds/batch)')
     else:
         print(f'Pre-filter: OFF')
-    print('GPU: O6 1x component scan -> translated O6+O15 R=2 estimate.')
+    print('GPU: vector-screened O6 components -> translated shape+halo estimate.')
     print(f'CPU: six-octave 1x validation step={validation_step_1x} '
           f'threshold<{validation_threshold} target>={validation_target_area:,} -> '
           f'flood gate>={cpu_6oct_gate:,} -> full flood.')
