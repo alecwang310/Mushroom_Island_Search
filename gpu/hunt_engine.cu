@@ -28,7 +28,7 @@ extern "C" {
 #define COARSE_MIN_AREA     6000000LL
 #define TRANSLATION_ESTIMATE_THRESHOLD -0.88f
 #define TRANSLATION_GROUPED_THREADS 256
-#define O6_VECTOR_MARGIN 0.20f
+#define O6_VECTOR_MARGIN 0.05f
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
