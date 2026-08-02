@@ -98,12 +98,10 @@ __device__ __forceinline__ float grad_dot(
 #if TIERED_USE_WARP_PERM
 
 __device__ __forceinline__ void keep_perm_words(
-    uint32_t &perm6_lo, uint32_t &perm6_hi,
-    uint32_t &perm15_lo, uint32_t &perm15_hi)
+    uint32_t &perm_lo, uint32_t &perm_hi)
 {
     asm volatile(""
-        : "+r"(perm6_lo), "+r"(perm6_hi),
-          "+r"(perm15_lo), "+r"(perm15_hi));
+        : "+r"(perm_lo), "+r"(perm_hi));
 }
 
 __device__ __forceinline__ uint32_t perm_pair_warp(
@@ -576,7 +574,7 @@ extern "C" __global__ void tiered_vector_screen(
 extern "C" __launch_bounds__(THREADS, TIERED_MIN_BLOCKS_PER_SM)
 __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_1x, float threshold, int o6_only,
+    int G, int step_1x, float threshold,
     int minimum_connected_cells,
     const uint32_t *vector_masks,
     int hit_capacity, int *hit_count,
@@ -597,54 +595,20 @@ __global__ void tiered_scan(
     uint32_t h26 = seed_params->cached_h2[0];
     float d26 = seed_params->cached_d2[0];
     float t26 = seed_params->cached_t2[0];
-    float oa15 = 0.0f;
-    float oc15 = 0.0f;
-    float amp15 = 0.0f;
-    float lac15 = 0.0f;
-    uint32_t h215 = 0u;
-    float d215 = 0.0f;
-    float t215 = 0.0f;
-    if (!o6_only) {
-        oa15 = seed_params->offset_a[1];
-        oc15 = seed_params->offset_c[1];
-        amp15 = seed_params->amplitude[1];
-        lac15 = seed_params->lacunarity[1];
-        h215 = seed_params->cached_h2[1];
-        d215 = seed_params->cached_d2[1];
-        t215 = seed_params->cached_t2[1];
-    }
     float ct_amp = seed_params->cont_dbl_amp;
-    float frequency_ratio = 337.0f / 331.0f;
 
 #if TIERED_USE_WARP_PERM
     const uint2 *perm6_words = reinterpret_cast<const uint2*>(seed_params->perm[0]);
     uint2 perm6 = perm6_words[lane];
-    uint2 perm15 = make_uint2(0u, 0u);
-    if (!o6_only) {
-        const uint2 *perm15_words = reinterpret_cast<const uint2*>(
-            seed_params->perm[1]);
-        perm15 = perm15_words[lane];
-    }
 #else
 #if TIERED_USE_TRANSPOSED_SHARED_PERM
     __shared__ uint32_t shared_perm6[
         CONT_TIERED_PERM_SIZE * TIERED_SHARED_REPLICAS];
-    __shared__ uint32_t shared_perm15[
-        CONT_TIERED_PERM_SIZE * TIERED_SHARED_REPLICAS];
     if (tid < CONT_TIERED_PERM_SIZE) {
         uint32_t perm6_value = (uint32_t)seed_params->perm[0][tid];
-        uint32_t perm15_value = 0u;
 #if TIERED_SHARED_PACKED_PAIRS
         perm6_value |= (uint32_t)seed_params->perm[0]
             [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8;
-        if (!o6_only) {
-            perm15_value = (uint32_t)seed_params->perm[1][tid]
-                | ((uint32_t)seed_params->perm[1]
-                    [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
-        }
-#else
-        if (!o6_only)
-            perm15_value = (uint32_t)seed_params->perm[1][tid];
 #endif
         #pragma unroll
         for (int copy_lane = 0;
@@ -653,27 +617,17 @@ __global__ void tiered_scan(
                 & (TIERED_SHARED_REPLICAS - 1);
             shared_perm6[tid * TIERED_SHARED_REPLICAS
                 + destination_replica] = perm6_value;
-            shared_perm15[tid * TIERED_SHARED_REPLICAS
-                + destination_replica] = perm15_value;
         }
     }
 #else
     __shared__ uint32_t shared_perm6[CONT_TIERED_PERM_SIZE];
-    __shared__ uint32_t shared_perm15[CONT_TIERED_PERM_SIZE];
     if (tid < CONT_TIERED_PERM_SIZE) {
 #if TIERED_SHARED_PACKED_PAIRS
         shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid]
             | ((uint32_t)seed_params->perm[0]
                 [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
-        if (!o6_only) {
-            shared_perm15[tid] = (uint32_t)seed_params->perm[1][tid]
-                | ((uint32_t)seed_params->perm[1]
-                    [(tid + 1) & (CONT_TIERED_PERM_SIZE - 1)] << 8);
-        }
 #else
         shared_perm6[tid] = (uint32_t)seed_params->perm[0][tid];
-        if (!o6_only)
-            shared_perm15[tid] = (uint32_t)seed_params->perm[1][tid];
 #endif
     }
 #endif
@@ -685,7 +639,7 @@ __global__ void tiered_scan(
     __shared__ int seed_hit_count;
     __shared__ int tile_has_refine;
     if (tid == 0) seed_hit_count = 0;
-    bool use_vector_screen = o6_only && vector_masks;
+    bool use_vector_screen = vector_masks != nullptr;
     const uint32_t *seed_vector_mask = use_vector_screen
         ? vector_masks + (size_t)seed * VECTOR_CELL_WORDS : nullptr;
     for (int word_index = tid;
@@ -751,7 +705,6 @@ __global__ void tiered_scan(
 
 #if !TIERED_USE_WARP_PERM && TIERED_USE_PREFIX_LUT
             uint32_t prefix6 = 0u;
-            uint32_t prefix15 = 0u;
             if (lane_has_refine) {
                 int prefix_global_z = tile_base_z + warp;
                 float prefix_sample_x = center_x
@@ -761,12 +714,6 @@ __global__ void tiered_scan(
                     prefix_sample_x * lac6 + oa6);
                 prefix6 = build_shared_prefix(
                     shared_perm6, lane, prefix_h16, h26);
-                if (!o6_only) {
-                    uint32_t prefix_h115 = (uint32_t)__float2int_rd(
-                        prefix_sample_x * lac15 * frequency_ratio + oa15);
-                    prefix15 = build_shared_prefix(
-                        shared_perm15, lane, prefix_h115, h215);
-                }
             }
 #endif
 
@@ -803,40 +750,19 @@ __global__ void tiered_scan(
                 float continentalness = 0.0f;
                 if (refine) {
 #if TIERED_USE_WARP_PERM
-                    keep_perm_words(perm6.x, perm6.y, perm15.x, perm15.y);
+                    keep_perm_words(perm6.x, perm6.y);
                     continentalness = amp6 * perlin_warp(
                         perm6.x, perm6.y, oa6, oc6, h26, d26, t26,
                         sample_x * lac6, sample_z * lac6);
-                    if (!o6_only) {
-                        continentalness += amp15 * perlin_warp(
-                            perm15.x, perm15.y, oa15, oc15,
-                            h215, d215, t215,
-                            sample_x * lac15 * frequency_ratio,
-                            sample_z * lac15 * frequency_ratio);
-                    }
 #else
 #if TIERED_USE_PREFIX_LUT
                     continentalness = amp6 * perlin_shared_prefix(
                         shared_perm6, lane, prefix6, oa6, oc6, d26, t26,
                         sample_x * lac6, sample_z * lac6);
-                    if (!o6_only) {
-                        continentalness += amp15 * perlin_shared_prefix(
-                            shared_perm15, lane, prefix15, oa15, oc15,
-                            d215, t215,
-                            sample_x * lac15 * frequency_ratio,
-                            sample_z * lac15 * frequency_ratio);
-                    }
 #else
                     continentalness = amp6 * perlin_shared(
                         shared_perm6, lane, oa6, oc6, h26, d26, t26,
                         sample_x * lac6, sample_z * lac6);
-                    if (!o6_only) {
-                        continentalness += amp15 * perlin_shared(
-                            shared_perm15, lane, oa15, oc15,
-                            h215, d215, t215,
-                            sample_x * lac15 * frequency_ratio,
-                            sample_z * lac15 * frequency_ratio);
-                    }
 #endif
 #endif
                 }

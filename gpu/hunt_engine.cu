@@ -32,7 +32,7 @@ extern "C" {
 
 extern "C" __global__ void tiered_scan(
     const ContTieredParams *params, int num_seeds,
-    int G, int step_1x, float threshold, int o6_only,
+    int G, int step_1x, float threshold,
     int minimum_connected_cells,
     const uint32_t *vector_masks,
     int hit_capacity, int *hit_count,
@@ -381,7 +381,7 @@ static int tiered_chunk(const uint64_t *seeds, int n, int step_2x, int G,
     }
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, step_1x, threshold,
-        1, o6_minimum_connected_cells,
+        o6_minimum_connected_cells,
         vector_screen ? g_tier.d_vector_masks : nullptr,
         hit_capacity, g_tier.d_hit_count,
         g_tier.d_hits);
@@ -551,7 +551,7 @@ static int tiered_translation_chunk(
     }
     tiered_scan<<<n, THREADS>>>(
         g_tier.d_params, n, G, scan_step_1x, o6_threshold,
-        1, o6_minimum_connected_cells,
+        o6_minimum_connected_cells,
         vector_screen ? g_tier.d_vector_masks : nullptr,
         hit_capacity, g_tier.d_hit_count, g_tier.d_hits);
     if (debug_stats) {
